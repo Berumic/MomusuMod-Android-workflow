@@ -1,0 +1,17 @@
+{
+  "targets": [
+    {
+      "game": "monmusutd",
+      "sourcePackage": "com.dmm.dmmgames.monmusutd",
+      "modPackage": "com.dmm.dmmgames.monmusutd.mod",
+      "label": "MonsterMusumeTD Mod"
+    },
+    {
+      "game": "monmusutdx",
+      "sourcePackage": "jp.co.dmm.fanzagames.monmusutdx",
+      "modPackage": "jp.co.dmm.fanzagames.monmusutdx.mod",
+      "label": "MonsterMusumeTD X Mod"
+    }
+  ]
+}
+

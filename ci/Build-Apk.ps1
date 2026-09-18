@@ -4,6 +4,9 @@ param(
     [Parameter(Mandatory)][string]$TranslationsRoot,
     [Parameter(Mandatory)][string]$Keystore,
     [Parameter(Mandatory)][string]$KeyAlias,
+    [Parameter(Mandatory)][string]$Apktool,
+    [string]$ExpectedGame = 'auto',
+    [string]$SourceReleaseTag,
     [string]$Java = 'java',
     [string]$Workspace = (Join-Path (Split-Path $PSScriptRoot) 'work/build'),
     [string]$Output = (Join-Path (Split-Path $PSScriptRoot) 'dist')
@@ -21,14 +24,8 @@ Copy-Item -LiteralPath $Apk -Destination "$Workspace/input.apk"
 $Apk = Join-Path $Workspace 'input.apk'
 $lemon = Join-Path $Toolchain 'Lemon'
 $sdk = Join-Path $Toolchain 'BuildTools'
-$badging = & "$sdk/aapt.exe" dump badging $Apk
-Check-Exit 'Cannot read APK metadata.'
-$packageLine = ($badging | Where-Object { $_ -match '^package:' }) -join ''
-if ($packageLine -notmatch "^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']*)'") { throw 'Invalid APK package metadata.' }
-$package = $Matches[1]; $code = $Matches[2]; $version = $Matches[3]
-if (@($config.packageNames) -cnotcontains $package) {
-    throw "Wrong package: $package. Allowed packages: $($config.packageNames -join ', ')"
-}
+$identity = & "$PSScriptRoot/Build-Identity.ps1" -Apk $Apk -Aapt "$sdk/aapt.exe" -TranslationsRoot $TranslationsRoot -ExpectedGame $ExpectedGame
+$package = $identity.sourcePackage; $code = $identity.sourceVersion; $version = $identity.versionName
 $zip = [IO.Compression.ZipFile]::OpenRead($Apk)
 try {
     foreach ($path in @('lib/arm64-v8a/libil2cpp.so','assets/bin/Data/Managed/Metadata/global-metadata.dat','assets/bin/Data/globalgamemanagers')) {
@@ -65,9 +62,11 @@ $unsigned = "$Workspace/unsigned.apk"
 Check-Exit 'LemonLoader packaging failed.'
 [xml]$project = Get-Content "$root/Android/MonsterMusumeTDMod.Android.csproj"
 $modVersion = $project.Project.PropertyGroup.Version
-$name = "MonsterMusumeTD-$code-Mod-$modVersion"
+$name = "$($identity.game)-v$code-mod-$modVersion"
 $signed = "$Output/$name.apk"
-& "$sdk/zipalign.exe" -f -P 16 4 $unsigned "$Workspace/aligned.apk"
+& "$PSScriptRoot/Make-IndependentApk.ps1" -InputApk $unsigned -OutputApk "$Workspace/independent.apk" -Apktool $Apktool `
+    -SourcePackage $package -ModPackage $identity.modPackage -Label $identity.label -Workspace $Workspace -Java $Java
+& "$sdk/zipalign.exe" -f -P 16 4 "$Workspace/independent.apk" "$Workspace/aligned.apk"
 Check-Exit 'APK alignment failed.'
 & $Java -jar "$sdk/lib/apksigner.jar" sign --ks $Keystore --ks-key-alias $KeyAlias `
     --ks-pass env:APK_STORE_PASSWORD --key-pass env:APK_KEY_PASSWORD --out $signed "$Workspace/aligned.apk"
@@ -76,6 +75,23 @@ Check-Exit 'APK signing failed.'
 Check-Exit 'APK signature verification failed.'
 & "$sdk/zipalign.exe" -c -P 16 4 $signed
 Check-Exit 'Signed APK alignment verification failed.'
+$finalBadging = (& "$sdk/aapt.exe" dump badging $signed) -join "`n"
+Check-Exit 'Cannot inspect signed APK.'
+if ($finalBadging -notmatch "package: name='$([regex]::Escape($identity.modPackage))' versionCode='$code'") {
+    throw 'Final package identity/version verification failed.'
+}
+$finalManifest = (& "$sdk/aapt.exe" dump xmltree $signed AndroidManifest.xml) -join "`n"
+Check-Exit 'Cannot inspect final manifest.'
+$identityReport = Get-Content "$Workspace/identity.json" -Raw | ConvertFrom-Json
+$authorities = @([regex]::Matches($finalManifest, 'android:authorities[^=]*="([^"]+)"') | ForEach-Object { $_.Groups[1].Value.Split(';') })
+foreach ($entry in $identityReport.providerAuthorities.PSObject.Properties) {
+    if ($authorities -ccontains $entry.Name -or $authorities -cnotcontains $entry.Value) { throw 'Final provider authority isolation failed.' }
+}
+foreach ($entry in $identityReport.customPermissions.PSObject.Properties) {
+    if ($finalManifest.Contains('="' + $entry.Name + '"') -or !$finalManifest.Contains('="' + $entry.Value + '"')) {
+        throw 'Final custom permission isolation failed.'
+    }
+}
 $zip = [IO.Compression.ZipFile]::OpenRead($signed)
 try {
     foreach ($file in Get-ChildItem $deployment -File -Recurse) {
@@ -91,6 +107,7 @@ try {
     }
 } finally { $zip.Dispose() }
 Copy-Item "$deployment.zip" "$Output/$name-mod-files.zip"
+Copy-Item "$Workspace/identity.json" "$Output/identity.json"
 $translationCommit = & git -C $TranslationsRoot rev-parse HEAD
 Check-Exit 'Cannot identify translation commit.'
 $sourceCommit = 'local-uncommitted'
@@ -100,7 +117,11 @@ if (Test-Path "$root/.git") {
 }
 if ($env:GITHUB_ACTIONS -eq 'true' -and $sourceCommit -eq 'local-uncommitted') { throw 'Cannot identify Mod source commit.' }
 $metadata = [ordered]@{
-    packageName=$package; versionCode=$code; versionName=$version; unityVersion=$unity
+    game=$identity.game; sourceVersion=$identity.sourceVersion; releaseTag=$identity.releaseTag
+    sourceReleaseTag=$SourceReleaseTag
+    fingerprint=$identity.fingerprint; recipeSha256=$identity.recipeSha256
+    translationManifestSha256=$identity.translationManifestSha256
+    sourcePackageName=$package; packageName=$identity.modPackage; versionCode=$code; versionName=$version; unityVersion=$unity
     modVersion=$modVersion; sourceApkSha256=(Get-FileHash $Apk).Hash.ToLowerInvariant()
     signedApkSha256=(Get-FileHash $signed).Hash.ToLowerInvariant()
     translationRepository='Berumic/MonsterMusumeTDChineseTranslation'; translationCommit="$translationCommit".Trim()
