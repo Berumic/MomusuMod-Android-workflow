@@ -47,14 +47,17 @@ try
     Check(!material.HasShaderKeyword("OUTLINE_ON"), "Empty material keyword list is supported");
     var settingsPath = Path.Combine(root, "config.json");
     var config = new ModConfig(new ConfigFile(settingsPath));
+    Check(config.UiTextFaceDilate.Value == 0.35f, "New UI face dilate default is 0.35");
     Check(config.FontAssetPath.Value == "alimama-android", "Android font filename is distinct from PC");
     Check(config.TranslationAssetUpdateBaseUrl.Value.EndsWith("/assets/android"), "Android font update channel");
     Check(!config.EnableUiSnapshotHotkey.Value && !config.EnableSubSkillScanHotkey.Value, "Desktop diagnostics disabled by default");
     config.Language.Value = "zh_Hans";
     config.UiTextOutlineWidth.Value = 0.42f;
+    config.UiTextFaceDilate.Value = 0.2f;
     config.Save();
     var reloaded = new ModConfig(new ConfigFile(settingsPath));
     Check(reloaded.UiTextOutlineWidth.Value == 0.42f, "Configuration persists and reloads");
+    Check(reloaded.UiTextFaceDilate.Value == 0.2f, "Saved UI face dilate remains user-controlled");
     File.WriteAllText(settingsPath, "{invalid");
     reloaded.Reload();
     Check(reloaded.UiTextOutlineWidth.Value == 0.42f, "Invalid JSON preserves active configuration");

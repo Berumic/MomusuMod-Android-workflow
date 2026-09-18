@@ -254,7 +254,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         UiStyleManager.Apply(
             text,
             Plugin.Settings?.UiTextOutlineWidth.Value ?? 0.3f,
-            Plugin.Settings?.UiTextFaceDilate.Value ?? 0.2f,
+            Plugin.Settings?.UiTextFaceDilate.Value ?? 0.35f,
             TmpFontInstaller.LoadedFont,
             isTranslated: false);
         _observedValues[instanceId] = source;

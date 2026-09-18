@@ -77,7 +77,7 @@ public sealed class ModConfig
         UiTextFaceDilate = config.Bind(
             "Translation.UIAppearance",
             "UiTextFaceDilate",
-            0.2f,
+            0.35f,
             "UICanvas 汉化字体增厚（建议 -1 至 1）");
         EnableTranslationAutoUpdate = config.Bind(
             "Translation.Update",

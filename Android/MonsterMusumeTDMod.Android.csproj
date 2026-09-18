@@ -2,7 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>MonsterMusumeTDMod.Android</AssemblyName>
-    <Version>0.1.118</Version>
+    <Version>0.1.121</Version>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <DefineConstants>$(DefineConstants);ANDROID</DefineConstants>

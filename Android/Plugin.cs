@@ -7,7 +7,7 @@ using MonsterMusumeTDMod.Patches;
 using MonsterMusumeTDMod.Services;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.118", "MonsterMusumeTDMod")]
+[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.121", "MonsterMusumeTDMod")]
 
 namespace MonsterMusumeTDMod.Core;
 

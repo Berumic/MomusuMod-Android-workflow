@@ -19,7 +19,8 @@ internal static class UiStyleManager
     private static readonly List<StyleRule> Rules = new();
     private static readonly Dictionary<int, Material> Materials = new();
     private static readonly Dictionary<int, int> MaterialFontIds = new();
-    private static readonly Dictionary<int, Color> MaterialBaseFaceColors = new();
+    private static readonly HashSet<int> InheritedFaceColorIds = new();
+    private static readonly Dictionary<int, Color> AppliedFontColors = new();
     private static readonly Dictionary<int, TextMeshProUGUI> UnderlayTexts = new();
     private static readonly Dictionary<int, TextMeshProUGUI> UnderlaySources = new();
     private static readonly Dictionary<int, Material> UnderlayMaterials = new();
@@ -44,7 +45,8 @@ internal static class UiStyleManager
                 UnityEngine.Object.Destroy(material);
         Materials.Clear();
         MaterialFontIds.Clear();
-        MaterialBaseFaceColors.Clear();
+        InheritedFaceColorIds.Clear();
+        AppliedFontColors.Clear();
         foreach (var underlayText in UnderlayTexts.Values)
             if (underlayText != null)
                 UnityEngine.Object.Destroy(underlayText.gameObject);
@@ -127,7 +129,10 @@ internal static class UiStyleManager
             }
         }
         if (matched == null)
+        {
+            AppliedFontColors.Remove(text.GetInstanceID());
             return false;
+        }
 
         var values = matched.Values;
         var translatedOnly = values.TranslatedOnly ?? _defaults.TranslatedOnly ?? false;
@@ -169,18 +174,27 @@ internal static class UiStyleManager
             changed = true;
         }
 
-        if (fontColor.HasValue && text.color != fontColor.Value)
+        // Apply a configured base color once per change. Reasserting it on
+        // every scan fights the game's disabled-state and fade animations.
+        var instanceId = text.GetInstanceID();
+        if (fontColor.HasValue &&
+            (!AppliedFontColors.TryGetValue(instanceId, out var appliedColor) || appliedColor != fontColor.Value))
         {
-            text.color = fontColor.Value;
-            changed = true;
+            AppliedFontColors[instanceId] = fontColor.Value;
+            if (text.color != fontColor.Value)
+            {
+                text.color = fontColor.Value;
+                changed = true;
+            }
         }
+        else if (!fontColor.HasValue)
+            AppliedFontColors.Remove(instanceId);
         if (lineSpacing.HasValue && !Mathf.Approximately(text.lineSpacing, lineSpacing.Value))
         {
             text.lineSpacing = lineSpacing.Value;
             changed = true;
         }
 
-        var instanceId = text.GetInstanceID();
         var materialFont = selectedFont ?? text.font;
         var selectedFontId = materialFont == null ? 0 : materialFont.GetInstanceID();
         var materialUsesSelectedFont = MaterialFontIds.TryGetValue(instanceId, out var materialFontId) &&
@@ -209,11 +223,15 @@ internal static class UiStyleManager
             }
             Materials[instanceId] = material;
             MaterialFontIds[instanceId] = selectedFontId;
-            if (material.HasProperty("_FaceColor"))
-                MaterialBaseFaceColors[instanceId] = material.GetColor("_FaceColor");
             changed = true;
         }
-        changed |= SyncButtonFaceColor(text, material, instanceId);
+        if (!fontColor.HasValue)
+        {
+            InheritedFaceColorIds.Add(instanceId);
+            changed |= SyncInheritedFaceColor(text, material, instanceId);
+        }
+        else
+            InheritedFaceColorIds.Remove(instanceId);
         if (material.HasProperty("_OutlineColor") && material.GetColor("_OutlineColor") != outlineColor)
         {
             material.SetColor("_OutlineColor", outlineColor);
@@ -410,11 +428,11 @@ internal static class UiStyleManager
         layer.lineSpacing = source.lineSpacing;
         layer.paragraphSpacing = source.paragraphSpacing;
         layer.margin = source.margin;
-        layer.color = Color.white;
+        layer.color = source.color;
         layer.enableVertexGradient = false;
         layer.maskable = source.maskable;
         layer.SetAllDirty();
-        layer.enabled = source.enabled;
+        layer.enabled = CanRenderUnderlay(source);
         return changed;
     }
 
@@ -446,7 +464,6 @@ internal static class UiStyleManager
 
         // Run after translation processing so the projection never retains
         // the source-language value seen by an earlier TMP setter hook.
-        layer.enabled = false;
         layer.text = source.text;
         layer.fontSize = source.fontSize;
         layer.fontStyle = source.fontStyle;
@@ -464,10 +481,8 @@ internal static class UiStyleManager
         layer.margin = source.margin;
         layer.maskable = source.maskable;
         if (Materials.TryGetValue(source.GetInstanceID(), out var sourceMaterial) && sourceMaterial != null)
-            SyncButtonFaceColor(source, sourceMaterial, source.GetInstanceID());
-        var layerColor = Color.white;
-        layerColor.a = source.color.a;
-        layer.color = layerColor;
+            SyncInheritedFaceColor(source, sourceMaterial, source.GetInstanceID());
+        layer.color = source.color;
 
         if (layer.transform.GetSiblingIndex() > source.transform.GetSiblingIndex())
             layer.transform.SetSiblingIndex(source.transform.GetSiblingIndex());
@@ -519,29 +534,18 @@ internal static class UiStyleManager
         // only the graphic color changes. Do not hide the projection here.
         var groups = source.GetComponentsInParent<CanvasGroup>(true);
         foreach (var group in groups)
-            if (group != null && (!group.interactable || group.alpha <= 0.001f))
+            if (group != null && group.alpha <= 0.001f)
                 return false;
 
         return true;
     }
 
-    private static bool SyncButtonFaceColor(TMP_Text text, Material material, int instanceId)
+    private static bool SyncInheritedFaceColor(TMP_Text text, Material material, int instanceId)
     {
         if (text == null || material == null || !material.HasProperty("_FaceColor") ||
-            !MaterialBaseFaceColors.TryGetValue(instanceId, out var baseColor))
+            !InheritedFaceColorIds.Contains(instanceId) ||
+            !TmpFontInstaller.TryGetOriginalFaceColor(text, out var targetColor))
             return false;
-
-        var targetColor = baseColor;
-        var button = text.GetComponentInParent<Button>();
-        if (button != null && !button.interactable)
-        {
-            var disabledColor = button.colors.disabledColor;
-            targetColor = new Color(
-                baseColor.r * disabledColor.r,
-                baseColor.g * disabledColor.g,
-                baseColor.b * disabledColor.b,
-                baseColor.a * disabledColor.a);
-        }
 
         if (material.GetColor("_FaceColor") == targetColor)
             return false;

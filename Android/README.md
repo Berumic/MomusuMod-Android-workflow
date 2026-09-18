@@ -1,4 +1,10 @@
-# MonsterMusumeTD Android Mod 0.1.118
+# MonsterMusumeTD Android Mod 0.1.121
+
+0.1.121 在未指定 fontColor 时继承原材质面色及其后续变化，取消额外套用按钮 disabledColor。文字颜色、渐变和淡出由游戏控制；显式路径样式与 0.35 默认增厚仍保留。不会复制旧字体图集。
+
+0.1.120 修正按钮暗态刷新中的材质反复切换、阴影可见性不一致及重复覆盖文字颜色；切换字体时保留游戏当前的颜色和淡出状态。按钮暗态与恢复正常的实际效果仍需设备验证。
+
+0.1.119 将通用 UI 字体增厚默认值与回退值统一为 0.35。已有配置会保留原值；旧安装需在 UserData/MonsterMusumeTDMod/config.json 中将 Translation.UIAppearance.UiTextFaceDilate 改为 0.35 后重启。匹配的 styles.json 规则仍优先生效。
 
 适用于本项目配套 ARM64 LemonLoader（.NET 10 / Il2CppInterop）和 Unity 2022.3.62f2。
 

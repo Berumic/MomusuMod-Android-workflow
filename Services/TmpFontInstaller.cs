@@ -21,7 +21,7 @@ public static class TmpFontInstaller
 {
     private const float SubSkillMinimumLineSpacing = 8f;
     private const float DefaultUiTextOutlineWidth = 0.3f;
-    private const float DefaultUiTextFaceDilate = 0.2f;
+    private const float DefaultUiTextFaceDilate = 0.35f;
     private const float UiTextSoftOutlineWidth = 0.2f;
     private const float UiTextSoftOutlineSoftness = 0.06f;
     private const float EquipmentSubSkillFaceDilate = 0.2f;
@@ -992,13 +992,14 @@ public static class TmpFontInstaller
         var changed = fontChanged;
         if (fontChanged)
         {
+            var currentPresentation = new TmpPresentationState(text);
             var instanceId = text.GetInstanceID();
             if (SubSkillTextInstanceIds.Contains(instanceId) || UiTextInstanceIds.Contains(instanceId))
                 OriginalTranslatedTmpFonts.TryAdd(instanceId, new TmpPresentationState(text));
             text.font = _loadedFont;
 
-            if (OriginalTranslatedTmpFonts.TryGetValue(instanceId, out var originalPresentation))
-                originalPresentation.RestoreVertexColors(text);
+            // Keep the current disabled/fading state, not the first observed tint.
+            currentPresentation.RestoreVertexColors(text);
 
         }
 
@@ -1072,7 +1073,8 @@ public static class TmpFontInstaller
 
         public bool TryGetFaceColor(out Color faceColor)
         {
-            faceColor = FaceColor;
+            // The game may animate the original material after font replacement.
+            faceColor = HasFaceColor && Material != null ? Material.GetColor("_FaceColor") : FaceColor;
             return HasFaceColor;
         }
     }
@@ -1159,6 +1161,12 @@ public static class TmpFontInstaller
             return;
         }
 
+        // A path style owns this slot's material. Avoid briefly binding the
+        // generic (undimmed) material on every scanner/render callback.
+        if (UiStyleManager.Apply(text, GetUiTextOutlineWidth(), GetUiTextFaceDilate(), _loadedFont,
+                Plugin.Translations?.IsKnownUiTextTranslationValue(text.text) == true))
+            return;
+
         var instanceId = text.GetInstanceID();
         var changed = false;
         if (!UiTextMaterials.TryGetValue(instanceId, out var material) || material == null)
@@ -1168,6 +1176,13 @@ public static class TmpFontInstaller
                 name = $"{_loadedFont.material.name}_UiOutline_{instanceId}"
             };
             UiTextMaterials[instanceId] = material;
+            changed = true;
+        }
+
+        if (material.HasProperty("_FaceColor") && TryGetOriginalFaceColor(text, out var originalFaceColor) &&
+            material.GetColor("_FaceColor") != originalFaceColor)
+        {
+            material.SetColor("_FaceColor", originalFaceColor);
             changed = true;
         }
 
@@ -1201,8 +1216,6 @@ public static class TmpFontInstaller
             text.fontSharedMaterial = material;
             changed = true;
         }
-        UiStyleManager.Apply(text, GetUiTextOutlineWidth(), GetUiTextFaceDilate(), _loadedFont,
-            Plugin.Translations?.IsKnownUiTextTranslationValue(text.text) == true);
         if (changed)
             text.SetAllDirty();
     }
