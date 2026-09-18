@@ -69,7 +69,7 @@ Run workflow 表单不支持上传文件，所以这里用 Release 附件作为 
 
 ## 构建检查和限制
 
-- 检查包名 `com.dmm.dmmgames.monmusutd`、ARM64 IL2CPP 文件和 Unity 版本，不支持缺少资源的 split APK。
+- 包名允许 `com.dmm.dmmgames.monmusutd` 和 `jp.co.dmm.fanzagames.monmusutdx`，继续检查 ARM64 IL2CPP 文件和 Unity 版本，不支持缺少资源的 split APK。允许包名不代表已经完成该版本的实机兼容验证。
 - 按上传 APK 生成安卓 Interop，再编译插件并运行回归检查。
 - 拉取 `Berumic/MonsterMusumeTDChineseTranslation` 的 main，校验翻译 manifest 的大小和 SHA256，记录实际提交号。
 - 进行 16 KiB 对齐、固定密钥签名、签名验证及 APK 部署文件逐项哈希校验。

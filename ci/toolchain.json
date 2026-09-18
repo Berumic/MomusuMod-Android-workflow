@@ -2,7 +2,9 @@
   "releaseTag": "build-tools-v1",
   "assetName": "android-toolchain-v1.zip",
   "sha256": "580721eb3bafccbfa02dc9add6f9df3d69e7fca57f9ca944d6df0dd9e0c90b0b",
-  "packageName": "com.dmm.dmmgames.monmusutd",
+  "packageNames": [
+    "com.dmm.dmmgames.monmusutd",
+    "jp.co.dmm.fanzagames.monmusutdx"
+  ],
   "unityVersion": "2022.3.62f2"
 }
-

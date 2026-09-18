@@ -26,7 +26,9 @@ Check-Exit 'Cannot read APK metadata.'
 $packageLine = ($badging | Where-Object { $_ -match '^package:' }) -join ''
 if ($packageLine -notmatch "^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']*)'") { throw 'Invalid APK package metadata.' }
 $package = $Matches[1]; $code = $Matches[2]; $version = $Matches[3]
-if ($package -ne $config.packageName) { throw "Wrong package: $package" }
+if (@($config.packageNames) -cnotcontains $package) {
+    throw "Wrong package: $package. Allowed packages: $($config.packageNames -join ', ')"
+}
 $zip = [IO.Compression.ZipFile]::OpenRead($Apk)
 try {
     foreach ($path in @('lib/arm64-v8a/libil2cpp.so','assets/bin/Data/Managed/Metadata/global-metadata.dat','assets/bin/Data/globalgamemanagers')) {
