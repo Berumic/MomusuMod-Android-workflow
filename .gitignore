@@ -1,0 +1,12 @@
+.venv/
+work/
+release-assets/
+dist/
+**/bin/
+**/obj/
+*.apk
+*.p12
+*.jks
+*.keystore
+*.log
+
