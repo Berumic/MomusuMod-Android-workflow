@@ -1,6 +1,7 @@
 # 如果你需要下载安装包
-##在release中寻找latest
-##下载 monmusutdx-vxxx-mod-xxx.apk
+## 在release中寻找latest
+## 下载 monmusutdx-vxxx-mod-xxx.apk
+## 注意更新时间，因为是手动触发打包工作流所以可能不会立刻更新。
 
 
 # MonsterMusumeTD Android 自动打包
