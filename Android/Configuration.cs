@@ -14,6 +14,7 @@ public sealed class ConfigEntry<T>
 // Keep the shared settings contract while persisting to Android's writable UserData.
 public sealed class ConfigFile
 {
+    private const string FaceDilateMigrationKey = "Internal.UiFaceDilateDefaultsVersion";
     private readonly string _path;
     private Dictionary<string, JsonElement> _values = new();
     private readonly Dictionary<string, Action<JsonElement>> _readers = new();
@@ -52,6 +53,7 @@ public sealed class ConfigFile
             var values = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllText(_path));
             if (values == null)
                 throw new InvalidDataException("Configuration must be a JSON object");
+            MigrateFaceDilateDefault(values);
             _values = values;
             foreach (var pair in _values)
                 ReadEntry(pair.Key, pair.Value);
@@ -70,6 +72,24 @@ public sealed class ConfigFile
         catch (Exception ex) { Core.Plugin.Log?.LogWarning($"Invalid setting {key}: {ex.Message}"); }
     }
 
+    private static void MigrateFaceDilateDefault(Dictionary<string, JsonElement> values)
+    {
+        if (values.TryGetValue(FaceDilateMigrationKey, out var marker) &&
+            marker.ValueKind == JsonValueKind.Number && marker.TryGetInt32(out var version) && version >= 1)
+            return;
+
+        const string key = "Translation.UIAppearance.UiTextFaceDilate";
+        // Old releases persisted 0.2 automatically, hiding the new default.
+        // A marker lets users deliberately select 0.2 again after this upgrade.
+        if (values.TryGetValue(key, out var value) && value.ValueKind == JsonValueKind.Number &&
+            value.TryGetSingle(out var dilate) && dilate == 0.2f)
+        {
+            values[key] = JsonSerializer.SerializeToElement(0.35f);
+            Core.Plugin.Log?.LogInfo("Migrated legacy UiTextFaceDilate: 0.2 -> 0.35");
+        }
+        values[FaceDilateMigrationKey] = JsonSerializer.SerializeToElement(1);
+    }
+
     public void Save()
     {
         var result = new Dictionary<string, object>();
@@ -77,6 +97,7 @@ public sealed class ConfigFile
             result[pair.Key] = pair.Value;
         foreach (var pair in _writers)
             result[pair.Key] = pair.Value();
+        result[FaceDilateMigrationKey] = 1;
         Directory.CreateDirectory(Path.GetDirectoryName(_path));
         File.WriteAllText(_path + ".tmp", JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }));
         File.Move(_path + ".tmp", _path, true);

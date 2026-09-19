@@ -1,4 +1,6 @@
-# MonsterMusumeTD Android Mod 0.1.121
+# MonsterMusumeTD Android Mod 0.1.122
+
+0.1.122 一次性将未迁移旧配置中的 UiTextFaceDilate=0.2 升级为 0.35，保留其他自定义值。迁移后可手动改回 0.2，不会再次覆盖。启动日志输出实际配置值；styles.json 明确指定的 faceDilate（包括 0）仍优先。
 
 0.1.121 在未指定 fontColor 时继承原材质面色及其后续变化，取消额外套用按钮 disabledColor。文字颜色、渐变和淡出由游戏控制；显式路径样式与 0.35 默认增厚仍保留。不会复制旧字体图集。
 

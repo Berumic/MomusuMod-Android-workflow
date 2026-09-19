@@ -7,7 +7,7 @@ using MonsterMusumeTDMod.Patches;
 using MonsterMusumeTDMod.Services;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.121", "MonsterMusumeTDMod")]
+[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.122", "MonsterMusumeTDMod")]
 
 namespace MonsterMusumeTDMod.Core;
 
@@ -35,6 +35,7 @@ public sealed class Plugin : MelonMod
         Directory.CreateDirectory(AndroidPaths.ModDirectory);
         Settings = new ModConfig(new ConfigFile(Path.Combine(AndroidPaths.ModDirectory, "config.json")));
         Settings.Save();
+        Log.LogInfo($"UI face dilate: {Settings.UiTextFaceDilate.Value}; matching styles.json rules may override this value");
         TranslationUpdateController.ApplyPendingAssetUpdate(AndroidPaths.PluginPath);
         Translations = new TranslationManager(AndroidPaths.PluginPath, Settings);
         Translations.LoadStatic();

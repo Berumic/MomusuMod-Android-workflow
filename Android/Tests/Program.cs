@@ -58,6 +58,24 @@ try
     var reloaded = new ModConfig(new ConfigFile(settingsPath));
     Check(reloaded.UiTextOutlineWidth.Value == 0.42f, "Configuration persists and reloads");
     Check(reloaded.UiTextFaceDilate.Value == 0.2f, "Saved UI face dilate remains user-controlled");
+    var legacyPath = Path.Combine(root, "legacy-config.json");
+    Write(legacyPath, new Dictionary<string, object> {
+        ["Translation.UIAppearance.UiTextFaceDilate"] = 0.2f,
+        ["Translation.UIAppearance.UiTextOutlineWidth"] = 0.42f
+    });
+    var legacy = new ModConfig(new ConfigFile(legacyPath));
+    Check(legacy.UiTextFaceDilate.Value == 0.35f && legacy.UiTextOutlineWidth.Value == 0.42f,
+        "Legacy default migrates without changing unrelated settings");
+    legacy.Save();
+    Check(new ModConfig(new ConfigFile(legacyPath)).UiTextFaceDilate.Value == 0.35f,
+        "Migrated face dilate persists across restarts");
+    legacy.UiTextFaceDilate.Value = 0.2f;
+    legacy.Save();
+    Check(new ModConfig(new ConfigFile(legacyPath)).UiTextFaceDilate.Value == 0.2f,
+        "Migration runs only once and permits a later custom 0.2");
+    Write(legacyPath, new Dictionary<string, object> { ["Translation.UIAppearance.UiTextFaceDilate"] = 0.27f });
+    Check(new ModConfig(new ConfigFile(legacyPath)).UiTextFaceDilate.Value == 0.27f,
+        "Legacy nondefault face dilate is preserved");
     File.WriteAllText(settingsPath, "{invalid");
     reloaded.Reload();
     Check(reloaded.UiTextOutlineWidth.Value == 0.42f, "Invalid JSON preserves active configuration");
