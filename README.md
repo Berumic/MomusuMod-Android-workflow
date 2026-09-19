@@ -1,3 +1,7 @@
+# 如果你需要下载安装包
+在release中寻找latest
+下载 monmusutdx-vxxx-mod-xxx.apk
+
 # MonsterMusumeTD Android 自动打包
 
 上传原版游戏 APK 到 GitHub Release，工作流生成包含 LemonLoader、汉化插件、字体和最新翻译的独立包名 APK。支持与原版共存，使用 GitHub 托管 Windows runner，无需本地电脑一直开机，也不需要 DMM 下载接口。
