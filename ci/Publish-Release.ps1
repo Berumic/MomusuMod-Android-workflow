@@ -44,7 +44,7 @@ try {
     # Completion marker is uploaded after all distributable files.
     & gh release upload $tag "$Output/build-info.json" --repo $Repository --clobber
     if ($LASTEXITCODE -ne 0) { throw 'Cannot upload build marker; draft retained.' }
-    & gh release edit $tag --repo $Repository --draft=false --latest=false
+    # Mark the generated Mod release as the repository's Latest release.
+    & gh release edit $tag --repo $Repository --draft=false --latest=true
     if ($LASTEXITCODE -ne 0) { throw 'Cannot publish completed release; draft retained.' }
 } finally { Remove-Item -LiteralPath $notesFile -Force }
-

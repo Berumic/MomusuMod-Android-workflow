@@ -72,7 +72,7 @@
 2. 进入 **Actions → Build Mod APK → Run workflow**。
 3. `apk_release_tag` 填 `game-input`；只有一个 APK 时 `apk_asset_name` 留空。标签留空时自动选择每个游戏最新的标准命名原版 Release。
 4. 勾选 `publish_release` 并运行；取消勾选则强制构建且只保存 Actions artifact。需要重新构建已有相同输入时，勾选 `force`。
-5. 成功后在 `mod-<game>-v<versionCode>` Release 下载签名 APK，或下载 Actions 页对应产物。输入未改变时自动跳过，不生成新产物。
+5. 成功后在带有 GitHub `Latest` 标记的 `mod-<game>-v<versionCode>` Release 下载签名 APK，或下载 Actions 页对应产物。输入未改变时自动跳过，不生成新产物。
 
 Run workflow 表单不支持上传文件，所以这里用 Release 附件作为 APK 输入。
 
@@ -87,7 +87,7 @@ Run workflow 表单不支持上传文件，所以这里用 Release 附件作为 
 - 每 6 小时检查一次：检测最新原版 Release 的 APK 附件替换和远端汉化清单更新。GitHub 定时执行可能延迟。
 - 手动 Run workflow，或发送 `repository_dispatch` 的 `mod-input-updated` 事件。
 
-只替换 Release 附件不一定立即产生 Release 事件，定时检查会补上，也可手动运行。输出标签使用 `mod-*`，不会循环触发。没有上传原版时，自动检查会跳过。
+只替换 Release 附件不一定立即产生 Release 事件，定时检查会补上，也可手动运行。输出标签使用 `mod-*`，不会循环触发；构建成功后该 Mod Release 会被标记为仓库 Latest。GitHub 每个仓库只有一个 Latest 标记，多游戏目标时最后完成的构建会成为 Latest。没有上传原版时，自动检查会跳过。
 
 自动选择按各游戏的原版 versionCode 数值选最新版本。老的 `apk-174` 标签仍可手动指定；仓库完全没有标准命名输入时，也会回退检查最近发布的 `apk-*` Release。多版本并存时建议统一标准命名，旧版本需要手动指定重建。
 
