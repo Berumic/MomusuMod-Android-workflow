@@ -19,6 +19,10 @@ public sealed class TranslationManager
     private readonly ConcurrentDictionary<string, Dictionary<string, string>> _scenarios = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _names = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _uiTexts = new(StringComparer.Ordinal);
+    // UI results depend on both text and path. Bound retained runtime strings;
+    // misses are cached too, and every table reload invalidates both kinds.
+    private readonly Dictionary<(string Source, string Path), (bool Matched, string Value)> _uiResults = new();
+    private const int UiResultCapacity = 1024;
     private readonly List<UiPathTable> _uiPathTables = new();
     private readonly Dictionary<string, List<UiPathTable>>
         _uiPathTablesByLeaf = new(StringComparer.OrdinalIgnoreCase);
@@ -70,6 +74,7 @@ public sealed class TranslationManager
 
     public void LoadStatic()
     {
+        _uiResults.Clear();
         _names.Clear();
         _nameExTemplates.Clear();
         _nameSceneTemplates.Clear();
@@ -353,6 +358,26 @@ public sealed class TranslationManager
         translated = source;
         if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
             return false;
+        if (source.Length > 8192 || (scenePath?.Length ?? 0) > 4096)
+            return TryTranslateUiTextCore(source, scenePath, out translated);
+        var key = (source, scenePath ?? string.Empty);
+        if (_uiResults.TryGetValue(key, out var cached))
+        {
+            translated = cached.Value;
+            return cached.Matched;
+        }
+        var matched = TryTranslateUiTextCore(source, scenePath, out translated);
+        if (_uiResults.Count >= UiResultCapacity)
+            _uiResults.Clear();
+        _uiResults[key] = (matched, translated);
+        return matched;
+    }
+
+    private bool TryTranslateUiTextCore(string source, string scenePath, out string translated)
+    {
+        translated = source;
+        if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
+            return false;
 
         if (TryTranslateSceneTemplate(source, scenePath, _uiSceneTemplates, out translated))
             return true;
@@ -381,6 +406,11 @@ public sealed class TranslationManager
         // TMP descriptions may be populated with CRLF while JSON source
         // tables use LF. Normalize only for a second complete-row lookup.
         var normalizedSource = NormalizeSubSkillKey(source);
+        if (string.Equals(normalizedSource, source, StringComparison.Ordinal))
+        {
+            translated = source;
+            return false;
+        }
         if (!string.Equals(normalizedSource, source, StringComparison.Ordinal) &&
             TryTranslateSceneTemplate(normalizedSource, scenePath, _uiSceneTemplates, out translated))
             return true;
@@ -905,6 +935,7 @@ public sealed class TranslationManager
         private readonly Regex _sourcePattern;
         private readonly Regex _translationPattern;
         private readonly string _translation;
+        private readonly string[] _translationPieces;
 
         public NumberTemplate(string source, string translation)
         {
@@ -912,6 +943,7 @@ public sealed class TranslationManager
             _sourcePattern = BuildPattern(source);
             _translationPattern = BuildPattern(translation);
             _translation = translation;
+            _translationPieces = translation.Split(NumberPlaceholder, StringSplitOptions.None);
         }
 
         public int SourceLength { get; }
@@ -925,17 +957,21 @@ public sealed class TranslationManager
                 return false;
             }
 
-            var value = _translation;
-            foreach (Capture capture in match.Groups["number"].Captures)
+            var captures = match.Groups["number"].Captures;
+            var count = Math.Min(captures.Count, _translationPieces.Length - 1);
+            if (count == 0)
             {
-                var placeholderIndex = value.IndexOf(NumberPlaceholder, StringComparison.Ordinal);
-                if (placeholderIndex < 0)
-                    break;
-                value = value[..placeholderIndex] + capture.Value +
-                        value[(placeholderIndex + NumberPlaceholder.Length)..];
+                translated = _translation;
+                return true;
             }
-
-            translated = value;
+            var result = new StringBuilder(_translation.Length + 16);
+            result.Append(_translationPieces[0]);
+            for (var index = 0; index < _translationPieces.Length - 1; index++)
+            {
+                result.Append(index < count ? captures[index].Value : NumberPlaceholder);
+                result.Append(_translationPieces[index + 1]);
+            }
+            translated = result.ToString();
             return true;
         }
 

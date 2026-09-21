@@ -183,7 +183,13 @@ public sealed class RuntimeTextCollector
                 "renderer\tui_path\tfont_name\tmaterial_name\ttext\tfallback_material\t" +
                 "fallback_source_material\trendering_material\tmaterial_index\t" +
                 "outline_width\tface_dilate\toutline_on\tsibling_index\tcanvas_name\t" +
-                "canvas_sorting_order\tresource_name\tenabled\traycast_target"
+                "canvas_sorting_order\tresource_name\tenabled\traycast_target\t" +
+                "vertex_gradient_enabled\tgradient_top_left\tgradient_top_right\t" +
+                "gradient_bottom_left\tgradient_bottom_right\tgradient_preset\t" +
+                "first_visible_vertex_colors\tselectable_type\tselectable_interactable\t" +
+                "selectable_effective_interactable\tselectable_transition\tdisabled_color\t" +
+                "target_graphic_path\ttarget_graphic_color\ttarget_renderer_color\t" +
+                "text_color\ttext_renderer_color\tmaterial_face_color\toriginal_face_color"
             };
             var observed = new HashSet<string>(StringComparer.Ordinal);
 
@@ -245,9 +251,13 @@ public sealed class RuntimeTextCollector
 
         var (fontName, materialName) = GetFontMetadata(component);
         var material = component is TMP_Text tmp ? tmp.fontSharedMaterial : null;
+        var gradientDiagnostics = component is TMP_Text tmpText
+            ? GetGradientDiagnostics(tmpText)
+            : "\t\t\t\t\t\t";
         var line = $"{renderer}\t{GetHierarchy(component, 64)}\t{EscapeForTsv(fontName)}\t" +
                    $"{EscapeForTsv(materialName)}\t{EscapeForTsv(source)}\t\t\t\t\t" +
-                   GetMaterialDiagnostics(material) + "\t\t\t\t\t\t";
+                   GetMaterialDiagnostics(material) + "\t\t\t\t\t\t\t" + gradientDiagnostics +
+                   "\t" + GetSelectableDiagnostics(component) + "\t" + GetFaceDiagnostics(component);
         if (observed.Add(line))
             lines.Add(line);
 
@@ -419,7 +429,7 @@ public sealed class RuntimeTextCollector
                    $"{EscapeForTsv(GetMaterialName(fallbackSourceMaterial))}\t" +
                    $"{EscapeForTsv(GetMaterialName(renderingMaterial))}\t" +
                    $"{subMesh.m_materialReferenceIndex}\t{GetMaterialDiagnostics(renderingMaterial)}" +
-                   "\t\t\t\t\t\t";
+                   "\t\t\t\t\t\t\t\t\t\t\t\t\t";
         if (observed.Add(line))
             lines.Add(line);
     }
@@ -479,7 +489,7 @@ public sealed class RuntimeTextCollector
                    $"<none>\t<none>\tfalse\t{component.transform.GetSiblingIndex()}\t" +
                    $"{EscapeForTsv(canvas != null ? canvas.name : "<none>")}\t" +
                    $"{(canvas != null ? canvas.sortingOrder : 0)}\t{EscapeForTsv(resourceName)}\t" +
-                   $"{enabled}\t{raycast}";
+                   $"{enabled}\t{raycast}\t\t\t\t\t\t\t";
         if (observed.Add(line))
             lines.Add(line);
     }
@@ -500,6 +510,110 @@ public sealed class RuntimeTextCollector
             : "<none>";
         return $"{outlineWidth}\t{faceDilate}\t{material.HasShaderKeyword("OUTLINE_ON")}";
     }
+
+    private static string GetGradientDiagnostics(TMP_Text text)
+    {
+        try { return ReadGradientDiagnostics(text); }
+        catch (Exception ex)
+        {
+            Core.Plugin.Log?.LogWarning($"Gradient diagnostic unavailable: {ex}");
+            return "<unavailable>\t\t\t\t\t\t";
+        }
+    }
+
+    private static string GetFaceDiagnostics(Component component)
+    {
+        if (component is not TMP_Text text) return "\t\t\t";
+        try
+        {
+            var material = text.fontSharedMaterial;
+            var face = material != null && material.HasProperty("_FaceColor")
+                ? FormatColor(material.GetColor("_FaceColor")) : "<none>";
+            var original = TmpFontInstaller.TryGetOriginalFaceColor(text, out var color)
+                ? FormatColor(color) : "<none>";
+            return $"{FormatColor(text.color)}\t{FormatColor(text.canvasRenderer.GetColor())}\t{face}\t{original}";
+        }
+        catch (Exception ex)
+        {
+            return $"<unavailable:{EscapeForTsv(ex.Message)}>\t\t\t";
+        }
+    }
+
+    private static string ReadGradientDiagnostics(TMP_Text text)
+    {
+        var gradient = text.colorGradient;
+        var preset = text.colorGradientPreset != null ? text.colorGradientPreset.name : "<none>";
+        return $"{text.enableVertexGradient}\t{FormatColor(gradient.topLeft)}\t" +
+               $"{FormatColor(gradient.topRight)}\t{FormatColor(gradient.bottomLeft)}\t" +
+               $"{FormatColor(gradient.bottomRight)}\t{EscapeForTsv(preset)}\t" +
+               GetFirstVisibleVertexColors(text);
+    }
+
+    private static string GetSelectableDiagnostics(Component component)
+    {
+        try { return ReadSelectableDiagnostics(component); }
+        catch (Exception ex)
+        {
+            Core.Plugin.Log?.LogWarning($"Button diagnostic unavailable: {ex}");
+            return "<unavailable>\t\t\t\t\t\t\t";
+        }
+    }
+
+    private static string ReadSelectableDiagnostics(Component component)
+    {
+        var selectable = component.GetComponentInParent<Selectable>();
+        if (selectable == null)
+            return "\t\t\t\t\t\t\t";
+        var graphic = selectable.targetGraphic;
+        return $"{selectable.GetIl2CppType().Name}\t{selectable.interactable}\t" +
+               $"{selectable.IsInteractable()}\t{selectable.transition}\t" +
+               $"{FormatColor(selectable.colors.disabledColor)}\t" +
+               $"{(graphic != null ? EscapeForTsv(GetHierarchy(graphic, 64)) : "<none>")}\t" +
+               $"{(graphic != null ? FormatColor(graphic.color) : "<none>")}\t" +
+               $"{(graphic != null ? FormatColor(graphic.canvasRenderer.GetColor()) : "<none>")}";
+    }
+
+    private static string GetFirstVisibleVertexColors(TMP_Text text)
+    {
+        try
+        {
+            var textInfo = text.textInfo;
+            if (textInfo == null || textInfo.characterCount <= 0)
+                return "<none>";
+
+            for (var i = 0; i < textInfo.characterCount; i++)
+            {
+                var character = textInfo.characterInfo[i];
+                if (!character.isVisible)
+                    continue;
+                var materialIndex = character.materialReferenceIndex;
+                if (materialIndex < 0 || materialIndex >= textInfo.meshInfo.Length)
+                    return "<none>";
+                var colors = textInfo.meshInfo[materialIndex].colors32;
+                var vertexIndex = character.vertexIndex;
+                if (colors == null || vertexIndex < 0 || vertexIndex + 3 >= colors.Length)
+                    return "<none>";
+                return $"{FormatColor(colors[vertexIndex])}," +
+                       $"{FormatColor(colors[vertexIndex + 1])}," +
+                       $"{FormatColor(colors[vertexIndex + 2])}," +
+                       FormatColor(colors[vertexIndex + 3]);
+            }
+        }
+        catch
+        {
+            // Snapshot diagnostics must never disturb live UI rendering.
+        }
+        return "<none>";
+    }
+
+    private static string FormatColor(Color color) =>
+        $"#{ColorByte(color.r):X2}{ColorByte(color.g):X2}{ColorByte(color.b):X2}{ColorByte(color.a):X2}";
+
+    private static byte ColorByte(float value) =>
+        (byte)Math.Clamp((int)Math.Round(value * 255f), 0, 255);
+
+    private static string FormatColor(Color32 color) =>
+        $"#{color.r:X2}{color.g:X2}{color.b:X2}{color.a:X2}";
 
     private static (string FontName, string MaterialName) GetFontMetadata(Component component)
     {

@@ -13,6 +13,7 @@ public static class PatchManager
     private static TranslationManager _translations;
     private static ModConfig _config;
     private static bool _processingDiscoveredText;
+    [ThreadStatic] internal static bool DeferringTmpPresentation;
     private static bool _storyTargetLogged;
     private static bool _storyMatchLogged;
     private static bool _storyMissLogged;
@@ -61,6 +62,13 @@ public static class PatchManager
             "TMPro.TextMeshProUGUI",
             new[] { "OnTransformParentChanged", "OnCanvasHierarchyChanged" },
             requestFastScan: true);
+        // Button state transitions change the label's tint without changing its
+        // text. Reapply the cached material so disabled buttons use the game's
+        // darkened face color immediately instead of waiting for the scanner.
+        PatchContextPostfixMethods(
+            "UnityEngine.UI.Selectable",
+            new[] { "DoStateTransition" },
+            nameof(Hooks.ApplyButtonState));
         // UTAGE 类型名和方法签名会随游戏版本变化；这些探针失败时只跳过，不阻止 TMP 补丁加载。
         foreach (var typeName in new[]
         {
@@ -348,6 +356,14 @@ public static class PatchManager
     {
         public static void ObserveContext(object __instance) => ScenarioContext.Observe(__instance);
 
+        public static void ApplyButtonState(object __instance)
+        {
+            if (__instance is not UnityEngine.Component component)
+                return;
+            foreach (var text in component.GetComponentsInChildren<TMPro.TMP_Text>(true))
+                UiCanvasTranslationScanner.QueueActivationRefresh(text);
+        }
+
         public static void TranslateStoryBeforeParse(
             System.Reflection.MethodBase __originalMethod,
             ref string __0
@@ -369,6 +385,12 @@ public static class PatchManager
 
         public static void ApplyFont(object __instance)
         {
+            if (UiCanvasTranslationScanner.IsApplying(__instance)) return;
+            if (__instance is TMPro.TMP_Text)
+            {
+                UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
+                return;
+            }
             TmpFontInstaller.ApplyToCurrentText(__instance);
             TmpFontInstaller.ApplyConfiguredUiStyle(__instance);
             UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
@@ -376,13 +398,11 @@ public static class PatchManager
 
         public static void QueueUiRefresh(object __instance)
         {
-            TmpFontInstaller.ApplyConfiguredUiStyle(__instance);
             UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
         }
 
         public static void QueueUiActivationRefresh(object __instance)
         {
-            TmpFontInstaller.ApplyConfiguredUiStyle(__instance);
             UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
@@ -393,13 +413,26 @@ public static class PatchManager
 
         public static void ReapplyTranslatedText(object __instance)
         {
-            TmpFontInstaller.ReapplyTranslatedText(__instance);
-            UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
+            if (UiCanvasTranslationScanner.IsApplying(__instance)) return;
+            UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
         public static void TranslateString(object __instance, ref string __0)
         {
+            if (UiCanvasTranslationScanner.IsApplying(__instance)) return;
+            var previous = DeferringTmpPresentation;
+            DeferringTmpPresentation = __instance is TMPro.TMP_Text;
+            try { TranslateStringCore(__instance, ref __0); }
+            finally { DeferringTmpPresentation = previous; }
+        }
+
+        private static void TranslateStringCore(object __instance, ref string __0)
+        {
             if (_config == null || !_config.Enabled.Value)
+                return;
+            // Projection text is already the final translated display value.
+            // Never send it back through translation/font hooks on each sync.
+            if (TmpFontInstaller.IsUiTextSoftOutlineLayer(__instance))
                 return;
 
             // A virtualized slot can receive its next source value before the

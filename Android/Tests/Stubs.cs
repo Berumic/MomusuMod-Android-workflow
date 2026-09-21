@@ -1,5 +1,6 @@
 namespace UnityEngine
 {
+    public readonly record struct Color(float r, float g, float b, float a);
     public class MonoBehaviour { public MonoBehaviour(IntPtr pointer) { } }
     public class Material
     {

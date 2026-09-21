@@ -15,6 +15,7 @@ public sealed class ModConfig
     public ConfigEntry<bool> TranslateNames { get; }
     public ConfigEntry<bool> TranslateUiTexts { get; }
     public ConfigEntry<bool> EnableUiSnapshotHotkey { get; }
+    public ConfigEntry<bool> EnableUiPerformanceLog { get; }
     public ConfigEntry<bool> EnableSubSkillScanHotkey { get; }
     public ConfigEntry<string> Language { get; }
     public ConfigEntry<string> FontAssetPath { get; }
@@ -25,6 +26,7 @@ public sealed class ModConfig
     public ConfigEntry<float> UiTextOutlineWidth { get; }
     public ConfigEntry<float> UiTextFaceDilate { get; }
     public ConfigEntry<bool> EnableTranslationAutoUpdate { get; }
+    public ConfigEntry<bool> ManualSyncWithF6 { get; }
     public ConfigEntry<string> TranslationUpdateBaseUrl { get; }
     public ConfigEntry<string> TranslationAssetUpdateBaseUrl { get; }
     public ConfigEntry<int> TranslationUpdateTimeoutSeconds { get; }
@@ -32,6 +34,8 @@ public sealed class ModConfig
     public ModConfig(ConfigFile config)
     {
         _config = config;
+        EnableUiPerformanceLog = config.Bind("Debug", "EnableUiPerformanceLog", false,
+            "每5秒记录UI刷新请求、合并数量和处理耗时，用于排查切页卡顿");
         Enabled = config.Bind("Translation", "Enabled", true, "启用运行时翻译");
         TranslateScenarios = config.Bind("Translation", "TranslateScenarios", true, "翻译剧情正文和剧情 Log");
         TranslateSubSkills = config.Bind("Translation", "TranslateSubSkills", true, "翻译副技能名称和说明");
@@ -84,6 +88,11 @@ public sealed class ModConfig
             "Enabled",
             true,
             "启动后在后台从翻译仓库同步新增、修改和已删除的受管文件");
+        ManualSyncWithF6 = config.Bind(
+            "Translation.Update",
+            "ManualSyncWithF6",
+            true,
+            "按 F6 时同步 GitHub 翻译；关闭后 F6 仅重载本地文件");
         TranslationUpdateBaseUrl = config.Bind(
             "Translation.Update",
             "BaseUrl",

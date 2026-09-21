@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="..\Configuration.cs;..\..\Core\ModConfig.cs;..\..\Services\TranslationManager.cs;..\..\Patches\TranslationUpdateController.cs" />
     <Compile Include="..\..\Services\MaterialKeywords.cs" />
+    <Compile Include="..\..\Services\UiRefreshQueue.cs;..\..\Services\UiStylePolicy.cs" />
     <Reference Include="Mono.Cecil" HintPath="$(AndroidWorkspace)\Loader\Mono.Cecil.dll" />
   </ItemGroup>
 </Project>

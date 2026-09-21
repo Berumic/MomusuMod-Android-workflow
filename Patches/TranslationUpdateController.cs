@@ -21,6 +21,7 @@ namespace MonsterMusumeTDMod.Patches;
 /// <summary>Synchronizes repository-managed translation files without blocking game startup.</summary>
 public sealed class TranslationUpdateController : MonoBehaviour
 {
+    private static TranslationUpdateController _instance;
     private Task<UpdateResult> _updateTask;
     private Task<AssetUpdateResult> _assetUpdateTask;
     private bool _handled;
@@ -38,10 +39,33 @@ public sealed class TranslationUpdateController : MonoBehaviour
     {
     }
 
+    public static void RequestManualSync()
+    {
+        if (_instance == null)
+        {
+            Plugin.Log?.LogWarning("F6 translation sync skipped: update controller is not ready");
+            return;
+        }
+        _instance.BeginTranslationSync(true);
+    }
+
     public void Start()
     {
+        _instance = this;
         if (Plugin.Settings?.EnableTranslationAutoUpdate.Value != true)
             return;
+
+        BeginTranslationSync(false);
+    }
+
+    private void BeginTranslationSync(bool manual)
+    {
+        if ((_updateTask != null && (!_updateTask.IsCompleted || !_handled)) ||
+            (_assetUpdateTask != null && (!_assetUpdateTask.IsCompleted || !_assetHandled)))
+        {
+            Plugin.Log?.LogInfo("Translation sync is already running");
+            return;
+        }
 
         var translationRoot = Path.Combine(Paths.PluginPath, "MonsterMusumeTDMod", "translations");
         var baseUrl = Plugin.Settings.TranslationUpdateBaseUrl.Value?.Trim().TrimEnd('/');
@@ -50,14 +74,18 @@ public sealed class TranslationUpdateController : MonoBehaviour
 
         if (string.IsNullOrWhiteSpace(baseUrl))
         {
-            Plugin.Log?.LogWarning("Translation auto-update skipped: remote base URL is empty");
+            Plugin.Log?.LogWarning($"Translation sync skipped: remote base URL is empty");
             return;
         }
 
-        Plugin.Log?.LogInfo("Checking for translation updates in the background");
+        _handled = false;
+        Plugin.Log?.LogInfo(manual
+            ? "F6 requested translation synchronization in the background"
+            : "Checking for translation updates in the background");
         _updateTask = Task.Run(() => SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds));
         if (!string.IsNullOrWhiteSpace(assetBaseUrl))
         {
+            _assetHandled = false;
             Plugin.Log?.LogInfo("Checking for font asset updates in the background");
             _assetUpdateTask = Task.Run(() => SynchronizeFontAssetAsync(
                 Paths.PluginPath, assetBaseUrl, timeoutSeconds));

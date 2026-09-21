@@ -193,6 +193,11 @@ public static class TmpFontInstaller
         var instanceId = text.GetInstanceID();
         SubSkillTextInstanceIds.Add(instanceId);
         SubSkillTranslatedValues[instanceId] = content;
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            return;
+        }
         ApplyTranslatedTmpText(text, content, useSubSkillPresentation: ShouldUseSubSkillPresentation(text));
 
         if (SubSkillFontLoggedIds.Add(instanceId))
@@ -209,10 +214,21 @@ public static class TmpFontInstaller
 
         var instanceId = text.GetInstanceID();
         UiTextInstanceIds.Add(instanceId);
+        var repeatedValue = UiTextTranslatedValues.TryGetValue(instanceId, out var previousValue) &&
+                            string.Equals(previousValue, content, StringComparison.Ordinal);
         UiTextTranslatedValues[instanceId] = content;
-        if (!string.IsNullOrEmpty(source))
+        // The queued pass sees the already translated text. Do not replace
+        // the original Japanese key with that value: F6 needs the original.
+        if (!string.IsNullOrEmpty(source) &&
+            (!string.Equals(source, content, StringComparison.Ordinal) ||
+             !repeatedValue || !UiTextSourceValues.ContainsKey(instanceId)))
             UiTextSourceValues[instanceId] = source;
         UiTextComponents[instanceId] = text;
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            return;
+        }
         ApplyTranslatedTmpText(text, content, useSubSkillPresentation: false);
         if (content.Contains('\n') &&
             !Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing))
@@ -221,11 +237,6 @@ public static class TmpFontInstaller
             text.SetAllDirty();
         }
         ApplyUiTextPresentation(text);
-        // Unit-detail descriptions use a dedicated material and fixed line
-        // spacing. The generic UI presentation above must not win when a
-        // translated value is registered for F6/rebind handling.
-        if (IsUnitDetailFontOverride(text))
-            ApplyUnitDetailFont(text);
     }
 
     /// <summary>Refreshes visible manual UI translations after F6 reloads JSON tables.</summary>
@@ -266,7 +277,8 @@ public static class TmpFontInstaller
 
             if (!string.Equals(text.text, translated, StringComparison.Ordinal))
                 text.text = translated;
-            ApplyToTranslatedUiText(text, translated, source);
+            UiTextTranslatedValues[entry.Key] = translated;
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
             refreshed++;
             processedIds.Add(entry.Key);
         }
@@ -304,7 +316,8 @@ public static class TmpFontInstaller
 
             if (!string.Equals(source, translated, System.StringComparison.Ordinal))
                 text.text = translated;
-            ApplyToTranslatedUiText(text, translated, source);
+            UiTextSourceValues[instanceId] = source;
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
             refreshed++;
         }
 
@@ -321,7 +334,7 @@ public static class TmpFontInstaller
                 !SubSkillTextInstanceIds.Contains(text.GetInstanceID()))
                 continue;
 
-            ApplySubSkillPresentationIfNeeded(text);
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
             refreshed++;
         }
 
@@ -330,6 +343,11 @@ public static class TmpFontInstaller
 
     public static void RestoreTranslatedSubSkillText(object component)
     {
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(component);
+            return;
+        }
         if (component is not TMP_Text text)
             return;
 
@@ -337,6 +355,7 @@ public static class TmpFontInstaller
         if (!SubSkillTextInstanceIds.Remove(instanceId))
             return;
 
+        UiStyleManager.ReleasePresentation(text);
         SubSkillTranslatedValues.Remove(instanceId);
         if (IsUnitDetailFontOverride(text))
         {
@@ -367,6 +386,11 @@ public static class TmpFontInstaller
 
     public static void RestoreTranslatedUiText(object component)
     {
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(component);
+            return;
+        }
         if (component is not TMP_Text text)
             return;
 
@@ -374,6 +398,7 @@ public static class TmpFontInstaller
         if (!UiTextInstanceIds.Remove(instanceId))
             return;
 
+        UiStyleManager.ReleasePresentation(text);
         UiTextTranslatedValues.Remove(instanceId);
         UiTextSourceValues.Remove(instanceId);
         UiTextComponents.Remove(instanceId);
@@ -581,6 +606,12 @@ public static class TmpFontInstaller
             !IsUnitDetailFontOverride(text))
             return;
 
+        var compact = IsUnitDetailNoOutlineText(text);
+        if (UiStyleManager.SubmitBaseline(text, _loadedFont,
+            compact ? 0f : GetUiTextOutlineWidth(), compact ? 0f : GetUiTextFaceDilate(),
+            UiTextOutlineColor, IsUnitDetailFixedSpacingText(text) || text.text.Contains('\n')
+                ? SubSkillMinimumLineSpacing : null, !compact))
+            return;
         EnsureUnitDetailMaterials();
         var material = IsUnitDetailNoOutlineText(text)
             ? _unitDetailNoOutlineMaterial
@@ -631,7 +662,7 @@ public static class TmpFontInstaller
                 !IsUnitDetailFontOverride(text))
                 continue;
 
-            ApplyUnitDetailFont(text);
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
             refreshed++;
         }
         return refreshed;
@@ -719,6 +750,14 @@ public static class TmpFontInstaller
             return;
 
         var instanceId = legacyText.GetInstanceID();
+        // UTAGE owns the reveal state of the live dialogue. A separate TMP
+        // renderer cannot reproduce it from Text.text (which is the full line).
+        if (IsCurrentStoryDialogueText(legacyText))
+        {
+            ApplyLegacyStoryFont(legacyText);
+            RestoreOriginalText(legacyText);
+            return;
+        }
         if (!_replaceStoryNames && IsStorySpeakerNameText(legacyText))
         {
             RestoreOriginalText(legacyText);
@@ -825,6 +864,12 @@ public static class TmpFontInstaller
 
     public static void SyncKnownStoryText(Text legacyText, string content)
     {
+        if (legacyText != null && IsCurrentStoryDialogueText(legacyText))
+        {
+            ApplyLegacyStoryFont(legacyText);
+            RestoreOriginalText(legacyText);
+            return;
+        }
         if (legacyText != null && _loadedLegacyFont != null && IsStoryMessageText(legacyText))
         {
             if (!_replaceStoryNames && IsStorySpeakerNameText(legacyText))
@@ -874,6 +919,11 @@ public static class TmpFontInstaller
 
         if (StoryTmpTexts.TryGetValue(legacyText.GetInstanceID(), out var overlay) && overlay != null)
             overlay.enabled = false;
+        // Also recover an overlay whose initialization failed before it was
+        // entered in StoryTmpTexts. Never leave an orphan full-line renderer.
+        var orphan = legacyText.transform.Find("MonsterMusumeTDMod_StoryText");
+        if (orphan != null)
+            orphan.gameObject.SetActive(false);
         legacyText.enabled = true;
     }
 
@@ -881,14 +931,24 @@ public static class TmpFontInstaller
     {
         var useWhiteOutline = Plugin.Settings.EnableR18WhiteTextOutline.Value &&
                               R18DialogueBackgroundController.IsR18SceneActive();
-        if (!force && _lastR18StoryOutlineState == useWhiteOutline)
+        var weightChanged = useWhiteOutline && _r18StoryOutlineMaterial != null &&
+            _r18StoryOutlineMaterial.HasProperty("_FaceDilate") &&
+            !Mathf.Approximately(_r18StoryOutlineMaterial.GetFloat("_FaceDilate"), GetUiTextFaceDilate());
+        if (!force && !weightChanged && _lastR18StoryOutlineState == useWhiteOutline)
             return;
         _lastR18StoryOutlineState = useWhiteOutline;
 
         foreach (var text in StoryTmpTexts.Values)
         {
             if (text != null)
+            {
                 ApplyR18StoryPresentation(text, useWhiteOutline);
+                if (weightChanged)
+                {
+                    text.UpdateMeshPadding();
+                    text.SetAllDirty();
+                }
+            }
         }
     }
 
@@ -913,7 +973,12 @@ public static class TmpFontInstaller
     private static Material GetR18StoryOutlineMaterial()
     {
         if (_r18StoryOutlineMaterial != null)
+        {
+            if (_r18StoryOutlineMaterial.HasProperty("_FaceDilate") &&
+                !Mathf.Approximately(_r18StoryOutlineMaterial.GetFloat("_FaceDilate"), GetUiTextFaceDilate()))
+                _r18StoryOutlineMaterial.SetFloat("_FaceDilate", GetUiTextFaceDilate());
             return _r18StoryOutlineMaterial;
+        }
         if (_loadedFont == null || _loadedFont.material == null)
             return null;
 
@@ -930,6 +995,8 @@ public static class TmpFontInstaller
 
         material.SetColor("_OutlineColor", Color.white);
         material.SetFloat("_OutlineWidth", R18StoryOutlineWidth);
+        if (material.HasProperty("_FaceDilate"))
+            material.SetFloat("_FaceDilate", GetUiTextFaceDilate());
         _r18StoryOutlineMaterial = material;
         Plugin.Log.LogInfo("R18 story white-outline material created");
         return _r18StoryOutlineMaterial;
@@ -988,6 +1055,17 @@ public static class TmpFontInstaller
         if (text == null)
             return false;
 
+        if (UiStyleManager.IsCollecting(text))
+        {
+            var id = text.GetInstanceID();
+            if (text.font != _loadedFont &&
+                (SubSkillTextInstanceIds.Contains(id) || UiTextInstanceIds.Contains(id)))
+                OriginalTranslatedTmpFonts.TryAdd(id, new TmpPresentationState(text));
+            UiStyleManager.SubmitBaseline(text, _loadedFont, 0f, GetUiTextFaceDilate(),
+                UiTextOutlineColor, null, false);
+            return false;
+        }
+
         var fontChanged = text.font != _loadedFont;
         var changed = fontChanged;
         if (fontChanged)
@@ -998,7 +1076,6 @@ public static class TmpFontInstaller
                 OriginalTranslatedTmpFonts.TryAdd(instanceId, new TmpPresentationState(text));
             text.font = _loadedFont;
 
-            // Keep the current disabled/fading state, not the first observed tint.
             currentPresentation.RestoreVertexColors(text);
 
         }
@@ -1073,7 +1150,6 @@ public static class TmpFontInstaller
 
         public bool TryGetFaceColor(out Color faceColor)
         {
-            // The game may animate the original material after font replacement.
             faceColor = HasFaceColor && Material != null ? Material.GetColor("_FaceColor") : FaceColor;
             return HasFaceColor;
         }
@@ -1089,6 +1165,10 @@ public static class TmpFontInstaller
             ApplyUnitDetailFont(text);
             return;
         }
+
+        if (UiStyleManager.SubmitBaseline(text, _loadedFont, GetUiTextOutlineWidth(),
+            GetUiTextFaceDilate(), SubSkillOutlineColor, SubSkillMinimumLineSpacing))
+            return;
 
         var changed = false;
         if (!Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing))
@@ -1161,10 +1241,8 @@ public static class TmpFontInstaller
             return;
         }
 
-        // A path style owns this slot's material. Avoid briefly binding the
-        // generic (undimmed) material on every scanner/render callback.
-        if (UiStyleManager.Apply(text, GetUiTextOutlineWidth(), GetUiTextFaceDilate(), _loadedFont,
-                Plugin.Translations?.IsKnownUiTextTranslationValue(text.text) == true))
+        if (UiStyleManager.SubmitBaseline(text, _loadedFont, GetUiTextOutlineWidth(),
+            GetUiTextFaceDilate(), GetUiTextOutlineColor(text), null))
             return;
 
         var instanceId = text.GetInstanceID();
@@ -1176,13 +1254,6 @@ public static class TmpFontInstaller
                 name = $"{_loadedFont.material.name}_UiOutline_{instanceId}"
             };
             UiTextMaterials[instanceId] = material;
-            changed = true;
-        }
-
-        if (material.HasProperty("_FaceColor") && TryGetOriginalFaceColor(text, out var originalFaceColor) &&
-            material.GetColor("_FaceColor") != originalFaceColor)
-        {
-            material.SetColor("_FaceColor", originalFaceColor);
             changed = true;
         }
 
@@ -1216,6 +1287,8 @@ public static class TmpFontInstaller
             text.fontSharedMaterial = material;
             changed = true;
         }
+        UiStyleManager.Apply(text, GetUiTextOutlineWidth(), GetUiTextFaceDilate(), _loadedFont,
+            Plugin.Translations?.IsKnownUiTextTranslationValue(text.text) == true);
         if (changed)
             text.SetAllDirty();
     }
@@ -1608,7 +1681,7 @@ public static class TmpFontInstaller
             }
         }
 
-        Plugin.Log.LogWarning("No Legacy UI font is available; story text will use the TMP overlay.");
+        Plugin.Log.LogWarning("No Legacy UI font is available; live dialogue retains UTAGE's original font and reveal state. Bundle a Legacy Font for complete Chinese glyph coverage.");
 #endif
     }
 
@@ -1713,7 +1786,11 @@ public static class TmpFontInstaller
         // so matching the exact prefab path silently skipped every card.
         var isAttachAbilityList =
             path.Contains("Unit_Detail_AttachAbility", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/WindowBase/ScrollView/", StringComparison.OrdinalIgnoreCase);
+            path.Contains("/WindowBase/ScrollView/", StringComparison.OrdinalIgnoreCase) &&
+            // The list instruction is ordinary UI, not a skill description.
+            // Both setter hooks and the scanner use this classifier: routing
+            // it to subskills prevents the exact UICanvas translation running.
+            !path.EndsWith("/Content/Title/Text", StringComparison.OrdinalIgnoreCase);
 
         // The unit-detail SkillDialog uses a separate SubSkillTextArea prefab.
         // It is a sub-skill presentation too, even though it is not under the

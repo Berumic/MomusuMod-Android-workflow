@@ -19,8 +19,8 @@ internal static class UiStyleManager
     private static readonly List<StyleRule> Rules = new();
     private static readonly Dictionary<int, Material> Materials = new();
     private static readonly Dictionary<int, int> MaterialFontIds = new();
-    private static readonly HashSet<int> InheritedFaceColorIds = new();
-    private static readonly Dictionary<int, Color> AppliedFontColors = new();
+    private static readonly Dictionary<int, Color> MaterialBaseFaceColors = new();
+    private static readonly Dictionary<int, TMP_Text> StyledTexts = new();
     private static readonly Dictionary<int, TextMeshProUGUI> UnderlayTexts = new();
     private static readonly Dictionary<int, TextMeshProUGUI> UnderlaySources = new();
     private static readonly Dictionary<int, Material> UnderlayMaterials = new();
@@ -29,8 +29,51 @@ internal static class UiStyleManager
     private static string _stylePath;
     [ThreadStatic]
     private static bool _applying;
+    private static TMP_Text _batchText;
+    private static bool _batchRequested;
+    private static bool _batchTranslated;
+    private static float _batchWidth;
+    private static float _batchDilate;
+    private static TMP_FontAsset _batchFont;
+    private static StyleValues _batchBaseline;
+    private static StyleValues _resolvedBaseline;
+
+    internal static bool SubmitBaseline(TMP_Text text, TMP_FontAsset font, float width,
+        float dilate, Color outlineColor, float? spacing, bool outline = true)
+    {
+        if (_batchText == null || _batchText != text) return false;
+        _batchBaseline = new StyleValues { Font = font.name, OutlineWidth = width,
+            FaceDilate = dilate, OutlineColor = outlineColor, LineSpacing = spacing ?? _batchBaseline?.LineSpacing, Outline = outline };
+        _batchRequested = true;
+        _batchFont = font;
+        _batchWidth = width;
+        _batchDilate = dilate;
+        return true;
+    }
+
+    internal static void BeginPresentation(TMP_Text text)
+    {
+        _batchText = text;
+        _batchRequested = false;
+        _batchTranslated = false;
+        _batchBaseline = null;
+    }
+
+    internal static void EndPresentation()
+    {
+        var text = _batchText;
+        _batchText = null;
+        _resolvedBaseline = _batchBaseline;
+        try
+        {
+            if (_batchRequested && text != null)
+                Apply(text, _batchWidth, _batchDilate, _batchFont, _batchTranslated);
+        }
+        finally { _batchRequested = false; _resolvedBaseline = null; _batchBaseline = null; }
+    }
 
     internal static bool IsApplying => _applying;
+    internal static bool IsCollecting(TMP_Text text) => _batchText != null && _batchText == text;
 
     public static void Initialize(string pluginRoot)
     {
@@ -45,8 +88,8 @@ internal static class UiStyleManager
                 UnityEngine.Object.Destroy(material);
         Materials.Clear();
         MaterialFontIds.Clear();
-        InheritedFaceColorIds.Clear();
-        AppliedFontColors.Clear();
+        MaterialBaseFaceColors.Clear();
+        StyledTexts.Clear();
         foreach (var underlayText in UnderlayTexts.Values)
             if (underlayText != null)
                 UnityEngine.Object.Destroy(underlayText.gameObject);
@@ -71,7 +114,7 @@ internal static class UiStyleManager
             if (root.TryGetProperty("$styles", out var styles) && styles.ValueKind == JsonValueKind.Object)
                 foreach (var property in styles.EnumerateObject())
                     if (property.Value.ValueKind == JsonValueKind.Object)
-                        Rules.Add(new StyleRule(NormalizePath(property.Name), ReadValues(property.Value)));
+                        Rules.Add(new StyleRule(UiStylePolicy.NormalizePath(property.Name), ReadValues(property.Value)));
 
             Rules.Sort((left, right) => right.Path.Length.CompareTo(left.Path.Length));
             Core.Plugin.Log?.LogInfo($"Loaded {Rules.Count} UI style rule(s) from {_stylePath}");
@@ -89,6 +132,15 @@ internal static class UiStyleManager
         TMP_FontAsset alimamaFont,
         bool isTranslated)
     {
+        if (_batchText != null && text == _batchText)
+        {
+            _batchRequested = true;
+            _batchTranslated |= isTranslated;
+            _batchWidth = fallbackOutlineWidth;
+            _batchDilate = fallbackFaceDilate;
+            _batchFont = alimamaFont;
+            return false;
+        }
         if (_applying)
             return false;
 
@@ -118,40 +170,31 @@ internal static class UiStyleManager
         if (text?.transform == null)
             return false;
 
-        var path = NormalizePath(TmpFontInstaller.GetHierarchyPath(text));
+        var path = UiStylePolicy.NormalizePath(TmpFontInstaller.GetHierarchyPath(text));
         StyleRule matched = null;
         foreach (var rule in Rules)
         {
-            if (PathContains(path, rule.Path))
+            if (UiStylePolicy.PathContains(path, rule.Path))
             {
                 matched = rule;
                 break;
             }
         }
-        if (matched == null)
-        {
-            AppliedFontColors.Remove(text.GetInstanceID());
-            return false;
-        }
-
-        var values = matched.Values;
-        var translatedOnly = values.TranslatedOnly ?? _defaults.TranslatedOnly ?? false;
-        if (translatedOnly && !isTranslated)
-            return false;
-        var fontColor = values.FontColor ?? _defaults.FontColor;
-        var outlineColor = values.OutlineColor ?? _defaults.OutlineColor ?? new Color32(0x54, 0x4A, 0x4A, 255);
-        var outlineWidth = values.OutlineWidth ?? _defaults.OutlineWidth ?? fallbackOutlineWidth;
-        var lineSpacing = values.LineSpacing ?? _defaults.LineSpacing;
-        var outline = values.Outline ?? _defaults.Outline ?? true;
-        var faceDilate = values.FaceDilate ?? _defaults.FaceDilate ?? fallbackFaceDilate;
-        var font = values.Font ?? _defaults.Font;
-        var underlay = values.Underlay ?? _defaults.Underlay;
-        var underlayColor = values.UnderlayColor ?? _defaults.UnderlayColor ??
-                            new Color32(0x54, 0x4A, 0x4A, 255);
-        var underlayOffsetX = values.UnderlayOffsetX ?? _defaults.UnderlayOffsetX ?? 0f;
-        var underlayOffsetY = values.UnderlayOffsetY ?? _defaults.UnderlayOffsetY ?? -0.5f;
-        var underlayDilate = values.UnderlayDilate ?? _defaults.UnderlayDilate ?? 0f;
-        var underlaySoftness = values.UnderlaySoftness ?? _defaults.UnderlaySoftness ?? 0f;
+        var values = UiStylePolicy.Resolve(matched?.Values, _defaults, _resolvedBaseline, isTranslated);
+        if (values == null) return false;
+        var fontColor = values.FontColor;
+        var outlineColor = values.OutlineColor ?? new Color32(0x54, 0x4A, 0x4A, 255);
+        var outlineWidth = values.OutlineWidth ?? fallbackOutlineWidth;
+        var lineSpacing = values.LineSpacing;
+        var outline = values.Outline ?? true;
+        var faceDilate = values.FaceDilate ?? fallbackFaceDilate;
+        var font = values.Font;
+        var underlay = values.Underlay;
+        var underlayColor = values.UnderlayColor ?? new Color32(0x54, 0x4A, 0x4A, 255);
+        var underlayOffsetX = values.UnderlayOffsetX ?? 0f;
+        var underlayOffsetY = values.UnderlayOffsetY ?? -0.5f;
+        var underlayDilate = values.UnderlayDilate ?? 0f;
+        var underlaySoftness = values.UnderlaySoftness ?? 0f;
         var changed = false;
 
         // TMP font assignment can replace the material preset and, depending
@@ -174,27 +217,18 @@ internal static class UiStyleManager
             changed = true;
         }
 
-        // Apply a configured base color once per change. Reasserting it on
-        // every scan fights the game's disabled-state and fade animations.
-        var instanceId = text.GetInstanceID();
-        if (fontColor.HasValue &&
-            (!AppliedFontColors.TryGetValue(instanceId, out var appliedColor) || appliedColor != fontColor.Value))
+        if (fontColor.HasValue && text.color != fontColor.Value)
         {
-            AppliedFontColors[instanceId] = fontColor.Value;
-            if (text.color != fontColor.Value)
-            {
-                text.color = fontColor.Value;
-                changed = true;
-            }
+            text.color = fontColor.Value;
+            changed = true;
         }
-        else if (!fontColor.HasValue)
-            AppliedFontColors.Remove(instanceId);
         if (lineSpacing.HasValue && !Mathf.Approximately(text.lineSpacing, lineSpacing.Value))
         {
             text.lineSpacing = lineSpacing.Value;
             changed = true;
         }
 
+        var instanceId = text.GetInstanceID();
         var materialFont = selectedFont ?? text.font;
         var selectedFontId = materialFont == null ? 0 : materialFont.GetInstanceID();
         var materialUsesSelectedFont = MaterialFontIds.TryGetValue(instanceId, out var materialFontId) &&
@@ -222,16 +256,13 @@ internal static class UiStyleManager
                     material.SetColor("_FaceColor", originalMaterial.GetColor("_FaceColor"));
             }
             Materials[instanceId] = material;
+            StyledTexts[instanceId] = text;
             MaterialFontIds[instanceId] = selectedFontId;
+            if (material.HasProperty("_FaceColor"))
+                MaterialBaseFaceColors[instanceId] = material.GetColor("_FaceColor");
             changed = true;
         }
-        if (!fontColor.HasValue)
-        {
-            InheritedFaceColorIds.Add(instanceId);
-            changed |= SyncInheritedFaceColor(text, material, instanceId);
-        }
-        else
-            InheritedFaceColorIds.Remove(instanceId);
+        changed |= SyncButtonFaceColor(text, material, instanceId);
         if (material.HasProperty("_OutlineColor") && material.GetColor("_OutlineColor") != outlineColor)
         {
             material.SetColor("_OutlineColor", outlineColor);
@@ -259,6 +290,17 @@ internal static class UiStyleManager
         {
             material.DisableKeyword("OUTLINE_ON");
             changed = true;
+        }
+        // A reused slot may move from an underlay rule to a plain rule.
+        // Absence of underlay in the resolved style must retire the old layer.
+        if (!underlay.HasValue && UnderlayTexts.ContainsKey(instanceId))
+        {
+            changed |= RemoveUnderlayLayer(text);
+            if (material.HasShaderKeyword("UNDERLAY_ON"))
+            {
+                material.DisableKeyword("UNDERLAY_ON");
+                changed = true;
+            }
         }
         if (underlay.HasValue)
         {
@@ -413,26 +455,45 @@ internal static class UiStyleManager
             changed = true;
         }
 
-        layer.text = source.text;
-        layer.fontSize = source.fontSize;
-        layer.fontStyle = source.fontStyle;
-        layer.alignment = source.alignment;
-        layer.enableAutoSizing = source.enableAutoSizing;
-        layer.fontSizeMin = source.fontSizeMin;
-        layer.fontSizeMax = source.fontSizeMax;
-        layer.enableWordWrapping = source.enableWordWrapping;
-        layer.overflowMode = source.overflowMode;
-        layer.richText = source.richText;
-        layer.characterSpacing = source.characterSpacing;
-        layer.wordSpacing = source.wordSpacing;
-        layer.lineSpacing = source.lineSpacing;
-        layer.paragraphSpacing = source.paragraphSpacing;
-        layer.margin = source.margin;
-        layer.color = source.color;
+        if (!string.Equals(layer.text, source.text, StringComparison.Ordinal))
+            layer.text = source.text;
+        if (layer.fontSize != source.fontSize)
+            layer.fontSize = source.fontSize;
+        if (layer.fontStyle != source.fontStyle)
+            layer.fontStyle = source.fontStyle;
+        if (layer.alignment != source.alignment)
+            layer.alignment = source.alignment;
+        if (layer.enableAutoSizing != source.enableAutoSizing)
+            layer.enableAutoSizing = source.enableAutoSizing;
+        if (layer.fontSizeMin != source.fontSizeMin)
+            layer.fontSizeMin = source.fontSizeMin;
+        if (layer.fontSizeMax != source.fontSizeMax)
+            layer.fontSizeMax = source.fontSizeMax;
+        if (layer.enableWordWrapping != source.enableWordWrapping)
+            layer.enableWordWrapping = source.enableWordWrapping;
+        if (layer.overflowMode != source.overflowMode)
+            layer.overflowMode = source.overflowMode;
+        if (layer.richText != source.richText)
+            layer.richText = source.richText;
+        if (layer.characterSpacing != source.characterSpacing)
+            layer.characterSpacing = source.characterSpacing;
+        if (layer.wordSpacing != source.wordSpacing)
+            layer.wordSpacing = source.wordSpacing;
+        if (layer.lineSpacing != source.lineSpacing)
+            layer.lineSpacing = source.lineSpacing;
+        if (layer.paragraphSpacing != source.paragraphSpacing)
+            layer.paragraphSpacing = source.paragraphSpacing;
+        if (layer.margin != source.margin)
+            layer.margin = source.margin;
+        layer.color = source.color * source.canvasRenderer.GetColor() * GetButtonTint(source);
         layer.enableVertexGradient = false;
-        layer.maskable = source.maskable;
-        layer.SetAllDirty();
-        layer.enabled = CanRenderUnderlay(source);
+        if (layer.maskable != source.maskable)
+            layer.maskable = source.maskable;
+        // TMP property setters invalidate only the data that actually changed.
+        // Do not force a layout/mesh rebuild for an unchanged projection.
+        var visible = CanRenderUnderlay(source);
+        if (layer.enabled != visible)
+            layer.enabled = visible;
         return changed;
     }
 
@@ -456,6 +517,18 @@ internal static class UiStyleManager
         return removed;
     }
 
+    internal static void ReleasePresentation(TMP_Text text)
+    {
+        if (text == null) return;
+        var id = text.GetInstanceID();
+        RemoveUnderlayLayer(text);
+        StyledTexts.Remove(id);
+        MaterialBaseFaceColors.Remove(id);
+        MaterialFontIds.Remove(id);
+        if (Materials.Remove(id, out var material) && material != null)
+            UnityEngine.Object.Destroy(material);
+    }
+
     internal static void SyncUnderlayLayer(TMP_Text text)
     {
         if (text is not TextMeshProUGUI source ||
@@ -464,31 +537,52 @@ internal static class UiStyleManager
 
         // Run after translation processing so the projection never retains
         // the source-language value seen by an earlier TMP setter hook.
-        layer.text = source.text;
-        layer.fontSize = source.fontSize;
-        layer.fontStyle = source.fontStyle;
-        layer.alignment = source.alignment;
-        layer.enableAutoSizing = source.enableAutoSizing;
-        layer.fontSizeMin = source.fontSizeMin;
-        layer.fontSizeMax = source.fontSizeMax;
-        layer.enableWordWrapping = source.enableWordWrapping;
-        layer.overflowMode = source.overflowMode;
-        layer.richText = source.richText;
-        layer.characterSpacing = source.characterSpacing;
-        layer.wordSpacing = source.wordSpacing;
-        layer.lineSpacing = source.lineSpacing;
-        layer.paragraphSpacing = source.paragraphSpacing;
-        layer.margin = source.margin;
-        layer.maskable = source.maskable;
+        if (!string.Equals(layer.text, source.text, StringComparison.Ordinal))
+            layer.text = source.text;
+        if (layer.fontSize != source.fontSize)
+            layer.fontSize = source.fontSize;
+        if (layer.fontStyle != source.fontStyle)
+            layer.fontStyle = source.fontStyle;
+        if (layer.alignment != source.alignment)
+            layer.alignment = source.alignment;
+        if (layer.enableAutoSizing != source.enableAutoSizing)
+            layer.enableAutoSizing = source.enableAutoSizing;
+        if (layer.fontSizeMin != source.fontSizeMin)
+            layer.fontSizeMin = source.fontSizeMin;
+        if (layer.fontSizeMax != source.fontSizeMax)
+            layer.fontSizeMax = source.fontSizeMax;
+        if (layer.enableWordWrapping != source.enableWordWrapping)
+            layer.enableWordWrapping = source.enableWordWrapping;
+        if (layer.overflowMode != source.overflowMode)
+            layer.overflowMode = source.overflowMode;
+        if (layer.richText != source.richText)
+            layer.richText = source.richText;
+        if (layer.characterSpacing != source.characterSpacing)
+            layer.characterSpacing = source.characterSpacing;
+        if (layer.wordSpacing != source.wordSpacing)
+            layer.wordSpacing = source.wordSpacing;
+        if (layer.lineSpacing != source.lineSpacing)
+            layer.lineSpacing = source.lineSpacing;
+        if (layer.paragraphSpacing != source.paragraphSpacing)
+            layer.paragraphSpacing = source.paragraphSpacing;
+        if (layer.margin != source.margin)
+            layer.margin = source.margin;
+        if (layer.maskable != source.maskable)
+            layer.maskable = source.maskable;
         if (Materials.TryGetValue(source.GetInstanceID(), out var sourceMaterial) && sourceMaterial != null)
-            SyncInheritedFaceColor(source, sourceMaterial, source.GetInstanceID());
-        layer.color = source.color;
+            SyncButtonFaceColor(source, sourceMaterial, source.GetInstanceID());
+        var layerColor = source.color * source.canvasRenderer.GetColor() * GetButtonTint(source);
+        if (layer.color != layerColor)
+            layer.color = layerColor;
 
         if (layer.transform.GetSiblingIndex() > source.transform.GetSiblingIndex())
             layer.transform.SetSiblingIndex(source.transform.GetSiblingIndex());
 
-        layer.SetAllDirty();
-        layer.enabled = CanRenderUnderlay(source);
+        // This runs before rendering every frame. Toggling enabled here would
+        // unregister/register the graphic and rebuild even completely static UI.
+        var visible = CanRenderUnderlay(source);
+        if (layer.enabled != visible)
+            layer.enabled = visible;
     }
 
     internal static void PrepareUnderlayForTextChange(object component)
@@ -500,6 +594,29 @@ internal static class UiStyleManager
 
     internal static void SyncAllUnderlayLayers()
     {
+        // Animated targets can change colour without a Selectable state event.
+        // Include styled labels without projection layers as well.
+        InvalidUnderlayIds.Clear();
+        foreach (var entry in StyledTexts)
+        {
+            var text = entry.Value;
+            if (text == null || text.gameObject == null)
+            {
+                InvalidUnderlayIds.Add(entry.Key);
+                continue;
+            }
+            if (text.gameObject.activeInHierarchy && !UnderlaySources.ContainsKey(entry.Key) &&
+                Materials.TryGetValue(entry.Key, out var material) && material != null)
+                SyncButtonFaceColor(text, material, entry.Key);
+        }
+        foreach (var id in InvalidUnderlayIds)
+        {
+            StyledTexts.Remove(id);
+            MaterialBaseFaceColors.Remove(id);
+            MaterialFontIds.Remove(id);
+            if (Materials.Remove(id, out var material) && material != null)
+                UnityEngine.Object.Destroy(material);
+        }
         if (UnderlaySources.Count == 0)
             return;
 
@@ -510,6 +627,12 @@ internal static class UiStyleManager
             if (source == null || source.gameObject == null)
             {
                 InvalidUnderlayIds.Add(entry.Key);
+                continue;
+            }
+            if (!source.gameObject.activeInHierarchy)
+            {
+                if (UnderlayTexts.TryGetValue(entry.Key, out var hiddenLayer) && hiddenLayer != null && hiddenLayer.enabled)
+                    hiddenLayer.enabled = false;
                 continue;
             }
             SyncUnderlayLayer(source);
@@ -532,26 +655,52 @@ internal static class UiStyleManager
 
         // A disabled Button still renders its label and its shadow/underlay;
         // only the graphic color changes. Do not hide the projection here.
-        var groups = source.GetComponentsInParent<CanvasGroup>(true);
-        foreach (var group in groups)
-            if (group != null && group.alpha <= 0.001f)
-                return false;
-
+        // The sibling projection inherits the same CanvasGroups naturally.
+        // Enumerating all parent groups here allocates an IL2CPP array for
+        // every label on every rendered frame.
         return true;
     }
 
-    private static bool SyncInheritedFaceColor(TMP_Text text, Material material, int instanceId)
+    private static bool SyncButtonFaceColor(TMP_Text text, Material material, int instanceId)
     {
         if (text == null || material == null || !material.HasProperty("_FaceColor") ||
-            !InheritedFaceColorIds.Contains(instanceId) ||
-            !TmpFontInstaller.TryGetOriginalFaceColor(text, out var targetColor))
+            !MaterialBaseFaceColors.TryGetValue(instanceId, out var baseColor))
             return false;
+
+        var targetColor = baseColor * GetButtonTint(text);
 
         if (material.GetColor("_FaceColor") == targetColor)
             return false;
         material.SetColor("_FaceColor", targetColor);
         text.SetMaterialDirty();
         return true;
+    }
+
+    private static Color GetButtonTint(TMP_Text text)
+    {
+        var selectable = text.GetComponentInParent<Selectable>();
+        if (selectable == null)
+            return Color.white;
+
+        // A label which is itself the target graphic already receives Unity's
+        // colour transition. Multiplying it again would darken it twice.
+        if (selectable.targetGraphic == text)
+            return Color.white;
+        var labelColor = text.color * text.canvasRenderer.GetColor();
+        if (MaterialBaseFaceColors.TryGetValue(text.GetInstanceID(), out var baseFace))
+            labelColor *= baseFace;
+        var target = selectable.targetGraphic;
+        if (selectable.transition == Selectable.Transition.Animation && target != null)
+        {
+            var tint = target.color * target.canvasRenderer.GetColor();
+            // Transfer neutral dimming, not decorative background hues.
+            // Read the actual animated value, never multiply yesterday's tint.
+            if (Mathf.Abs(tint.r - tint.g) < 0.005f &&
+                Mathf.Abs(tint.g - tint.b) < 0.005f)
+                return UiStylePolicy.InheritButtonGray(labelColor, tint);
+        }
+        return selectable.IsInteractable() ? Color.white :
+            UiStylePolicy.InheritButtonGray(labelColor, selectable.colors.disabledColor);
     }
 
     private static StyleValues ReadValues(JsonElement element)
@@ -619,21 +768,6 @@ internal static class UiStyleManager
                ColorUtility.TryParseHtmlString(value.GetString(), out color);
     }
 
-    private static string NormalizePath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path)) return string.Empty;
-        var parts = path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
-        for (var index = 0; index < parts.Length; index++)
-            parts[index] = parts[index].Replace("(Clone)", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return string.Join('/', parts);
-    }
-
-    private static bool PathContains(string fullPath, string rulePath) =>
-        string.Equals(fullPath, rulePath, StringComparison.OrdinalIgnoreCase) ||
-        fullPath.StartsWith(rulePath + "/", StringComparison.OrdinalIgnoreCase) ||
-        fullPath.EndsWith("/" + rulePath, StringComparison.OrdinalIgnoreCase) ||
-        fullPath.Contains("/" + rulePath + "/", StringComparison.OrdinalIgnoreCase);
-
     private sealed class StyleRule
     {
         public StyleRule(string path, StyleValues values) { Path = path; Values = values; }
@@ -641,21 +775,4 @@ internal static class UiStyleManager
         public StyleValues Values { get; }
     }
 
-    private sealed class StyleValues
-    {
-        public Color? FontColor { get; set; }
-        public Color? OutlineColor { get; set; }
-        public Color? UnderlayColor { get; set; }
-        public float? OutlineWidth { get; set; }
-        public float? LineSpacing { get; set; }
-        public float? FaceDilate { get; set; }
-        public float? UnderlayOffsetX { get; set; }
-        public float? UnderlayOffsetY { get; set; }
-        public float? UnderlayDilate { get; set; }
-        public float? UnderlaySoftness { get; set; }
-        public bool? Outline { get; set; }
-        public bool? Underlay { get; set; }
-        public bool? TranslatedOnly { get; set; }
-        public string Font { get; set; }
-    }
 }

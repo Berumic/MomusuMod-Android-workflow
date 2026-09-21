@@ -44,6 +44,10 @@ public sealed class TranslationReloadHotkey : MonoBehaviour
         if (!Input.GetKeyDown(KeyCode.F6) || Plugin.Translations == null)
             return;
 
+        if (Plugin.Settings.ManualSyncWithF6.Value)
+            TranslationUpdateController.RequestManualSync();
+        else
+            Plugin.Log?.LogInfo("F6 manual translation sync is disabled; reloading local files only");
         Plugin.Settings?.Reload();
         Plugin.Translations.LoadStatic();
         UiStyleManager.Reload();

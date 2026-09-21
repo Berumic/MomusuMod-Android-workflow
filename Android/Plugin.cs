@@ -7,7 +7,7 @@ using MonsterMusumeTDMod.Patches;
 using MonsterMusumeTDMod.Services;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.122", "MonsterMusumeTDMod")]
+[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.133", "MonsterMusumeTDMod")]
 
 namespace MonsterMusumeTDMod.Core;
 
@@ -81,6 +81,8 @@ public sealed class Plugin : MelonMod
         try
         {
             Settings.Reload();
+            if (Settings.ManualSyncWithF6.Value)
+                TranslationUpdateController.RequestManualSync();
             Translations.LoadStatic();
             UiStyleManager.Reload();
             UiCanvasTranslationScanner.InvalidateProcessingCache();

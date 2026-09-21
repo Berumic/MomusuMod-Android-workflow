@@ -46,6 +46,26 @@ try
     material.shaderKeywords = null;
     Check(!material.HasShaderKeyword("OUTLINE_ON"), "Empty material keyword list is supported");
     var settingsPath = Path.Combine(root, "config.json");
+    var queue = new UiRefreshQueue<string>();
+    Check(!queue.Enqueue(1, "first", 12, false) && queue.Enqueue(1, "latest", 10, true),
+        "Repeated UI refresh requests merge");
+    var pending = queue.Single().Value;
+    Check(queue.Count == 1 && pending.Text == "latest" && pending.ReadyFrame == 10 && pending.IsActivation,
+        "Merged refresh preserves latest slot and earliest activation");
+    queue.Enqueue(1, "later", 20, false);
+    Check(queue.Single().Value.ReadyFrame == 10 && queue.Single().Value.IsActivation,
+        "Late setters cannot delay an activation refresh");
+    var baseline = new StyleValues { FaceDilate = 0.35f, Outline = true };
+    var style = UiStylePolicy.Resolve(new StyleValues { FaceDilate = 0f, Outline = false },
+        new StyleValues { FaceDilate = 0.5f }, baseline, true);
+    Check(style.FaceDilate == 0f && style.Outline == false, "Explicit zero and false styles override defaults");
+    Check(ReferenceEquals(UiStylePolicy.Resolve(new StyleValues { TranslatedOnly = true }, null, baseline, false), baseline),
+        "Translation-only styles preserve untranslated baseline");
+    Check(UiStylePolicy.PathContains(UiStylePolicy.NormalizePath("Canvas/Card(Clone)/Text"), "Card/Text"),
+        "Style paths match recycled clone slots");
+    var gray = UiStylePolicy.InheritButtonGray(new UnityEngine.Color(0.5f, 0.5f, 0.5f, 1f),
+        new UnityEngine.Color(0.4f, 0.4f, 0.4f, 0f));
+    Check(gray.r == 1f && gray.a == 1f, "Already dimmed labels are not darkened twice");
     var config = new ModConfig(new ConfigFile(settingsPath));
     Check(config.UiTextFaceDilate.Value == 0.35f, "New UI face dilate default is 0.35");
     Check(config.FontAssetPath.Value == "alimama-android", "Android font filename is distinct from PC");
