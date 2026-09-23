@@ -32,9 +32,22 @@ New-Item -ItemType Directory -Force $parent | Out-Null
 $temp = Join-Path $parent ([guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $temp | Out-Null
 try {
-    # gh uses authenticated API downloads, including private repository assets.
-    & gh release download $Tag --repo $Repository --pattern $assets[0].name --dir $temp
-    if ($LASTEXITCODE -ne 0) { throw 'Release asset download failed.' }
+    $asset = $assets[0]
+    $downloadPath = Join-Path $temp $asset.name
+    $downloaded = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        & gh release download $Tag --repo $Repository --pattern $asset.name --dir $temp --clobber
+        if ($LASTEXITCODE -eq 0) { $downloaded = $true; break }
+        if ($attempt -lt 3) { Start-Sleep -Seconds (2 * $attempt) }
+    }
+    if (!$downloaded) {
+        # Public download endpoint: never forward the Actions token to the CDN.
+        Write-Warning 'API download failed; trying the public release download URL.'
+        $encodedName = [Uri]::EscapeDataString($asset.name)
+        $publicUrl = "https://github.com/$Repository/releases/download/$escaped/$encodedName"
+        & curl.exe --fail --location --retry 3 --retry-delay 2 --connect-timeout 30 --max-time 1800 --output $downloadPath $publicUrl
+        if ($LASTEXITCODE -ne 0) { throw "Release asset download failed via API and public URL: $Tag / $($asset.name)." }
+    }
     $downloads = @(Get-ChildItem $temp -File)
     if ($downloads.Count -ne 1 -or $downloads[0].Name -cne $assets[0].name) { throw 'Ambiguous asset download.' }
     Move-Item -LiteralPath $downloads[0].FullName -Destination $Output
