@@ -1,5 +1,18 @@
 namespace UnityEngine
 {
+    public class AndroidJavaObject
+    {
+        public AndroidJavaObject() { }
+        public AndroidJavaObject(string name) { }
+        public T Call<T>(string method, params object[] args) => default;
+        public void Call(string method, params object[] args) { }
+    }
+    public class AndroidJavaClass : AndroidJavaObject
+    {
+        public AndroidJavaClass(string name) : base(name) { }
+        public T GetStatic<T>(string field) => default;
+        public T CallStatic<T>(string method, params object[] args) => default;
+    }
     public readonly record struct Color(float r, float g, float b, float a);
     public class MonoBehaviour { public MonoBehaviour(IntPtr pointer) { } }
     public class Material

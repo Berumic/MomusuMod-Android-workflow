@@ -30,6 +30,8 @@ public sealed class ModConfig
     public ConfigEntry<string> TranslationUpdateBaseUrl { get; }
     public ConfigEntry<string> TranslationAssetUpdateBaseUrl { get; }
     public ConfigEntry<int> TranslationUpdateTimeoutSeconds { get; }
+    public ConfigEntry<string> TranslationUpdateProxyUrl { get; }
+    public ConfigEntry<bool> TranslationUpdateDirectConnection { get; }
 
     public ModConfig(ConfigFile config)
     {
@@ -108,6 +110,12 @@ public sealed class ModConfig
             "TimeoutSeconds",
             10,
             "单次网络请求超时秒数（建议 3 至 60）");
+        TranslationUpdateProxyUrl = config.Bind(
+            "Translation.Update", "ProxyUrl", "",
+            "更新代理地址；留空使用系统代理。例：http://192.168.31.170:7890。DirectConnection=true 时忽略此项");
+        TranslationUpdateDirectConnection = config.Bind(
+            "Translation.Update", "DirectConnection", false,
+            "启用后更新强制直连，不读取系统代理，也不使用 ProxyUrl");
     }
 
     public void Reload() => _config.Reload();
