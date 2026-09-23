@@ -286,6 +286,9 @@ public sealed class TranslationUpdateController : MonoBehaviour
         }
     }
 
+    private static Task<AssetUpdateResult> SynchronizeFontAssetAsync(string pluginRoot, string baseUrl, int timeoutSeconds) =>
+        SynchronizeFontAssetAsync(pluginRoot, baseUrl, timeoutSeconds, null, false);
+
     internal static HttpClientHandler CreateUpdateHandler(string proxyUrl, bool directConnection = false)
     {
         if (directConnection)
@@ -421,6 +424,9 @@ public sealed class TranslationUpdateController : MonoBehaviour
             }
         }
     }
+
+    private static Task<UpdateResult> SynchronizeAsync(string translationRoot, string baseUrl, int timeoutSeconds) =>
+        SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds, null, false);
 
     private static TranslationManifest ParseManifest(byte[] bytes, string description)
     {

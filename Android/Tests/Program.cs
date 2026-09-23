@@ -32,7 +32,8 @@ byte[] Manifest(Dictionary<string, byte[]> files) => JsonSerializer.SerializeToU
 });
 async Task<object> InvokeUpdate(string name, params object[] arguments)
 {
-    var method = typeof(TranslationUpdateController).GetMethod(name, BindingFlags.Static | BindingFlags.NonPublic)!;
+    var method = typeof(TranslationUpdateController).GetMethods(BindingFlags.Static | BindingFlags.NonPublic)
+        .Single(m => m.Name == name && m.GetParameters().Length == arguments.Length);
     var task = (Task)method.Invoke(null, arguments)!;
     await task;
     return task.GetType().GetProperty("Result")!.GetValue(task)!;
