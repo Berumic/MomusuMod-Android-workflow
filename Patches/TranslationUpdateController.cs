@@ -79,23 +79,19 @@ public sealed class TranslationUpdateController : MonoBehaviour
         }
 
         _handled = false;
-        var proxyUrl = Plugin.Settings.TranslationUpdateProxyUrl.Value?.Trim();
-        var directConnection = Plugin.Settings.TranslationUpdateDirectConnection.Value;
-        Plugin.Log?.LogInfo(string.IsNullOrEmpty(proxyUrl)
-            ? "Update connection: system proxy"
-            : $"Update connection: explicit proxy {proxyUrl}");
+        Plugin.Log?.LogInfo("Update connection: system proxy");
         ShowUpdateNotice("正在检查汉化更新…");
         ShowUpdateNotice(manual ? "正在检查汉化更新…" : "正在检查汉化更新…");
         Plugin.Log?.LogInfo(manual
             ? "F6 requested translation synchronization in the background"
             : "Checking for translation updates in the background");
-        _updateTask = Task.Run(() => SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds, proxyUrl, directConnection));
+        _updateTask = Task.Run(() => SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds));
         if (!string.IsNullOrWhiteSpace(assetBaseUrl))
         {
             _assetHandled = false;
             Plugin.Log?.LogInfo("Checking for font asset updates in the background");
             _assetUpdateTask = Task.Run(() => SynchronizeFontAssetAsync(
-                Paths.PluginPath, assetBaseUrl, timeoutSeconds, proxyUrl, directConnection));
+                Paths.PluginPath, assetBaseUrl, timeoutSeconds));
         }
         else
         {
@@ -247,11 +243,11 @@ public sealed class TranslationUpdateController : MonoBehaviour
     private static async Task<AssetUpdateResult> SynchronizeFontAssetAsync(
         string pluginRoot,
         string baseUrl,
-        int timeoutSeconds, string proxyUrl = null, bool directConnection = false)
+        int timeoutSeconds)
     {
         try
         {
-            using var client = CreateUpdateClient(timeoutSeconds, proxyUrl, directConnection);
+            using var client = CreateUpdateClient(timeoutSeconds);
             var manifestBytes = await client.GetByteArrayAsync($"{baseUrl}/manifest.json").ConfigureAwait(false);
             var manifest = ParseManifest(manifestBytes, "remote asset manifest");
             if (!manifest.Files.TryGetValue(FontAssetName, out var expected))
@@ -286,23 +282,8 @@ public sealed class TranslationUpdateController : MonoBehaviour
         }
     }
 
-    private static Task<AssetUpdateResult> SynchronizeFontAssetAsync(string pluginRoot, string baseUrl, int timeoutSeconds) =>
-        SynchronizeFontAssetAsync(pluginRoot, baseUrl, timeoutSeconds, null, false);
-
-    internal static HttpClientHandler CreateUpdateHandler(string proxyUrl, bool directConnection = false)
-    {
-        if (directConnection)
-            return new HttpClientHandler { UseProxy = false };
-        if (string.IsNullOrWhiteSpace(proxyUrl))
-            return new HttpClientHandler { UseProxy = true };
-        if (!Uri.TryCreate(proxyUrl.Trim(), UriKind.Absolute, out var uri) ||
-            (uri.Scheme != "http" && uri.Scheme != "https") || string.IsNullOrEmpty(uri.Host))
-            throw new ArgumentException("Invalid update ProxyUrl; use http://host:port or leave it empty.");
-        return new HttpClientHandler { Proxy = new System.Net.WebProxy(uri), UseProxy = true };
-    }
-
-    private static HttpClient CreateUpdateClient(int timeoutSeconds, string proxyUrl, bool directConnection) =>
-        new HttpClient(CreateUpdateHandler(proxyUrl, directConnection), disposeHandler: true)
+    private static HttpClient CreateUpdateClient(int timeoutSeconds) =>
+        new HttpClient(new HttpClientHandler { UseProxy = true }, disposeHandler: true)
         { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
 
     private static string ManifestCommit(TranslationManifest manifest) =>
@@ -310,14 +291,13 @@ public sealed class TranslationUpdateController : MonoBehaviour
 
     private static void TryDeleteFile(string path)
     {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch { }
+        try { if (File.Exists(path)) File.Delete(path); } catch { }
     }
 
     private static async Task<UpdateResult> SynchronizeAsync(
         string translationRoot,
         string baseUrl,
-        int timeoutSeconds, string proxyUrl = null, bool directConnection = false)
+        int timeoutSeconds)
     {
         var stagingRoot = Path.Combine(translationRoot, $".update-{Guid.NewGuid():N}");
         try
@@ -326,7 +306,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
             RemoveStaleStagingDirectories(translationRoot);
             Directory.CreateDirectory(stagingRoot);
 
-            using var client = CreateUpdateClient(timeoutSeconds, proxyUrl, directConnection);
+            using var client = CreateUpdateClient(timeoutSeconds);
             var manifestBytes = await client.GetByteArrayAsync($"{baseUrl}/manifest.json").ConfigureAwait(false);
             var remoteManifest = ParseManifest(manifestBytes, "remote manifest");
             var localManifestPath = Path.Combine(translationRoot, "manifest.json");
@@ -424,9 +404,6 @@ public sealed class TranslationUpdateController : MonoBehaviour
             }
         }
     }
-
-    private static Task<UpdateResult> SynchronizeAsync(string translationRoot, string baseUrl, int timeoutSeconds) =>
-        SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds, null, false);
 
     private static TranslationManifest ParseManifest(byte[] bytes, string description)
     {
