@@ -11,10 +11,17 @@ $escaped = [Uri]::EscapeDataString($Tag)
 $json = & gh api "repos/$Repository/releases/tags/$escaped"
 if ($LASTEXITCODE -ne 0) { throw "Cannot read release '$Tag'." }
 $release = ($json -join "`n") | ConvertFrom-Json
+$AssetName = if ($null -ne $AssetName) { $AssetName.Trim() } else { '' }
 $assets = @($release.assets | Where-Object {
-    if ($AssetName) { $_.name -ceq $AssetName } else { $_.name -match '(?i)\.apk$' }
+    if ($AssetName) { $_.name -ieq $AssetName } else { $_.name -match '(?i)\.apk$' }
 })
-if ($assets.Count -ne 1) { throw 'Specify an exact asset name, or upload exactly one APK to the source release.' }
+if ($assets.Count -ne 1) {
+    $available = @($release.assets | ForEach-Object { $_.name }) -join ', '
+    if ($AssetName) {
+        throw "APK asset '$AssetName' was not found in release '$Tag'. Available assets: $available"
+    }
+    throw "Source release '$Tag' contains $($assets.Count) APK assets. Specify apk_asset_name exactly. APK assets: $available"
+}
 $parent = Split-Path ([IO.Path]::GetFullPath($Output))
 New-Item -ItemType Directory -Force $parent | Out-Null
 $temp = Join-Path $parent ([guid]::NewGuid().ToString('N'))
@@ -30,4 +37,3 @@ try {
 } finally {
     Remove-Item -LiteralPath $temp -Recurse -Force
 }
-
