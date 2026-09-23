@@ -15,6 +15,11 @@ $AssetName = if ($null -ne $AssetName) { $AssetName.Trim() } else { '' }
 $assets = @($release.assets | Where-Object {
     if ($AssetName) { $_.name -ieq $AssetName } else { $_.name -match '(?i)\.apk$' }
 })
+if ($AssetName -and $assets.Count -eq 0) {
+    # Some GitHub API responses may omit release assets even though gh release
+    # download can resolve them. Use the explicitly supplied filename directly.
+    $assets = @([pscustomobject]@{ name = $AssetName })
+}
 if ($assets.Count -ne 1) {
     $available = @($release.assets | ForEach-Object { $_.name }) -join ', '
     if ($AssetName) {
