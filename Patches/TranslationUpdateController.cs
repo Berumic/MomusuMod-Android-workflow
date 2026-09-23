@@ -131,12 +131,14 @@ public sealed class TranslationUpdateController : MonoBehaviour
             Plugin.Translations?.LoadStatic();
             UiStyleManager.Reload();
             UiCanvasTranslationScanner.InvalidateProcessingCache();
+            UiCanvasTranslationScanner.RequestFastScan();
             R18DialogueBackgroundController.InvalidatePresentation();
             var refreshed = Plugin.Translations == null
                 ? 0
                 : TmpFontInstaller.ReloadVisibleUiTranslations(Plugin.Translations);
             var subSkillsRefreshed = TmpFontInstaller.RefreshVisibleSubSkillPresentation();
             var unitDetailRefreshed = TmpFontInstaller.RefreshVisibleUnitDetailPresentation();
+            UiCanvasTranslationScanner.RequestFastScan();
             Plugin.Log?.LogInfo(
                 $"Translation update applied: downloaded={result.Downloaded}, deleted={result.Deleted}, " +
                 $"unchanged={result.Unchanged}, commit={result.Commit}; refreshed {refreshed} UI, " +

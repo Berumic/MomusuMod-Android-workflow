@@ -50,6 +50,6 @@ namespace MonsterMusumeTDMod.Services
 }
 namespace MonsterMusumeTDMod.Patches
 {
-    public static class UiCanvasTranslationScanner { public static void InvalidateProcessingCache() { } }
+    public static class UiCanvasTranslationScanner { public static void InvalidateProcessingCache() { } public static void RequestFastScan() { } }
     public static class R18DialogueBackgroundController { public static void InvalidatePresentation() { } }
 }

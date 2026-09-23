@@ -1,4 +1,4 @@
-# MonsterMusumeTD Android Mod 0.1.122
+# MonsterMusumeTD Android Mod 0.1.134
 
 0.1.122 一次性将未迁移旧配置中的 UiTextFaceDilate=0.2 升级为 0.35，保留其他自定义值。迁移后可手动改回 0.2，不会再次覆盖。启动日志输出实际配置值；styles.json 明确指定的 faceDilate（包括 0）仍优先。
 

@@ -195,7 +195,7 @@ public static class TmpFontInstaller
         SubSkillTranslatedValues[instanceId] = content;
         if (PatchManager.DeferringTmpPresentation)
         {
-            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            UiCanvasTranslationScanner.QueueImmediateRefresh(text);
             return;
         }
         ApplyTranslatedTmpText(text, content, useSubSkillPresentation: ShouldUseSubSkillPresentation(text));
@@ -226,7 +226,7 @@ public static class TmpFontInstaller
         UiTextComponents[instanceId] = text;
         if (PatchManager.DeferringTmpPresentation)
         {
-            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            UiCanvasTranslationScanner.QueueImmediateRefresh(text);
             return;
         }
         ApplyTranslatedTmpText(text, content, useSubSkillPresentation: false);
@@ -278,7 +278,7 @@ public static class TmpFontInstaller
             if (!string.Equals(text.text, translated, StringComparison.Ordinal))
                 text.text = translated;
             UiTextTranslatedValues[entry.Key] = translated;
-            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            UiCanvasTranslationScanner.QueueImmediateRefresh(text);
             refreshed++;
             processedIds.Add(entry.Key);
         }
