@@ -66,7 +66,9 @@ $name = "$($identity.game)-v$code-mod-$modVersion"
 $signed = "$Output/$name.apk"
 & "$PSScriptRoot/Make-IndependentApk.ps1" -InputApk $unsigned -OutputApk "$Workspace/independent.apk" -Apktool $Apktool `
     -SourcePackage $package -ModPackage $identity.modPackage -Label $identity.label -Workspace $Workspace -Java $Java
-& "$sdk/zipalign.exe" -f -P 16 4 "$Workspace/independent.apk" "$Workspace/aligned.apk"
+& python "$PSScriptRoot/Optimize-Apk.py" --input "$Workspace/independent.apk" --output "$Workspace/compressed.apk" --aapt "$sdk/aapt.exe"
+Check-Exit 'APK compression or payload verification failed.'
+& "$sdk/zipalign.exe" -f -P 16 4 "$Workspace/compressed.apk" "$Workspace/aligned.apk"
 Check-Exit 'APK alignment failed.'
 & $Java -jar "$sdk/lib/apksigner.jar" sign --ks $Keystore --ks-key-alias $KeyAlias `
     --ks-pass env:APK_STORE_PASSWORD --key-pass env:APK_KEY_PASSWORD --out $signed "$Workspace/aligned.apk"

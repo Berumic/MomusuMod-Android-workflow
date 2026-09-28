@@ -37,8 +37,8 @@ on:
       - 'ci/**'
       - '.github/workflows/build-mod-apk.yml'
   schedule:
-    # Monday 12:00 Asia/Shanghai (UTC+8)
-    - cron: '0 4 * * 1'
+    # Daily 14:25 Asia/Shanghai (UTC+8)
+    - cron: '25 6 * * *'
   repository_dispatch:
     types: [mod-input-updated]
 
@@ -98,19 +98,53 @@ jobs:
           ref: ${{ needs.select.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Download APK and pinned toolchain
+      - name: Check DMM APK metadata before download
+        id: apk_metadata
+        if: matrix.downloadUrl != ''
+        env:
+          SOURCE_URL: ${{ matrix.downloadUrl }}
+        run: ./ci/Probe-DirectApk.ps1 -Url $env:SOURCE_URL
+
+      - name: Restore unchanged original APK
+        id: apk_cache
+        if: steps.apk_metadata.outputs.key != ''
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/input.apk
+          key: ${{ steps.apk_metadata.outputs.key }}
+
+      - name: Download original APK when needed
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           SOURCE_TAG: ${{ matrix.sourceTag }}
           SOURCE_ASSET: ${{ matrix.assetName }}
           SOURCE_URL: ${{ matrix.downloadUrl }}
+          APK_CACHE_HIT: ${{ steps.apk_cache.outputs.cache-hit }}
+          APK_ETAG: ${{ steps.apk_metadata.outputs.etag }}
         run: |
           if ($env:SOURCE_URL) {
-            ./ci/Get-DirectApk.ps1 -Url $env:SOURCE_URL -Output "$env:RUNNER_TEMP/input.apk"
+            if ($env:APK_CACHE_HIT -eq 'true') {
+              Write-Host 'DMM APK unchanged; reusing cached original APK.'
+            } else {
+              ./ci/Get-DirectApk.ps1 -Url $env:SOURCE_URL -Output "$env:RUNNER_TEMP/input.apk" -ExpectedETag $env:APK_ETAG
+            }
           } else {
             ./ci/Get-ReleaseAsset.ps1 -Repository $env:REPOSITORY -Tag $env:SOURCE_TAG -AssetName $env:SOURCE_ASSET -Output "$env:RUNNER_TEMP/input.apk"
           }
+
+      - name: Cache validated original APK
+        if: steps.apk_metadata.outputs.key != '' && steps.apk_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/input.apk
+          key: ${{ steps.apk_metadata.outputs.key }}
+
+      - name: Download pinned toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
           $config = Get-Content ./ci/toolchain.json -Raw | ConvertFrom-Json
           ./ci/Get-ReleaseAsset.ps1 -Repository $env:REPOSITORY -Tag $config.releaseTag -AssetName $config.assetName -Output "$env:RUNNER_TEMP/toolchain.zip" -Sha256 $config.sha256
           [IO.Compression.ZipFile]::ExtractToDirectory("$env:RUNNER_TEMP/toolchain.zip", "$env:RUNNER_TEMP/toolchain")
@@ -176,6 +210,7 @@ jobs:
           python -m unittest discover -s ci/tests -v
           if ($LASTEXITCODE -ne 0) { throw 'Manifest tests failed.' }
           ./ci/tests/Test-ReleaseLogic.ps1
+          ./ci/tests/Test-ApkProbe.ps1
 
       - name: Build, test, isolate package, align, sign and verify
         if: steps.probe.outputs.needed == 'true'

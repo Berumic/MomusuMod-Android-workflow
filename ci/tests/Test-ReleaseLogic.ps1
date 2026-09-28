@@ -85,13 +85,26 @@ try {
     & "$ci/Check-Build.ps1" -Repository owner/repo -Apk "$temp/input.apk" -Aapt FakeAapt -TranslationsRoot $temp
     Assert ((Get-Content $env:GITHUB_OUTPUT) -contains 'needed=true') 'interrupted draft must rebuild'
     New-Item -ItemType Directory "$temp/dist" | Out-Null
-    @{releaseTag='mod-monmusutd-v174';game='monmusutd';sourceVersion='174';sourceCommit='test';modVersion='1'} |
+    @{releaseTag='mod-monmusutd-v174';game='monmusutd';sourceVersion='174';sourceCommit='test';modVersion='1';fingerprint=$translationChanged.fingerprint} |
         ConvertTo-Json | Set-Content "$temp/dist/build-info.json"
     'apk' | Set-Content "$temp/dist/game.apk"
     $global:ModCiTest_calls.Clear()
     & "$ci/Publish-Release.ps1" -Repository owner/repo -Output "$temp/dist"
     Assert (@($global:ModCiTest_calls | Where-Object { $_ -match 'release create' }).Count -eq 0) 'existing stable tag is updated, not recreated'
     Assert ($global:ModCiTest_calls[$global:ModCiTest_calls.Count - 1] -match '--draft=false') 'publish happens after uploads'
+    $uploads = @($global:ModCiTest_calls | Where-Object { $_ -match '^release upload ' })
+    Assert ($uploads.Count -eq 1 -and $uploads[0] -match 'game.apk' -and $uploads[0] -notmatch 'build-info.json|identity.json|SHA256SUMS|mod-files.zip') 'only final APK is uploaded'
+    Assert (@($global:ModCiTest_calls | Where-Object { $_ -match '--method DELETE' }).Count -eq 4) 'old auxiliary assets removed after APK upload'
+    $global:ModCiTest_releases[0].draft = $false
+    $global:ModCiTest_releases[0].assets = @(@{name='game.apk';size=1;id=10})
+    $global:ModCiTest_releases[0].body = "Build fingerprint: $($translationChanged.fingerprint)"
+    Clear-Content $env:GITHUB_OUTPUT
+    & "$ci/Check-Build.ps1" -Repository owner/repo -Apk "$temp/input.apk" -Aapt FakeAapt -TranslationsRoot $temp
+    Assert ((Get-Content $env:GITHUB_OUTPUT) -contains 'needed=false') 'APK-only release skips unchanged inputs using notes fingerprint'
+    $global:ModCiTest_releases[0].body = ''
+    Clear-Content $env:GITHUB_OUTPUT
+    & "$ci/Check-Build.ps1" -Repository owner/repo -Apk "$temp/input.apk" -Aapt FakeAapt -TranslationsRoot $temp
+    Assert ((Get-Content $env:GITHUB_OUTPUT) -contains 'needed=true') 'missing notes fingerprint requires rebuild'
     $global:ModCiTest_calls.Clear()
     $global:ModCiTest_failUpload = $true
     $failed = $false

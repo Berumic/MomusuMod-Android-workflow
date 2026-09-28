@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory)][string]$Url,
-    [Parameter(Mandatory)][string]$Output
+    [Parameter(Mandatory)][string]$Output,
+    [string]$ExpectedETag
 )
 $ErrorActionPreference = 'Stop'
 $uri = [Uri]$Url
@@ -11,7 +12,9 @@ New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
 $partial = $destination + '.' + [guid]::NewGuid().ToString('N') + '.partial'
 try {
     # Follow DMM redirects; save to a fixed name regardless of Content-Disposition.
-    & curl.exe --fail --location --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 1800 --output $partial $Url
+    $conditional = @()
+    if ($ExpectedETag) { $conditional = @('--header', "If-Match: $ExpectedETag") }
+    & curl.exe --fail --location --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 5 --connect-timeout 30 --max-time 1800 @conditional --output $partial $Url
     if ($LASTEXITCODE -ne 0) { throw 'DMM APK download failed; check runner network access and HTTP status above.' }
     $archive = [IO.Compression.ZipFile]::OpenRead($partial)
     try {

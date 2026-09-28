@@ -5,6 +5,9 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/GitHub.ps1"
 $info = Get-Content "$Output/build-info.json" -Raw | ConvertFrom-Json
+$files = @(Get-ChildItem $Output -File -Filter '*.apk')
+if ($files.Count -ne 1 -or $files[0].Length -le 0) { throw 'Expected exactly one nonempty final APK.' }
+if ($info.fingerprint -notmatch '^[0-9a-f]{64}$') { throw 'Missing or invalid build fingerprint.' }
 $tag = $info.releaseTag
 if ($tag -cne "mod-$($info.game)-v$($info.sourceVersion)" -or $tag -notmatch '^mod-[a-z0-9-]+-v[0-9]+$') { throw 'Invalid release tag.' }
 $title = "$($info.game) v$($info.sourceVersion) / Mod $($info.modVersion)"
@@ -15,7 +18,8 @@ $notes = @(
     "Mod commit: $($info.sourceCommit)",
     "Translations commit: $($info.translationCommit)",
     "Build fingerprint: $($info.fingerprint)",
-    "This tag is updated when APK, Mod or build recipe changes. The actual source commit is recorded above and in build-info.json.",
+    "APK SHA256: $((Get-FileHash -LiteralPath $files[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant())",
+    "This tag is updated when APK, Mod or build recipe changes. Build metadata is recorded in these release notes; only the final APK is attached.",
     "Original and Mod use separate application data. DMM login requires device validation."
 ) -join "`n`n"
 $notesFile = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N') + '.md')
@@ -29,10 +33,9 @@ try {
         & gh release create $tag --repo $Repository --target $info.sourceCommit --title $title --notes-file $notesFile --draft --latest=false
     }
     if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare draft release.' }
-    $files = @(Get-ChildItem $Output -File | Where-Object { $_.Name -ne 'build-info.json' })
-    & gh release upload $tag @($files.FullName) --repo $Repository --clobber
+    & gh release upload $tag $files[0].FullName --repo $Repository --clobber
     if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; draft retained.' }
-    $keep = @($files.Name) + 'build-info.json'
+    $keep = @($files.Name)
     if ($existing.Count) {
         foreach ($asset in $existing[0].assets) {
             if ($asset.name -notin $keep) {
@@ -41,9 +44,7 @@ try {
             }
         }
     }
-    # Completion marker is uploaded after all distributable files.
-    & gh release upload $tag "$Output/build-info.json" --repo $Repository --clobber
-    if ($LASTEXITCODE -ne 0) { throw 'Cannot upload build marker; draft retained.' }
+    # A non-draft release with the notes fingerprint is the completion marker.
     # Mark the generated Mod release as the repository's Latest release.
     & gh release edit $tag --repo $Repository --draft=false --latest=true
     if ($LASTEXITCODE -ne 0) { throw 'Cannot publish completed release; draft retained.' }
