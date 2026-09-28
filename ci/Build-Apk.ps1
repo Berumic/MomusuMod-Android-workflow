@@ -119,6 +119,7 @@ if ($env:GITHUB_ACTIONS -eq 'true' -and $sourceCommit -eq 'local-uncommitted') {
 $metadata = [ordered]@{
     game=$identity.game; sourceVersion=$identity.sourceVersion; releaseTag=$identity.releaseTag
     sourceReleaseTag=$SourceReleaseTag
+    sourceApkUrl=$env:SOURCE_APK_URL
     fingerprint=$identity.fingerprint; recipeSha256=$identity.recipeSha256
     translationManifestSha256=$identity.translationManifestSha256
     sourcePackageName=$package; packageName=$identity.modPackage; versionCode=$code; versionName=$version; unityVersion=$unity

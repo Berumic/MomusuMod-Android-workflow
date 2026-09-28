@@ -1,12 +1,15 @@
 param(
     [Parameter(Mandatory)][string]$Repository,
     [string]$SourceTag,
-    [string]$AssetName
+    [string]$AssetName,
+    [switch]$DirectDownload
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/GitHub.ps1"
 $selected = @()
-if ($SourceTag) {
+if ($DirectDownload) {
+    $selected += @{ sourceTag=''; assetName=''; game='monmusutdx'; sourceVersion=''; downloadUrl='https://dl-app.games.dmm.com/android/jp.co.dmm.fanzagames.monmusutdx' }
+} elseif ($SourceTag) {
     $entry = @{ sourceTag=$SourceTag; assetName=$AssetName; game='auto'; sourceVersion='' }
     $targets = (Get-Content "$PSScriptRoot/targets.json" -Raw | ConvertFrom-Json).targets
     foreach ($target in $targets) {

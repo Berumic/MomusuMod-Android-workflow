@@ -37,6 +37,9 @@ function Assert($condition,[string]$message) {
     Write-Host "PASS: $message"
 }
 try {
+    $direct = & "$ci/Select-Targets.ps1" -Repository owner/repo -DirectDownload -SourceTag ignored | ConvertFrom-Json
+    Assert ($direct.include.Count -eq 1 -and $direct.include[0].game -eq 'monmusutdx') 'direct download selects FANZA target'
+    Assert ($direct.include[0].downloadUrl -eq 'https://dl-app.games.dmm.com/android/jp.co.dmm.fanzagames.monmusutdx' -and !$direct.include[0].sourceVersion -and !$direct.include[0].sourceTag) 'direct download reads version from APK without a source release'
     $global:ModCiTest_releases = @(
         @{tag_name='apk-monmusutd-v9';draft=$false;published_at='2026-01-01'},
         @{tag_name='apk-monmusutd-v174';draft=$false;published_at='2026-01-02'},

@@ -3,6 +3,11 @@ name: Build Mod APK
 on:
   workflow_dispatch:
     inputs:
+      download_from_dmm:
+        description: Download current FANZA APK from DMM (ignores Release inputs)
+        required: true
+        default: false
+        type: boolean
       apk_release_tag:
         description: 'Source Release tag; blank selects latest apk-<game>-v<versionCode> per game'
         required: false
@@ -32,7 +37,8 @@ on:
       - 'ci/**'
       - '.github/workflows/build-mod-apk.yml'
   schedule:
-    - cron: '17 */6 * * *'
+    # Monday 12:00 Asia/Shanghai (UTC+8)
+    - cron: '0 4 * * 1'
   repository_dispatch:
     types: [mod-input-updated]
 
@@ -67,8 +73,9 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           SOURCE_TAG: ${{ inputs.apk_release_tag || github.event.release.tag_name }}
           SOURCE_ASSET: ${{ inputs.apk_asset_name }}
+          DMM_DOWNLOAD: ${{ github.event_name == 'schedule' || inputs.download_from_dmm }}
         run: |
-          ./ci/Select-Targets.ps1 -Repository $env:REPOSITORY -SourceTag $env:SOURCE_TAG -AssetName $env:SOURCE_ASSET
+          ./ci/Select-Targets.ps1 -Repository $env:REPOSITORY -SourceTag $env:SOURCE_TAG -AssetName $env:SOURCE_ASSET -DirectDownload:($env:DMM_DOWNLOAD -eq 'true')
 
   build:
     needs: select
@@ -97,8 +104,13 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           SOURCE_TAG: ${{ matrix.sourceTag }}
           SOURCE_ASSET: ${{ matrix.assetName }}
+          SOURCE_URL: ${{ matrix.downloadUrl }}
         run: |
-          ./ci/Get-ReleaseAsset.ps1 -Repository $env:REPOSITORY -Tag $env:SOURCE_TAG -AssetName $env:SOURCE_ASSET -Output "$env:RUNNER_TEMP/input.apk"
+          if ($env:SOURCE_URL) {
+            ./ci/Get-DirectApk.ps1 -Url $env:SOURCE_URL -Output "$env:RUNNER_TEMP/input.apk"
+          } else {
+            ./ci/Get-ReleaseAsset.ps1 -Repository $env:REPOSITORY -Tag $env:SOURCE_TAG -AssetName $env:SOURCE_ASSET -Output "$env:RUNNER_TEMP/input.apk"
+          }
           $config = Get-Content ./ci/toolchain.json -Raw | ConvertFrom-Json
           ./ci/Get-ReleaseAsset.ps1 -Repository $env:REPOSITORY -Tag $config.releaseTag -AssetName $config.assetName -Output "$env:RUNNER_TEMP/toolchain.zip" -Sha256 $config.sha256
           [IO.Compression.ZipFile]::ExtractToDirectory("$env:RUNNER_TEMP/toolchain.zip", "$env:RUNNER_TEMP/toolchain")
@@ -174,6 +186,7 @@ jobs:
           APK_KEY_PASSWORD: ${{ secrets.APK_KEY_PASSWORD }}
           EXPECTED_GAME: ${{ matrix.game }}
           SOURCE_TAG: ${{ matrix.sourceTag }}
+          SOURCE_APK_URL: ${{ matrix.downloadUrl }}
         run: |
           $keystore = "$env:RUNNER_TEMP/mod-signing.p12"
           try {

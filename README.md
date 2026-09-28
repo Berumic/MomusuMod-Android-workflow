@@ -1,7 +1,15 @@
 # 如果你需要下载安装包
 1. 在release中寻找latest
 2. 下载 monmusutdx-vxxx-mod-xxx.apk 并安装
-3. 注意更新时间，因为是手动触发打包工作流所以可能不会立刻更新。
+3. 每周一北京时间中午 12:00 自动从 DMM 下载 FANZA 原版并检查是否需要构建，也可手动触发。
+
+## 每周自动下载 FANZA APK
+
+默认分支工作流每周一 12:00（北京时间，UTC 04:00）从 `https://dl-app.games.dmm.com/android/jp.co.dmm.fanzagames.monmusutdx` 下载，跟随 HTTPS 重定向并保存为 `input.apk`，无需下载地址或原文件名包含 `.apk` 后缀。下载失败自动重试，下载结果检查 APK 结构，再由现有步骤校验包名并读取 versionCode。
+
+继续使用现有签名 Secrets 和 `build-tools-v1`。APK、插件、构建配方或翻译指纹变化时才构建并发布 `mod-monmusutdx-v<versionCode>`；完全相同时跳过。新产物沿用 Latest 发布规则。GitHub 定时任务可能排队延迟，只有默认分支中的工作流参与定时运行。
+
+想立即测试：Actions → Build Mod APK → Run workflow，勾选 `download_from_dmm`，保留 `publish_release`。无需填写源 Release 标签或附件名；直链模式会忽略这两项。不勾选则保留原有 Release 上传模式。直链下载需要 GitHub Runner 能访问 DMM；本地成功不代表 Runner 网络一定可用。
 
 
 # MonsterMusumeTD Android 自动打包
@@ -90,7 +98,7 @@ Run workflow 表单不支持上传文件，所以这里用 Release 附件作为 
 
 - 发布或编辑 `apk-*` Release：检查该输入并构建对应目标。
 - 向默认分支推送插件源码或构建配方（Android/Core/Services/Patches/ci/工作流）：检查每个游戏的最新输入。
-- 每 6 小时检查一次：检测最新原版 Release 的 APK 附件替换和远端汉化清单更新。GitHub 定时执行可能延迟。
+- 每周一北京时间 12:00：从 DMM 直链下载 FANZA 原版，并检测 APK 和远端汉化清单更新。GitHub 定时执行可能延迟。
 - 手动 Run workflow，或发送 `repository_dispatch` 的 `mod-input-updated` 事件。
 
 只替换 Release 附件不一定立即产生 Release 事件，定时检查会补上，也可手动运行。输出标签使用 `mod-*`，不会循环触发；构建成功后该 Mod Release 会被标记为仓库 Latest。GitHub 每个仓库只有一个 Latest 标记，多游戏目标时最后完成的构建会成为 Latest。没有上传原版时，自动检查会跳过。
@@ -108,7 +116,7 @@ Run workflow 表单不支持上传文件，所以这里用 Release 附件作为 
 - 产物为签名 APK、Mod 文件 ZIP、identity.json、build-info.json 和 SHA256SUMS.txt。私钥在 finally 和 always 步骤清理，不上传工作目录。
 - 发布先上传到草稿，成功后公开。更新已有 Release 时会暂时转为草稿；失败时从 Actions 下载产物，重新运行即可修复未完成草稿。
 - 当前固定 Unity `2022.3.62f2`；游戏升级 Unity 会明确报错，需要更新依赖及适配。支持 ARM64 手机。
-- 不自动从 DMM 下载 APK；定时检查的是你自己仓库中上传的 Release 附件。
+- 定时任务自动下载 DMM FANZA APK；手动 Release 上传入口保留。
 
 ## 本地构建和维护
 
