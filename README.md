@@ -1,13 +1,13 @@
 # 如果你需要下载安装包
 1. 在release中寻找latest
 2. 下载 monmusutdx-vxxx-mod-xxx.apk 并安装
-3. 每天北京时间 14:25 自动从 DMM 下载 FANZA 原版并检查是否需要构建，也可手动触发。
+3. 每天北京时间 15:05 自动从 DMM 下载 FANZA 原版并检查是否需要构建，也可手动触发。
 
 ## 每日自动下载 FANZA APK
 
 下载前先通过 HEAD 读取 DMM 的 ETag、文件长度和服务端文件版本标识，未变化且命中 Actions 缓存时复用原版 APK，不再从 DMM 重复下载。APK 的 versionCode 仍由 aapt 读取；HTTP 文件标识不是游戏版本号。首次运行、缓存被清理或文件变化时重新下载。HEAD 失败或缺少可靠标识时安全回退到下载。插件与翻译更新不会因为原版未变而被跳过。缓存命中仍需从 GitHub 恢复缓存，工具链也仍按原流程获取。
 
-默认分支工作流每天 14:25（北京时间，UTC 06:25）从 `https://dl-app.games.dmm.com/android/jp.co.dmm.fanzagames.monmusutdx` 下载，跟随 HTTPS 重定向并保存为 `input.apk`，无需下载地址或原文件名包含 `.apk` 后缀。下载失败自动重试，下载结果检查 APK 结构，再由现有步骤校验包名并读取 versionCode。
+默认分支工作流每天 15:05（北京时间，UTC 07:05）从 `https://dl-app.games.dmm.com/android/jp.co.dmm.fanzagames.monmusutdx` 下载，跟随 HTTPS 重定向并保存为 `input.apk`，无需下载地址或原文件名包含 `.apk` 后缀。下载失败自动重试，下载结果检查 APK 结构，再由现有步骤校验包名并读取 versionCode。
 
 继续使用现有签名 Secrets 和 `build-tools-v1`。APK、插件、构建配方或翻译指纹变化时才构建并发布 `mod-monmusutdx-v<versionCode>`；完全相同时跳过。新产物沿用 Latest 发布规则。GitHub 定时任务可能排队延迟，只有默认分支中的工作流参与定时运行。
 
@@ -100,7 +100,7 @@ Run workflow 表单不支持上传文件，所以这里用 Release 附件作为 
 
 - 发布或编辑 `apk-*` Release：检查该输入并构建对应目标。
 - 向默认分支推送插件源码或构建配方（Android/Core/Services/Patches/ci/工作流）：检查每个游戏的最新输入。
-- 每天北京时间 14:25：从 DMM 直链下载 FANZA 原版，并检测 APK 和远端汉化清单更新。GitHub 定时执行可能延迟。
+- 每天北京时间 15:05：从 DMM 直链下载 FANZA 原版，并检测 APK 和远端汉化清单更新。GitHub 定时执行可能延迟。
 - 手动 Run workflow，或发送 `repository_dispatch` 的 `mod-input-updated` 事件。
 
 只替换 Release 附件不一定立即产生 Release 事件，定时检查会补上，也可手动运行。输出标签使用 `mod-*`，不会循环触发；构建成功后该 Mod Release 会被标记为仓库 Latest。GitHub 每个仓库只有一个 Latest 标记，多游戏目标时最后完成的构建会成为 Latest。没有上传原版时，自动检查会跳过。

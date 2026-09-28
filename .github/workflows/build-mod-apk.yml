@@ -37,8 +37,8 @@ on:
       - 'ci/**'
       - '.github/workflows/build-mod-apk.yml'
   schedule:
-    # Daily 14:25 Asia/Shanghai (UTC+8)
-    - cron: '25 6 * * *'
+    # Daily 15:05 Asia/Shanghai (UTC+8)
+    - cron: '5 7 * * *'
   repository_dispatch:
     types: [mod-input-updated]
 
