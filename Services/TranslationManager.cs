@@ -21,7 +21,9 @@ public sealed class TranslationManager
     private readonly Dictionary<string, string> _uiTexts = new(StringComparer.Ordinal);
     // UI results depend on both text and path. Bound retained runtime strings;
     // misses are cached too, and every table reload invalidates both kinds.
-    private readonly Dictionary<(string Source, string Path), (bool Matched, string Value)> _uiResults = new();
+    private readonly BoundedLruCache<(string Source, string Path), (bool Matched, string Value)> _uiResults = new(UiResultCapacity);
+    private readonly BoundedLruCache<(string Source, string Path), (bool Matched, string Value)> _subSkillResults = new(UiResultCapacity);
+    private readonly BoundedLruCache<(string Value, int Kind), bool> _knownResults = new(2048);
     private const int UiResultCapacity = 1024;
     private readonly List<UiPathTable> _uiPathTables = new();
     private readonly Dictionary<string, List<UiPathTable>>
@@ -75,6 +77,8 @@ public sealed class TranslationManager
     public void LoadStatic()
     {
         _uiResults.Clear();
+        _subSkillResults.Clear();
+        _knownResults.Clear();
         _names.Clear();
         _nameExTemplates.Clear();
         _nameSceneTemplates.Clear();
@@ -367,9 +371,7 @@ public sealed class TranslationManager
             return cached.Matched;
         }
         var matched = TryTranslateUiTextCore(source, scenePath, out translated);
-        if (_uiResults.Count >= UiResultCapacity)
-            _uiResults.Clear();
-        _uiResults[key] = (matched, translated);
+        _uiResults.Set(key, (matched, translated));
         return matched;
     }
 
@@ -507,6 +509,23 @@ public sealed class TranslationManager
     public bool TryTranslateSubSkill(string source, string scenePath, out string translated)
     {
         translated = source;
+        if (!_config.Enabled.Value || string.IsNullOrEmpty(source)) return false;
+        if (source.Length > 8192 || (scenePath?.Length ?? 0) > 4096)
+            return TryTranslateSubSkillCore(source, scenePath, out translated);
+        var key = (source, scenePath ?? string.Empty);
+        if (_subSkillResults.TryGetValue(key, out var cached))
+        {
+            translated = cached.Value;
+            return cached.Matched;
+        }
+        var matched = TryTranslateSubSkillCore(source, scenePath, out translated);
+        _subSkillResults.Set(key, (matched, translated));
+        return matched;
+    }
+
+    private bool TryTranslateSubSkillCore(string source, string scenePath, out string translated)
+    {
+        translated = source;
         if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
             return false;
 
@@ -541,14 +560,36 @@ public sealed class TranslationManager
         return TryTranslateIndexedFragments(lookupKey, _subSkillFragmentIndex, out translated);
     }
 
-    public bool IsKnownSubSkillTranslationValue(string value) =>
+    public bool IsKnownSubSkillTranslationValue(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return false;
+        if (value.Length > 8192) return IsKnownSubSkillTranslationValueCore(value);
+        var key = (value, 1);
+        if (_knownResults.TryGetValue(key, out var cached)) return cached;
+        var result = IsKnownSubSkillTranslationValueCore(value);
+        _knownResults.Set(key, result);
+        return result;
+    }
+
+    private bool IsKnownSubSkillTranslationValueCore(string value) =>
         !string.IsNullOrEmpty(value) &&
         (_knownSubSkillTranslationValues.Contains(value) ||
          MatchesSceneTemplateTranslation(value, _subSkillSceneTemplates) ||
          MatchesNumberTemplateTranslation(value, _subSkillNumberTemplates) ||
          MatchesExTemplateTranslation(value, _subSkillExTemplates));
 
-    public bool IsKnownUiTextTranslationValue(string value) =>
+    public bool IsKnownUiTextTranslationValue(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return false;
+        if (value.Length > 8192) return IsKnownUiTextTranslationValueCore(value);
+        var key = (value, 2);
+        if (_knownResults.TryGetValue(key, out var cached)) return cached;
+        var result = IsKnownUiTextTranslationValueCore(value);
+        _knownResults.Set(key, result);
+        return result;
+    }
+
+    private bool IsKnownUiTextTranslationValueCore(string value) =>
         !string.IsNullOrEmpty(value) &&
         (_knownUiTextTranslationValues.Contains(value) ||
          MatchesSceneTemplateTranslation(value, _uiSceneTemplates) ||
@@ -1014,6 +1055,17 @@ public sealed class TranslationManager
         _runtimeTextCollector.CaptureVisibleSubSkillScanText();
 
     public bool IsKnownTranslationValue(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return false;
+        if (value.Length > 8192) return IsKnownTranslationValueCore(value);
+        var key = (value, 0);
+        if (_knownResults.TryGetValue(key, out var cached)) return cached;
+        var result = IsKnownTranslationValueCore(value);
+        _knownResults.Set(key, result);
+        return result;
+    }
+
+    private bool IsKnownTranslationValueCore(string value)
     {
         if (string.IsNullOrEmpty(value))
             return false;

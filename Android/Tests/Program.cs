@@ -130,6 +130,30 @@ try
     Check(!translations.TryTranslateUiText("\u653b\u648312.5%", out _), "Master switch disables translation");
     config.Enabled.Value = true;
 
+    var lru = new BoundedLruCache<string, bool>(2);
+    lru.Set("hot", false);
+    lru.Set("cold", true);
+    Check(lru.TryGetValue("hot", out var negative) && !negative, "Negative cache hits are retained");
+    lru.Set("new", true);
+    Check(lru.Count == 2 && !lru.TryGetValue("cold", out _) && lru.TryGetValue("hot", out _), "Eviction preserves hot entries");
+    lru.Set("hot", true);
+    Check(lru.Count == 2 && lru.TryGetValue("hot", out var replaced) && replaced, "Cached values can be replaced");
+    lru.Clear();
+    Check(lru.Count == 0 && !lru.TryGetValue("hot", out _), "Cache clear removes results");
+    Check(translations.IsKnownUiTextTranslationValue("Attack 12.5%") && translations.IsKnownUiTextTranslationValue("Attack 12.5%"), "Repeated UI template recognition");
+    Check(translations.IsKnownSubSkillTranslationValue("Attack +25%") && translations.IsKnownSubSkillTranslationValue("Attack +25%"), "Repeated subskill template recognition");
+    Check(!translations.IsKnownTranslationValue("new target") && !translations.IsKnownUiTextTranslationValue("new target") && !translations.IsKnownSubSkillTranslationValue("new target"), "Unknown values are cached by category");
+    Check(!translations.TryTranslateSubSkill("missing", out _) && !translations.TryTranslateSubSkill("missing", out _), "Repeated subskill misses");
+    Write(Path.Combine(translationRoot, "subskills", "zh_Hans.json"), new Dictionary<string,string> { ["missing"] = "new target" });
+    Write(Path.Combine(translationRoot, "UICanvas", "zh_Hans.json"), new Dictionary<string,string> { ["missing"] = "new target" });
+    translations.LoadStatic();
+    Check(translations.TryTranslateSubSkill("missing", out result) && result == "new target", "Reload invalidates subskill misses");
+    Check(translations.IsKnownTranslationValue("new target") && translations.IsKnownUiTextTranslationValue("new target") && translations.IsKnownSubSkillTranslationValue("new target"), "Reload invalidates all known-value misses");
+    Check(!translations.IsKnownUiTextTranslationValue("Attack 12.5%") && !translations.IsKnownSubSkillTranslationValue("Attack +25%"), "Reload removes cached template hits");
+    config.Enabled.Value = false;
+    Check(!translations.TryTranslateSubSkill("missing", out _), "Master switch bypasses subskill cache");
+    config.Enabled.Value = true;
+
     using var server = new FixtureServer();
     var updateRoot = Path.Combine(root, "updates");
     Directory.CreateDirectory(updateRoot);
