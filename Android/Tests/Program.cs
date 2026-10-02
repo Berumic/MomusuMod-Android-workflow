@@ -154,6 +154,63 @@ try
     Check(!translations.TryTranslateSubSkill("missing", out _), "Master switch bypasses subskill cache");
     config.Enabled.Value = true;
 
+    const string sharedStory = "\u3042<interval=0.5>\u3044";
+    const string sceneATarget = "Long translated A<interval=0.2>tail";
+    const string sceneBTarget = "B<interval=0.8>different";
+    Write(Path.Combine(translationRoot, "scenarios", "nested", "sceneA", "zh_Hans.json"), new Dictionary<string,string> {
+        [sharedStory] = sceneATarget,
+        ["line\nnext<interval=1>end"] = "translated\nlong next<interval=2>end",
+        ["unique"] = "unique translated"
+    });
+    Write(Path.Combine(translationRoot, "scenarios", "sceneB", "zh_Hans.json"), new Dictionary<string,string> { [sharedStory] = sceneBTarget });
+    translations.LoadStatic();
+    Check(translations.TryTranslateStoryBeforeParse(sharedStory, "sceneA", out result) && result == sceneATarget,
+        "Scene A supplies its own translated timing positions");
+    Check(translations.TryTranslateStoryBeforeParse(sharedStory, "sceneB", out result) && result == sceneBTarget,
+        "Scene B supplies a different translation of the same source");
+    Check(!translations.TryTranslateStoryBeforeParse(sharedStory, "", out result) && result == sharedStory,
+        "Unknown scene preserves ambiguous raw story");
+    Check(translations.TryTranslateStoryExact("\u3042\u3044", "sceneB", null, out result) && result == sceneBTarget,
+        "Display text without interval tags uses scene index");
+    Check(!translations.TryTranslateStoryExact("\u3042\u3044", "", null, out _),
+        "Display fallback refuses ambiguous story rows");
+    Check(!translations.TryTranslateStoryExact("prefix " + sharedStory, "", null, out _),
+        "Fragment fallback cannot reintroduce ambiguous translations");
+    Check(translations.TryTranslateStoryBeforeParse("unique", "", out result) && result == "unique translated",
+        "Unique global row remains available without scene identity");
+    Check(translations.TryTranslateStoryBeforeParse("line\r\nnext<interval=1>end", "sceneA", out result) && result == "translated\nlong next<interval=2>end",
+        "CRLF lookup preserves translated interval tags before parsing");
+    Check(!translations.TryTranslateStoryBeforeParse(sceneATarget, "sceneA", out _),
+        "Translated parser input is not translated again");
+    Check(translations.ResolveStoryScenarioId("book/sceneA.bytes:sheet") == "sceneA" &&
+        translations.ResolveStoryScenarioId("*sceneB") == "sceneB", "Book names and labels resolve scene identity");
+    StorySceneContext.RegisterLabel("label-A", "sceneA");
+    StorySceneContext.RegisterLabel("shared-label", "sceneA");
+    StorySceneContext.RegisterLabel("shared-label", "sceneB");
+    Check(StorySceneContext.ResolveLabel("label-A") == "sceneA" && StorySceneContext.ResolveLabel("shared-label") == "",
+        "Conflicting labels cannot select an arbitrary scene");
+    StorySceneContext.SetPlayback("sceneA");
+    Check(translations.TryTranslateStoryBeforeParse(sharedStory, out result) && result == sceneATarget,
+        "Playback context reaches parser translation");
+    using (StorySceneContext.EnterParsing("sceneB"))
+    {
+        Check(translations.TryTranslateStoryBeforeParse(sharedStory, out result) && result == sceneBTarget,
+            "Preloaded script overrides the playing scene");
+        using (StorySceneContext.EnterParsing(""))
+            Check(!translations.TryTranslateStoryBeforeParse(sharedStory, out _), "Unknown preload suppresses playing scene");
+        Check(StorySceneContext.ParsingId == "sceneB", "Nested parsing scope restores enclosing scene");
+    }
+    Check(StorySceneContext.ParsingId == "sceneA", "Parsing scope restores playback context");
+    StorySceneContext.ClearPlayback();
+    Check(StorySceneContext.ParsingId == "", "Playback end clears story context");
+    config.TranslateScenarios.Value = false;
+    Check(!translations.TryTranslateStoryBeforeParse(sharedStory, "sceneA", out _), "Scenario toggle disables preparse translation");
+    config.TranslateScenarios.Value = true;
+    Write(Path.Combine(translationRoot, "scenarios", "sceneB", "zh_Hans.json"), new Dictionary<string,string> { [sharedStory] = sceneATarget });
+    translations.LoadStatic();
+    Check(translations.TryTranslateStoryBeforeParse(sharedStory, "", out result) && result == sceneATarget,
+        "Translation reload rebuilds conflict indexes");
+
     using var server = new FixtureServer();
     var updateRoot = Path.Combine(root, "updates");
     Directory.CreateDirectory(updateRoot);
@@ -198,6 +255,21 @@ try
     using var tmp = AssemblyDefinition.ReadAssembly(Path.Combine(workspace, "Interop", "Unity.TextMeshPro.dll"));
     Check(game.MainModule.Types.Any(t => t.FullName == "Il2Cpp.SpineMosaic"), "Android APK contains SpineMosaic");
     var utage = game.MainModule.Types.Single(t => t.FullName == "Il2CppUtage.TextData");
+    Check(utage.Methods.Any(m => m.Name == "get_CreateCustomTextParser") &&
+        utage.Methods.Any(m => m.Name == "set_CreateCustomTextParser"), "Android UTAGE exposes custom parser callback");
+    bool InvokesNative(MethodDefinition method) => method.HasBody && method.Body.Instructions.Any(i =>
+        i.Operand is MethodReference called && called.Name == "il2cpp_runtime_invoke");
+    var parserConstructor = game.MainModule.Types.Single(t => t.FullName == "Il2CppUtage.TextParser").Methods.Single(m =>
+        m.Name == ".ctor" && m.Parameters.Count == 2 && m.Parameters[0].ParameterType.FullName == "System.String");
+    Check(InvokesNative(parserConstructor), "Translated input reaches native UTAGE parser");
+    foreach (var (typeName, methodName) in new[] {
+        ("AdvScenarioData", "Init"), ("AdvCommand", "ParseCellLocalizedText"), ("AdvCommandText", "DoCommand"),
+        ("AdvScenarioPlayer", "StartScenario"), ("AdvScenarioThread", "StartScenario"), ("AdvScenarioPlayer", "EndScenario") })
+    {
+        var method = game.MainModule.Types.Single(t => t.FullName == "Il2CppUtage." + typeName).Methods.Single(m => m.Name == methodName);
+        Check(InvokesNative(method) && (methodName != "StartScenario" || method.Parameters[0].ParameterType.FullName == "System.String"),
+            "Android scene hook has native entry point: " + typeName + "." + methodName);
+    }
     Check(utage.Methods.Any(m => m.Name == ".ctor" && m.Parameters.Any(p => p.ParameterType.FullName == "System.String")), "Android UTAGE has raw string constructor hook");
     Check(tmp.MainModule.Types.Single(t => t.FullName == "Il2CppTMPro.TMP_Text").Methods.Any(m => m.Name == "set_text"), "Android TMP setter hook exists");
     using var mod = AssemblyDefinition.ReadAssembly(Path.Combine(workspace, "Build", "MonsterMusumeTDMod.Android.dll"));
@@ -206,6 +278,11 @@ try
     IEnumerable<TypeDefinition> AllTypes(IEnumerable<TypeDefinition> types) => types.SelectMany(t => new[] { t }.Concat(AllTypes(t.NestedTypes)));
     var methodsCalled = AllTypes(mod.MainModule.Types).SelectMany(t => t.Methods).Where(m => m.HasBody)
         .SelectMany(m => m.Body.Instructions).Select(i => i.Operand).OfType<MethodReference>().ToArray();
+    Check(methodsCalled.Any(m => m.DeclaringType.FullName == "Il2CppUtage.TextData" && m.Name == "set_CreateCustomTextParser"),
+        "Built plugin installs native custom parser callback");
+    var parserCallback = mod.MainModule.Types.Single(t => t.Name == "PatchManager").Methods.Single(m => m.Name == "ParseStoryText");
+    Check(!parserCallback.Body.Instructions.Any(i => i.Operand is MethodReference called &&
+        called.DeclaringType.FullName == "Il2CppUtage.TextData" && called.Name == ".ctor"), "Parser callback cannot recursively construct TextData");
     Check(!methodsCalled.Any(m => m.DeclaringType.FullName == "UnityEngine.Material" && (m.Name == "IsKeywordEnabled" || m.Name == "set_globalIlluminationFlags")), "Built Android DLL avoids stripped material APIs in every style path");
     Check(!methodsCalled.Any(m => m.DeclaringType.FullName == "UnityEngine.Object" && m.Name == "FindObjectsByType"), "Built Android scanner avoids stripped discovery API");
     using var unity = AssemblyDefinition.ReadAssembly(Path.Combine(workspace, "Interop", "UnityEngine.CoreModule.dll"));

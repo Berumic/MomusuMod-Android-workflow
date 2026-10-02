@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using HarmonyLib;
+using Il2CppInterop.Runtime;
 using MonsterMusumeTDMod.Core;
 using MonsterMusumeTDMod.Services;
 
@@ -18,6 +19,8 @@ public static class PatchManager
     private static bool _storyMatchLogged;
     private static bool _storyMissLogged;
     private static bool _storyPreParseHitLogged;
+    private static Il2CppSystem.Func<string, Utage.TextParserBase> _previousStoryParser;
+    private static Il2CppSystem.Func<string, Utage.TextParserBase> _storyParser;
     private static readonly Dictionary<string, Type> RuntimeTypeCache = new(StringComparer.Ordinal);
     // The game writes the translated argument back through the same setter.
     // Track that value per UI component so a composed translation is not
@@ -34,6 +37,7 @@ public static class PatchManager
         PatchTypeMethods("TMPro.TextMeshProUGUI", new[] { "set_text", "SetText" });
         PatchTypeMethods("UnityEngine.UI.Text", new[] { "set_text" });
         PatchStoryTextParserEntryPoints();
+        PatchStorySceneEntryPoints();
         // Utage's full-screen history view uses this custom Text-derived control.
         PatchTypeMethods("UguiNovelText", new[] { "set_text", "SetText", "UpdateText" });
         // The attach-ability window first stores the master-data description
@@ -86,6 +90,12 @@ public static class PatchManager
 
     public static void Uninstall()
     {
+        if (_storyParser != null)
+        {
+            Utage.TextData.CreateCustomTextParser = _previousStoryParser;
+            _storyParser = null;
+            _previousStoryParser = null;
+        }
         try { _harmony?.UnpatchSelf(); }
         catch (Exception ex) { Plugin.Log?.LogWarning($"Unpatch failed: {ex.Message}"); }
         PatchedMethods.Clear();
@@ -168,56 +178,81 @@ public static class PatchManager
 
     private static void PatchStoryTextParserEntryPoints()
     {
-        var type = FindRuntimeType("Utage.TextData");
-        if (type == null)
+        // UTAGE exposes this native extension point specifically for custom
+        // parsing. Constructor Harmony hooks can fall back to managed-only
+        // patches and therefore miss native/inlined calls in IL2CPP builds.
+        try
         {
-            Plugin.Log.LogWarning(
-                "UTAGE TextData was not found; " +
-                "story interval tags will use the original timing");
-            return;
+            _previousStoryParser = Utage.TextData.CreateCustomTextParser;
+            _storyParser = DelegateSupport.ConvertDelegate<Il2CppSystem.Func<string, Utage.TextParserBase>>(
+                new Func<string, Utage.TextParserBase>(ParseStoryText));
+            Utage.TextData.CreateCustomTextParser = _storyParser;
+            Plugin.Log.LogInfo("Installed UTAGE CreateCustomTextParser translation callback");
+        }
+        catch (Exception exception)
+        {
+            Plugin.Log.LogWarning($"Failed to install UTAGE translation parser callback: {exception.Message}");
+        }
+    }
+
+    private static Utage.TextParserBase ParseStoryText(string source)
+    {
+        var text = source;
+        if (_translations != null &&
+            _translations.TryTranslateStoryBeforeParse(source, out var translated))
+        {
+            text = translated;
+            if (!_storyPreParseHitLogged)
+            {
+                _storyPreParseHitLogged = true;
+                Plugin.Log.LogInfo(
+                    $"UTAGE translation parser callback matched; scene={StorySceneContext.ParsingId}; " +
+                    "interval timing is parsed from translated text");
+            }
         }
 
-        var targets = new (System.Reflection.MethodBase Method, string Name)[]
-        {
-            (
-                Method: AccessTools.Constructor(type, new[] { typeof(string) }),
-                Name: "TextData(string) constructor"
-            ),
-            (
-                Method: AccessTools.Method(type, "CreateTextParser", new[] { typeof(string) }),
-                Name: "TextData.CreateTextParser(string)"
-            )
-        };
+        // Do not create TextData here: that would re-enter this callback.
+        // The original parser remains responsible for tags, glyphs and timing.
+        return _previousStoryParser != null
+            ? _previousStoryParser.Invoke(text)
+            : new Utage.TextParser(text, false);
+    }
 
-        var patchedAny = false;
-        foreach (var target in targets)
-        {
-            if (target.Method == null)
-            {
-                Plugin.Log.LogWarning($"UTAGE {target.Name} was not found");
-                continue;
-            }
+    private static void PatchStorySceneEntryPoints()
+    {
+        PatchStorySceneMethod("Utage.AdvScenarioData", "Init", nameof(Hooks.BeginStoryScript),
+            nameof(Hooks.RegisterStoryLabels), scoped: true);
+        PatchStorySceneMethod("Utage.AdvCommand", "ParseCellLocalizedText", nameof(Hooks.BeginStoryCommand),
+            null, scoped: true);
+        PatchStorySceneMethod("Utage.AdvCommandText", "DoCommand", nameof(Hooks.BeginStoryCommand),
+            null, scoped: true);
+        PatchStorySceneMethod("Utage.AdvScenarioPlayer", "StartScenario", nameof(Hooks.StartStoryScene), null);
+        PatchStorySceneMethod("Utage.AdvScenarioThread", "StartScenario", nameof(Hooks.StartStoryScene), null);
+        PatchStorySceneMethod("Utage.AdvScenarioPlayer", "EndScenario", nameof(Hooks.EndStoryScene), null);
+    }
 
+    private static void PatchStorySceneMethod(string typeName, string name, string prefix, string postfix,
+        bool scoped = false)
+    {
+        var type = FindRuntimeType(typeName);
+        if (type == null) return;
+        foreach (var method in AccessTools.GetDeclaredMethods(type))
+        {
+            if (method.Name != name) continue;
             try
             {
-                _harmony.Patch(
-                    target.Method,
-                    prefix: new HarmonyMethod(typeof(Hooks), nameof(Hooks.TranslateStoryBeforeParse))
-                );
-                PatchedMethods.Add(target.Method);
-                patchedAny = true;
-                Plugin.Log.LogInfo(
-                    $"Patched UTAGE {target.Name} for translated story timing");
+                _harmony.Patch(method,
+                    prefix: new HarmonyMethod(typeof(Hooks), prefix),
+                    postfix: postfix == null ? null : new HarmonyMethod(typeof(Hooks), postfix),
+                    finalizer: scoped ? new HarmonyMethod(typeof(Hooks), nameof(Hooks.EndStoryScope)) : null);
+                PatchedMethods.Add(method);
+                Plugin.Log.LogInfo($"Patched story scene context: {typeName}.{name}");
             }
             catch (Exception exception)
             {
-                Plugin.Log.LogWarning(
-                    $"Failed to patch UTAGE {target.Name}: {exception.Message}");
+                Plugin.Log.LogWarning($"Story scene hook unavailable: {typeName}.{name}: {exception.Message}");
             }
         }
-
-        if (!patchedAny)
-            Plugin.Log.LogWarning("No UTAGE story pre-parse entry point was patched");
     }
 
     private static bool Matches(string name, IEnumerable<string> candidates)
@@ -354,6 +389,74 @@ public static class PatchManager
 
     private static class Hooks
     {
+        public static void BeginStoryScript(Utage.AdvScenarioData __instance, out IDisposable __state)
+        {
+            var scene = string.Empty;
+            try
+            {
+                scene = _translations.ResolveStoryScenarioId(__instance.Name);
+                if (scene.Length == 0) scene = _translations.ResolveStoryScenarioId(__instance.DataGridName);
+            }
+            catch (Exception exception) { Plugin.Log.LogDebug($"Story script context: {exception.Message}"); }
+            // Even an unknown preloaded script suppresses the playback context.
+            __state = StorySceneContext.EnterParsing(scene);
+        }
+
+        public static void RegisterStoryLabels(Utage.AdvScenarioData __instance)
+        {
+            try
+            {
+                var scene = StorySceneContext.ParsingId;
+                if (string.IsNullOrEmpty(scene)) return;
+                foreach (var entry in __instance.ScenarioLabels)
+                    StorySceneContext.RegisterLabel(entry.Key, scene);
+                Plugin.Log.LogInfo($"Story script indexed: {scene}");
+            }
+            catch (Exception exception) { Plugin.Log.LogDebug($"Story label indexing: {exception.Message}"); }
+        }
+
+        public static void BeginStoryCommand(Utage.AdvCommand __instance, out IDisposable __state)
+        {
+            var scene = string.Empty;
+            try
+            {
+                var grid = __instance.RowData?.Grid;
+                if (grid != null)
+                {
+                    scene = _translations.ResolveStoryScenarioId(grid.Name);
+                    if (scene.Length == 0) scene = _translations.ResolveStoryScenarioId(grid.SheetName);
+                }
+                if (__instance is Utage.AdvCommandText command)
+                {
+                    var label = command.PageData?.ScenarioLabelData?.ScenarioLabel;
+                    if (scene.Length == 0) scene = StorySceneContext.ResolveLabel(label);
+                    if (scene.Length == 0) scene = _translations.ResolveStoryScenarioId(label);
+                    if (scene.Length > 0) StorySceneContext.SetPlayback(scene);
+                }
+            }
+            catch (Exception exception) { Plugin.Log.LogDebug($"Story command context: {exception.Message}"); }
+            // A command's own identity takes precedence; otherwise retain its
+            // enclosing parsing scope, including an explicitly unknown one.
+            if (scene.Length == 0) scene = StorySceneContext.ParsingId;
+            __state = StorySceneContext.EnterParsing(scene);
+        }
+
+        public static Exception EndStoryScope(Exception __exception, IDisposable __state)
+        {
+            __state?.Dispose();
+            return __exception;
+        }
+
+        public static void StartStoryScene(string __0)
+        {
+            var scene = StorySceneContext.ResolveLabel(__0);
+            if (scene.Length == 0) scene = _translations.ResolveStoryScenarioId(__0);
+            StorySceneContext.SetPlayback(scene);
+            Plugin.Log.LogInfo($"Story playback context: label={__0}, scene={scene}");
+        }
+
+        public static void EndStoryScene() => StorySceneContext.ClearPlayback();
+
         public static void ObserveContext(object __instance) => ScenarioContext.Observe(__instance);
 
         public static void ApplyButtonState(object __instance)
@@ -570,7 +673,7 @@ public static class PatchManager
             if (_config.TranslateScenarios.Value &&
                 _translations.TryTranslateStoryExact(
                     source,
-                    ScenarioContext.CurrentId,
+                    StorySceneContext.PlaybackId,
                     ScenarioContext.CurrentResourceId,
                     out var translated))
             {
@@ -591,7 +694,7 @@ public static class PatchManager
                 _storyMissLogged = true;
                 Plugin.Log.LogInfo(
                     $"Legacy story translation first miss: length={source.Length}, " +
-                    $"scenario={ScenarioContext.CurrentId ?? "<none>"}, " +
+                    $"scenario={StorySceneContext.PlaybackId}, " +
                     $"resource={ScenarioContext.CurrentResourceId ?? "<none>"}");
             }
             TmpFontInstaller.RestoreOriginalStoryPresentation(storyText);

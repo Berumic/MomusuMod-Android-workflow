@@ -11,6 +11,7 @@
     <Compile Include="..\..\Services\MaterialKeywords.cs" />
     <Compile Include="..\..\Services\UiRefreshQueue.cs;..\..\Services\UiStylePolicy.cs" />
     <Compile Include="../../Services/BoundedLruCache.cs" />
+    <Compile Include="../../Services/StoryTranslationIndex.cs;../../Services/StorySceneContext.cs" />
     <Reference Include="Mono.Cecil" HintPath="$(AndroidWorkspace)\Loader\Mono.Cecil.dll" />
   </ItemGroup>
 </Project>

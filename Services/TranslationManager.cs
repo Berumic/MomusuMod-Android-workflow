@@ -30,6 +30,8 @@ public sealed class TranslationManager
         _uiPathTablesByLeaf = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _subSkills = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _fallback = new(StringComparer.Ordinal);
+    private readonly StoryTranslationIndex _storyParseIndex = new();
+    private readonly StoryTranslationIndex _storyDisplayIndex = new();
     private readonly List<SceneTemplate> _nameSceneTemplates = new();
     private readonly List<SceneTemplate> _uiSceneTemplates = new();
     private readonly List<SceneTemplate> _subSkillSceneTemplates = new();
@@ -228,6 +230,8 @@ public sealed class TranslationManager
         _r18ResourceScenarioIds.Clear();
         _storySourceIndex.Clear();
         _fallback.Clear();
+        _storyParseIndex.Clear();
+        _storyDisplayIndex.Clear();
         _storyFragmentIndex.Clear();
         ResetInferredStoryScenario();
         var scenarioRoot = Path.Combine(_root, "scenarios");
@@ -256,6 +260,10 @@ public sealed class TranslationManager
 
                 foreach (var pair in table)
                 {
+                    var parseKey = NormalizeSubSkillKey(pair.Key);
+                    _storyParseIndex.Add(scenarioId, parseKey, pair.Value);
+                    _storyDisplayIndex.Add(scenarioId, parseKey, pair.Value);
+                    _storyDisplayIndex.Add(scenarioId, NormalizeStoryDisplayValue(pair.Key), pair.Value);
                     // Values are registered only to identify nested setter
                     // writebacks. Preserve the first usable global mapping,
                     // but never let an empty duplicate shadow a later
@@ -275,11 +283,36 @@ public sealed class TranslationManager
                         AddStoryFragment(pair.Key, pair.Value);
                         promotedStoryTranslations++;
                     }
+
+                    // UTAGE may normalize line endings differently from the
+                    // JSON reader. Keep a second exact key for the normalized
+                    // form so the translated row is available before UTAGE
+                    // parses <interval> and other timing tags. This must be
+                    // an exact-key alias only; story wildcard matching stays
+                    // out of the pre-parse path.
+                    var normalizedStoryKey = NormalizeSubSkillKey(pair.Key);
+                    if (!string.Equals(normalizedStoryKey, pair.Key, StringComparison.Ordinal))
+                    {
+                        if (_fallback.TryAdd(normalizedStoryKey, pair.Value))
+                        {
+                            AddStoryFragment(normalizedStoryKey, pair.Value);
+                        }
+                        else if (string.IsNullOrEmpty(_fallback[normalizedStoryKey]) &&
+                                 !string.IsNullOrEmpty(pair.Value))
+                        {
+                            _fallback[normalizedStoryKey] = pair.Value;
+                            AddStoryFragment(normalizedStoryKey, pair.Value);
+                        }
+                    }
                 }
             }
 
             foreach (var candidates in _storyFragmentIndex.Values)
+            {
+                candidates.RemoveAll(pair => !_storyParseIndex.TryGet(
+                    NormalizeSubSkillKey(pair.Key), null, out _, out _));
                 candidates.Sort((left, right) => right.Key.Length.CompareTo(left.Key.Length));
+            }
 
             Core.Plugin.Log?.LogInfo(
                 $"Loaded {_fallback.Count} unique story row(s); " +
@@ -608,12 +641,10 @@ public sealed class TranslationManager
         if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
             return false;
 
-        if (_fallback.TryGetValue(source, out var fallbackTranslation) &&
-            !string.IsNullOrEmpty(fallbackTranslation))
-        {
-            translated = fallbackTranslation;
+        var scene = ResolveStoryScenarioId(scenarioId);
+        if (_storyDisplayIndex.TryGet(NormalizeSubSkillKey(source), scene, out translated, out var conflict))
             return true;
-        }
+        if (conflict) return false;
 
         return TryTranslateIndexedStoryFragments(source, out translated);
     }
@@ -623,13 +654,49 @@ public sealed class TranslationManager
     /// Story wildcards are intentionally unsupported here.
     /// </summary>
     public bool TryTranslateStoryBeforeParse(string source, out string translated)
+        => TryTranslateStoryBeforeParse(source, StorySceneContext.ParsingId, out translated);
+
+    public bool TryTranslateStoryBeforeParse(string source, string scenarioId, out string translated)
     {
         translated = source;
-        return _config.Enabled.Value &&
-               _config.TranslateScenarios.Value &&
-               !string.IsNullOrEmpty(source) &&
-               _fallback.TryGetValue(source, out translated) &&
-               !string.IsNullOrEmpty(translated);
+        if (!_config.Enabled.Value || !_config.TranslateScenarios.Value ||
+            string.IsNullOrEmpty(source))
+            return false;
+
+        // TextData.CreateTextParser can call TextParser(string,bool) after
+        // the outer TextData prefix has already supplied the translation.
+        // Treat a known translated value as idempotent so the second parser
+        // hook cannot chain it into another source row.
+        if (IsKnownStoryTranslationValue(source))
+            return false;
+
+        // UTAGE can hand the parser CRLF while JSON rows are normalized to LF.
+        // If this lookup misses, translation happens later in the Text setter,
+        // after UTAGE has already recorded the original interval positions.
+        // Normalize only line endings here; keep all control tags untouched so
+        // the translated row's own <interval> positions are parsed.
+        var lookup = NormalizeSubSkillKey(source);
+        if (_storyParseIndex.TryGet(lookup, ResolveStoryScenarioId(scenarioId), out translated, out _))
+            return true;
+        translated = source;
+        return false;
+    }
+
+    public string ResolveStoryScenarioId(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+        var candidate = value.Trim().Replace('\\', '/');
+        if (_scenarioPaths.ContainsKey(candidate)) return candidate;
+        var leaf = candidate[(candidate.LastIndexOf('/') + 1)..];
+        // UTAGE grid names may append a sheet name to the book resource.
+        var sheetSeparator = leaf.IndexOf(':');
+        if (sheetSeparator > 0) leaf = leaf[..sheetSeparator];
+        var dot = leaf.LastIndexOf('.');
+        if (dot > 0) leaf = leaf[..dot];
+        if (_scenarioPaths.ContainsKey(leaf)) return leaf;
+        if (leaf.StartsWith("*", StringComparison.Ordinal) && _scenarioPaths.ContainsKey(leaf[1..]))
+            return leaf[1..];
+        return string.Empty;
     }
 
     public bool IsKnownStoryTranslationValue(string value) =>

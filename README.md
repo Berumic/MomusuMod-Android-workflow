@@ -124,6 +124,8 @@ Run workflow 表单不支持上传文件，所以这里用 Release 附件作为 
 
 ## 本地构建和维护
 
+剧情翻译使用 UTAGE 的 `CreateCustomTextParser` 回调，在解析前替换完整译文，使 `<interval>` 停顿按译文位置解析。通过脚本、命令和播放标签识别剧情场景；预加载场景独立于当前播放场景，同一句原文有不同译文时按场景选择，无法确认场景时保留原文。插件代码更新需要重新构建并安装 APK，运行时汉化下载只更新翻译资源。
+
 需要 Windows、PowerShell 7、Python 3.9+、.NET SDK 10、.NET 6 运行时、Java 21，以及与配置哈希匹配的 Apktool JAR。
 
 入口 `ci/Build-Apk.ps1` 的必需参数：`-Apk`、`-Toolchain`（解压后的依赖目录）、`-TranslationsRoot`（汉化 Git 仓库）、`-Keystore`、`-KeyAlias`、`-Apktool`（JAR 路径）。可指定 `-ExpectedGame`、`-SourceReleaseTag`、`-Java`、`-Workspace`、`-Output`。工作目录必须全新，输出目录必须为空；密码取自环境变量 `APK_STORE_PASSWORD` 和 `APK_KEY_PASSWORD`。建议使用 ASCII 工作路径，避免旧 Android 工具的编码问题。
