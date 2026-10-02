@@ -233,6 +233,116 @@ try
     update = await InvokeUpdate("SynchronizeAsync", updateRoot, server.Url, 3);
     Check(Property<string>(update, "Error") != null && !File.Exists(Path.Combine(root, "escaped.json")), "Manifest path traversal rejected");
 
+    var resumeRoot = Path.Combine(root, "resume", "translations");
+    var goodBytes = Encoding.UTF8.GetBytes("{\"ready\":\"cached\"}");
+    var nextBytes = Encoding.UTF8.GetBytes("{\"next\":\"download\"}");
+    var rangeBytes = Encoding.UTF8.GetBytes("{\"range\":\"resume a partially downloaded file\"}");
+    server.Files["/manifest.json"] = Manifest(new() { ["ready.json"] = goodBytes, ["next.json"] = nextBytes });
+    server.Files["/ready.json"] = goodBytes;
+    update = await InvokeUpdate("SynchronizeAsync", resumeRoot, server.Url, 3);
+    Check(Property<string>(update, "Error") != null && !File.Exists(Path.Combine(resumeRoot, "ready.json")),
+        "Interrupted batch keeps existing installation unchanged");
+    Check(Property<string>(update, "Error").Contains("stage=download.headers") &&
+        Property<string>(update, "Error").Contains("file=next.json") &&
+        Property<string>(update, "Error").Contains("reason=HTTP 404") &&
+        Property<string>(update, "Error").Contains("url=" + server.Url),
+        "File failure identifies request phase, path, URL and HTTP status");
+    var readyRequests = server.RequestCounts["/ready.json"];
+    server.Files["/next.json"] = nextBytes;
+    update = await InvokeUpdate("SynchronizeAsync", resumeRoot, server.Url, 3);
+    Check(Property<string>(update, "Error") == null && Property<int>(update, "Resumed") == 1 &&
+        server.RequestCounts["/ready.json"] == readyRequests &&
+        File.ReadAllBytes(Path.Combine(resumeRoot, "ready.json")).SequenceEqual(goodBytes),
+        "Next sync reuses completed files instead of downloading the batch again");
+    var partialRoot = Path.Combine(root, "partial", "translations");
+    server.Files["/manifest.json"] = Manifest(new() { ["range.json"] = rangeBytes });
+    server.Files["/range.json"] = rangeBytes;
+    server.TruncateOnce["/range.json"] = 17;
+    update = await InvokeUpdate("SynchronizeAsync", partialRoot, server.Url, 3);
+    var cacheRoot = Path.Combine(root, "partial", ".translation-update-cache");
+    Check(Property<string>(update, "Error") != null && Directory.GetFiles(cacheRoot, "*.part").Length == 1 &&
+        new FileInfo(Directory.GetFiles(cacheRoot, "*.part")[0]).Length == 17,
+        "Connection interruption retains downloaded bytes on disk");
+    Check(Property<string>(update, "Error").Contains("stage=download.body") &&
+        Property<string>(update, "Error").Contains("idle_timeout=3s"),
+        "Interrupted response reports body phase and effective timeout");
+    server.ServeRanges = true;
+    update = await InvokeUpdate("SynchronizeAsync", partialRoot, server.Url, 3);
+    Check(Property<string>(update, "Error") == null && server.RangeStarts["/range.json"] == 17 &&
+        File.ReadAllBytes(Path.Combine(partialRoot, "range.json")).SequenceEqual(rangeBytes),
+        "HTTP Range resumes a partial file from its previous byte offset");
+    var fallbackRoot = Path.Combine(root, "range-fallback", "translations");
+    server.ServeRanges = false;
+    server.TruncateOnce["/range.json"] = 11;
+    update = await InvokeUpdate("SynchronizeAsync", fallbackRoot, server.Url, 3);
+    update = await InvokeUpdate("SynchronizeAsync", fallbackRoot, server.Url, 3);
+    Check(Property<string>(update, "Error") == null &&
+        File.ReadAllBytes(Path.Combine(fallbackRoot, "range.json")).SequenceEqual(rangeBytes),
+        "Servers ignoring Range restart only the partial file without appending duplicate bytes");
+    // Repository changed during the interrupted update: stale cached content
+    // must never be installed in place of the latest manifest's hash.
+    var changedRoot = Path.Combine(root, "changed", "translations");
+    server.Files["/manifest.json"] = Manifest(new() { ["ready.json"] = goodBytes, ["next.json"] = nextBytes });
+    server.Files.TryRemove("/next.json", out _);
+    update = await InvokeUpdate("SynchronizeAsync", changedRoot, server.Url, 3);
+    server.Files["/manifest.json"] = Manifest(new() { ["ready.json"] = rangeBytes });
+    server.Files["/ready.json"] = rangeBytes;
+    update = await InvokeUpdate("SynchronizeAsync", changedRoot, server.Url, 3);
+    Check(Property<string>(update, "Error") == null &&
+        File.ReadAllBytes(Path.Combine(changedRoot, "ready.json")).SequenceEqual(rangeBytes),
+        "New manifest hash replaces stale cached content after interrupted update");
+    var corruptRoot = Path.Combine(root, "corrupt-cache", "translations");
+    var corruptCache = Path.Combine(root, "corrupt-cache", ".translation-update-cache");
+    Directory.CreateDirectory(corruptCache);
+    var goodHash = Convert.ToHexString(SHA256.HashData(goodBytes)).ToLowerInvariant();
+    File.WriteAllBytes(Path.Combine(corruptCache, goodHash + ".bin"), rangeBytes);
+    server.Files["/manifest.json"] = Manifest(new() { ["ready.json"] = goodBytes });
+    server.Files["/ready.json"] = goodBytes;
+    update = await InvokeUpdate("SynchronizeAsync", corruptRoot, server.Url, 3);
+    Check(Property<string>(update, "Error") == null && Property<int>(update, "Resumed") == 0 &&
+        File.ReadAllBytes(Path.Combine(corruptRoot, "ready.json")).SequenceEqual(goodBytes),
+        "Corrupt completed cache is re-downloaded and never installed");
+    Check(!Directory.EnumerateFiles(corruptCache).Any(), "Successful install releases redundant download cache");
+
+    server.Files.TryRemove("/manifest.json", out _);
+    update = await InvokeUpdate("SynchronizeAsync", Path.Combine(root, "missing-manifest"), server.Url, 3);
+    Check(Property<string>(update, "Error").Contains("stage=manifest.headers") &&
+        Property<string>(update, "Error").Contains("file=manifest.json") &&
+        Property<string>(update, "Error").Contains("reason=HTTP 404"),
+        "Manifest failure is distinguished from translation file failure");
+    server.Files["/manifest.json"] = Manifest(new() { ["ready.json"] = goodBytes });
+    server.DelayOnce["/manifest.json"] = 3500;
+    update = await InvokeUpdate("SynchronizeAsync", Path.Combine(root, "timeout-manifest"), server.Url, 3);
+    Check(Property<string>(update, "Error").Contains("stage=manifest.headers") &&
+        Property<string>(update, "Error").Contains("reason=idle-timeout") &&
+        Property<string>(update, "Error").Contains("idle_timeout=3s"),
+        "Timeout identifies manifest request phase and configured request limit");
+    server.StreamDelayOnce["/manifest.json"] = 1200;
+    server.StreamDelayOnce["/ready.json"] = 1200;
+    update = await InvokeUpdate("SynchronizeAsync", Path.Combine(root, "slow-stream"), server.Url, 3);
+    Check(Property<string>(update, "Error") == null && Property<bool>(update, "Updated"),
+        "Continuous manifest and file streams can exceed the idle timeout in total duration");
+    using (var stalledServer = new FixtureServer())
+    {
+        stalledServer.Files["/manifest.json"] = server.Files["/manifest.json"];
+        stalledServer.StreamDelayOnce["/manifest.json"] = 3500;
+        update = await InvokeUpdate("SynchronizeAsync", Path.Combine(root, "stalled-stream"), stalledServer.Url, 3);
+        Check(Property<string>(update, "Error").Contains("stage=manifest.body") &&
+            Property<string>(update, "Error").Contains("reason=idle-timeout"),
+            "Stalled response body triggers idle timeout");
+    }
+    using (var limit = new TranslationUpdateController.RequestTimeout(TimeSpan.FromSeconds(2), TimeSpan.FromMilliseconds(300)))
+    {
+        try { await Task.Delay(2000, limit.Token); Check(false, "Total request deadline cancels the request"); }
+        catch (OperationCanceledException ex)
+        {
+            Check(limit.DescribeFailure(ex).Message.StartsWith("total-timeout"),
+                "Total request deadline is distinguishable from idle timeout");
+        }
+    }
+    var safeUrl = (string)typeof(TranslationUpdateController).GetMethod("SafeLogUrl", BindingFlags.NonPublic | BindingFlags.Static)!
+        .Invoke(null, new object[] { "https://user:secret@example.com/translations/manifest.json?token=private#fragment" })!;
+    Check(safeUrl == "https://example.com/translations/manifest.json", "Logged URLs strip credentials, query tokens and fragments");
     var fonts = Path.Combine(root, "fonts");
     Directory.CreateDirectory(fonts);
     File.WriteAllBytes(Path.Combine(fonts, "alimama-android"), old);
@@ -249,6 +359,22 @@ try
     server.Files["/manifest.json"] = Manifest(new() { ["alimama"] = current });
     fontUpdate = await InvokeUpdate("SynchronizeFontAssetAsync", fonts, server.Url, 3);
     Check(Property<string>(fontUpdate, "Error") != null, "PC-only font manifest is rejected");
+
+    var resumeFonts = Path.Combine(root, "resume-fonts");
+    server.Files["/manifest.json"] = Manifest(new() { ["alimama-android"] = rangeBytes });
+    server.Files["/alimama-android"] = rangeBytes;
+    server.TruncateOnce["/alimama-android"] = 13;
+    server.ServeRanges = true;
+    fontUpdate = await InvokeUpdate("SynchronizeFontAssetAsync", resumeFonts, server.Url, 3);
+    Check(Property<string>(fontUpdate, "Error") != null, "Interrupted font download reports failure without installing it");
+    fontUpdate = await InvokeUpdate("SynchronizeFontAssetAsync", resumeFonts, server.Url, 3);
+    Check(Property<string>(fontUpdate, "Error") == null && server.RangeStarts["/alimama-android"] == 13 &&
+        File.ReadAllBytes(Path.Combine(resumeFonts, "alimama-android.pending")).SequenceEqual(rangeBytes),
+        "Font download also resumes previously received bytes");
+    var fontRequests = server.RequestCounts["/alimama-android"];
+    fontUpdate = await InvokeUpdate("SynchronizeFontAssetAsync", resumeFonts, server.Url, 3);
+    Check(server.RequestCounts["/alimama-android"] == fontRequests,
+        "Completed pending font is reused without re-downloading");
 
     var workspace = args.FirstOrDefault() ?? @"D:\mms\MomusuMod-Android";
     using var game = AssemblyDefinition.ReadAssembly(Path.Combine(workspace, "Interop", "Assembly-CSharp.dll"));
@@ -299,6 +425,12 @@ sealed class FixtureServer : IDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly Task _loop;
     public ConcurrentDictionary<string, byte[]> Files { get; } = new();
+    public ConcurrentDictionary<string, int> RequestCounts { get; } = new();
+    public ConcurrentDictionary<string, long> RangeStarts { get; } = new();
+    public ConcurrentDictionary<string, int> TruncateOnce { get; } = new();
+    public ConcurrentDictionary<string, int> DelayOnce { get; } = new();
+    public ConcurrentDictionary<string, int> StreamDelayOnce { get; } = new();
+    public bool ServeRanges { get; set; }
     public string Url { get; }
     public FixtureServer()
     {
@@ -311,13 +443,35 @@ sealed class FixtureServer : IDisposable
                     using var stream = client.GetStream();
                     using var reader = new StreamReader(stream, Encoding.ASCII, false, 1024, true);
                     var request = await reader.ReadLineAsync();
-                    while (!string.IsNullOrEmpty(await reader.ReadLineAsync())) { }
+                    long rangeStart = 0;
+                    string line;
+                    while (!string.IsNullOrEmpty(line = await reader.ReadLineAsync())) {
+                        if (line.StartsWith("Range: bytes=", StringComparison.OrdinalIgnoreCase))
+                            long.TryParse(line[13..].TrimEnd('-'), out rangeStart);
+                    }
                     var path = Uri.UnescapeDataString(request!.Split(' ')[1]);
+                    if (DelayOnce.TryRemove(path, out var delay)) await Task.Delay(delay, _stop.Token);
+                    RequestCounts.AddOrUpdate(path, 1, (_, count) => count + 1);
+                    if (rangeStart > 0) RangeStarts[path] = rangeStart;
                     var found = Files.TryGetValue(path, out var body);
                     body ??= Array.Empty<byte>();
-                    var header = Encoding.ASCII.GetBytes($"HTTP/1.1 {(found ? "200 OK" : "404 Not Found")}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
-                    await stream.WriteAsync(header);
-                    await stream.WriteAsync(body);
+                    var partial = found && ServeRanges && rangeStart > 0;
+                    var offset = partial ? (int)rangeStart : 0;
+                    var contentRange = partial ? $"Content-Range: bytes {offset}-{body.Length - 1}/{body.Length}\r\n" : "";
+                    var header = Encoding.ASCII.GetBytes($"HTTP/1.1 {(found ? partial ? "206 Partial Content" : "200 OK" : "404 Not Found")}\r\nContent-Length: {body.Length - offset}\r\n{contentRange}Connection: close\r\n\r\n");
+                    try {
+                        await stream.WriteAsync(header);
+                        var count = TruncateOnce.TryRemove(path, out var truncated) ? truncated : body.Length - offset;
+                        if (StreamDelayOnce.TryRemove(path, out var streamDelay)) {
+                            var chunkSize = Math.Max(1, (count + 3) / 4);
+                            for (var sent = 0; sent < count; sent += chunkSize) {
+                                await stream.WriteAsync(body.AsMemory(offset + sent, Math.Min(chunkSize, count - sent)));
+                                if (sent + chunkSize < count) await Task.Delay(streamDelay, _stop.Token);
+                            }
+                        } else await stream.WriteAsync(body.AsMemory(offset, count));
+                    } catch (IOException) {
+                        // Timeout tests intentionally disconnect before the response.
+                    }
                 }
             } catch (OperationCanceledException) { }
         });

@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
@@ -33,6 +36,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
     private const string FontAssetName = "alimama";
 #endif
     private const string PendingSuffix = ".pending";
+    private const int RequestTotalTimeoutSeconds = 600;
 
     public TranslationUpdateController(IntPtr pointer)
         : base(pointer)
@@ -147,7 +151,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
             var unitDetailRefreshed = TmpFontInstaller.RefreshVisibleUnitDetailPresentation();
             UiCanvasTranslationScanner.RequestFastScan();
             Plugin.Log?.LogInfo(
-                $"Translation update applied: downloaded={result.Downloaded}, deleted={result.Deleted}, " +
+                $"Translation update applied: downloaded={result.Downloaded}, reused={result.Resumed}, deleted={result.Deleted}, " +
                 $"unchanged={result.Unchanged}, commit={result.Commit}; refreshed {refreshed} UI, " +
                 $"{subSkillsRefreshed} sub-skill and {unitDetailRefreshed} unit-detail text(s)");
         }
@@ -245,11 +249,15 @@ public sealed class TranslationUpdateController : MonoBehaviour
         string baseUrl,
         int timeoutSeconds)
     {
+        var diagnostics = new UpdateDiagnostics("Font", timeoutSeconds);
+        var stage = "manifest.fetch";
         try
         {
             using var client = CreateUpdateClient(timeoutSeconds);
-            var manifestBytes = await client.GetByteArrayAsync($"{baseUrl}/manifest.json").ConfigureAwait(false);
+            var manifestBytes = await FetchManifestAsync(client, baseUrl, diagnostics).ConfigureAwait(false);
+            stage = "manifest.parse";
             var manifest = ParseManifest(manifestBytes, "remote asset manifest");
+            diagnostics.Info($"manifest ready: files={manifest.Files.Count}, commit={ManifestCommit(manifest)}");
             if (!manifest.Files.TryGetValue(FontAssetName, out var expected))
                 throw new InvalidDataException($"Remote asset manifest does not contain {FontAssetName}");
 
@@ -257,41 +265,56 @@ public sealed class TranslationUpdateController : MonoBehaviour
             var pendingPath = targetPath + PendingSuffix;
             var pendingManifestPath = Path.Combine(
                 pluginRoot, "MonsterMusumeTDMod", "assets-manifest.pending.json");
+            var cacheRoot = Path.Combine(pluginRoot, "MonsterMusumeTDMod", ".font-update-cache");
+            stage = "local-check";
+            diagnostics.Info($"checking installed font: file={FontAssetName}, expected_bytes={expected.Size}");
             if (File.Exists(targetPath) && new FileInfo(targetPath).Length == expected.Size &&
                 HashMatches(targetPath, expected.Sha256))
             {
                 TryDeleteFile(pendingPath);
                 TryDeleteFile(pendingManifestPath);
+                PruneDownloadCache(cacheRoot, Array.Empty<string>());
+                diagnostics.Info("complete: installed font is up to date; no font download needed");
                 return new AssetUpdateResult { Commit = ManifestCommit(manifest) };
             }
 
-            var bytes = await client.GetByteArrayAsync(BuildFileUrl(baseUrl, FontAssetName)).ConfigureAwait(false);
-            ValidateDownloadedFile(FontAssetName, expected, bytes);
             Directory.CreateDirectory(Path.GetDirectoryName(pendingManifestPath)!);
-            var tempPath = pendingPath + ".tmp";
-            await File.WriteAllBytesAsync(tempPath, bytes).ConfigureAwait(false);
-            File.Move(tempPath, pendingPath, true);
+            if (!IsValidCachedFile(pendingPath, FontAssetName, expected))
+            {
+                diagnostics.Info($"font download: file={FontAssetName}, url={SafeLogUrl(BuildFileUrl(baseUrl, FontAssetName))}, idle_timeout={timeoutSeconds}s, total_timeout={RequestTotalTimeoutSeconds}s");
+                var cachedPath = await DownloadVerifiedAsync(client, BuildFileUrl(baseUrl, FontAssetName),
+                    cacheRoot, FontAssetName, expected, diagnostics).ConfigureAwait(false);
+                stage = "pending-install";
+                var tempPath = pendingPath + ".tmp";
+                File.Copy(cachedPath, tempPath, true);
+                File.Move(tempPath, pendingPath, true);
+            }
+            else diagnostics.Info("reusing verified pending font; no font download needed");
+            stage = "pending-manifest.commit";
             var manifestTempPath = pendingManifestPath + ".tmp";
             await File.WriteAllBytesAsync(manifestTempPath, manifestBytes).ConfigureAwait(false);
             File.Move(manifestTempPath, pendingManifestPath, true);
+            PruneDownloadCache(cacheRoot, Array.Empty<string>());
+            diagnostics.Info("complete: verified font staged; installation on next game start");
             return new AssetUpdateResult { Downloaded = true, Commit = ManifestCommit(manifest) };
         }
         catch (Exception ex)
         {
-            return new AssetUpdateResult { Error = ex.Message };
+            return new AssetUpdateResult { Error = diagnostics.Failure(stage, null, null, ex) };
         }
     }
 
     private static HttpClient CreateUpdateClient(int timeoutSeconds) =>
         new HttpClient(new HttpClientHandler { UseProxy = true }, disposeHandler: true)
-        { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
+        { Timeout = Timeout.InfiniteTimeSpan };
 
     private static string ManifestCommit(TranslationManifest manifest) =>
         string.IsNullOrWhiteSpace(manifest.Commit) ? "unknown" : manifest.Commit;
 
     private static void TryDeleteFile(string path)
     {
-        try { if (File.Exists(path)) File.Delete(path); } catch { }
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch { }
     }
 
     private static async Task<UpdateResult> SynchronizeAsync(
@@ -299,43 +322,68 @@ public sealed class TranslationUpdateController : MonoBehaviour
         string baseUrl,
         int timeoutSeconds)
     {
-        var stagingRoot = Path.Combine(translationRoot, $".update-{Guid.NewGuid():N}");
+        // Keep binary download state outside translations so loaders and F8
+        // collectors never mistake cached JSON for installed translations.
+        var cacheRoot = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(translationRoot))!,
+            ".translation-update-cache");
+        var diagnostics = new UpdateDiagnostics("Translation", timeoutSeconds);
+        var stage = "initialize";
+        string currentFile = null;
         try
         {
             Directory.CreateDirectory(translationRoot);
-            RemoveStaleStagingDirectories(translationRoot);
-            Directory.CreateDirectory(stagingRoot);
 
             using var client = CreateUpdateClient(timeoutSeconds);
-            var manifestBytes = await client.GetByteArrayAsync($"{baseUrl}/manifest.json").ConfigureAwait(false);
+            stage = "manifest.fetch";
+            var manifestBytes = await FetchManifestAsync(client, baseUrl, diagnostics).ConfigureAwait(false);
+            stage = "manifest.parse";
             var remoteManifest = ParseManifest(manifestBytes, "remote manifest");
+            diagnostics.Info($"manifest ready: files={remoteManifest.Files.Count}, commit={ManifestCommit(remoteManifest)}");
             var localManifestPath = Path.Combine(translationRoot, "manifest.json");
             var localManifest = TryReadManifest(localManifestPath);
 
             var downloads = new List<(string RelativePath, ManifestFile File)>();
             var unchanged = 0;
+            var checkedFiles = 0;
+            stage = "local-check";
+            diagnostics.Info($"checking local files: total={remoteManifest.Files.Count}");
             foreach (var pair in remoteManifest.Files)
             {
                 var relativePath = NormalizeRelativePath(pair.Key);
+                currentFile = relativePath;
                 var localPath = ResolveManagedPath(translationRoot, relativePath);
                 if (File.Exists(localPath) && HashMatches(localPath, pair.Value.Sha256))
                     unchanged++;
                 else
                     downloads.Add((relativePath, pair.Value));
+                diagnostics.Progress($"local-check: {++checkedFiles}/{remoteManifest.Files.Count}, unchanged={unchanged}, needs_update={downloads.Count}");
             }
 
             using var gate = new SemaphoreSlim(4, 4);
-            var downloadTasks = downloads.Select(async item =>
+            currentFile = null;
+            var resumed = 0;
+            var downloaded = 0;
+            var groups = downloads.GroupBy(item => CacheKey(item.File)).ToArray();
+            var verified = 0;
+            diagnostics.Info($"download plan: files={downloads.Count}, unique_contents={groups.Length}, concurrency=4, idle_timeout={timeoutSeconds}s, total_timeout={RequestTotalTimeoutSeconds}s, cache={cacheRoot}");
+            stage = "download-batch";
+            var downloadTasks = groups.Select(async group =>
             {
                 await gate.WaitAsync().ConfigureAwait(false);
                 try
                 {
-                    var url = BuildFileUrl(baseUrl, item.RelativePath);
-                    var bytes = await client.GetByteArrayAsync(url).ConfigureAwait(false);
-                    ValidateDownloadedFile(item.RelativePath, item.File, bytes);
-                    var stagedPath = ResolveManagedPath(stagingRoot, item.RelativePath);
-                    Directory.CreateDirectory(Path.GetDirectoryName(stagedPath)!);
-                    await File.WriteAllBytesAsync(stagedPath, bytes).ConfigureAwait(false);
+                    var item = group.First();
+                    var cachedPath = Path.Combine(cacheRoot, CacheKey(item.File) + ".bin");
+                    var reused = IsValidCachedFile(cachedPath, item.RelativePath, item.File);
+                    await DownloadVerifiedAsync(client, BuildFileUrl(baseUrl, item.RelativePath),
+                        cacheRoot, item.RelativePath, item.File, diagnostics).ConfigureAwait(false);
+                    if (reused) Interlocked.Increment(ref resumed);
+                    else Interlocked.Increment(ref downloaded);
+                    foreach (var entry in group)
+                        ValidateCachedFile(cachedPath, entry.RelativePath, entry.File);
+                    var finished = Interlocked.Increment(ref verified);
+                    diagnostics.Progress($"download: verified={finished}/{groups.Length}, downloaded={Volatile.Read(ref downloaded)}, reused={Volatile.Read(ref resumed)}",
+                        force: finished == groups.Length);
                 }
                 finally
                 {
@@ -345,14 +393,25 @@ public sealed class TranslationUpdateController : MonoBehaviour
             await Task.WhenAll(downloadTasks).ConfigureAwait(false);
 
             var deleted = 0;
+            var installed = 0;
+            stage = "install";
+            diagnostics.Info($"installing verified files: total={downloads.Count}");
             foreach (var item in downloads)
             {
-                var stagedPath = ResolveManagedPath(stagingRoot, item.RelativePath);
+                currentFile = item.RelativePath;
+                var stagedPath = Path.Combine(cacheRoot, CacheKey(item.File) + ".bin");
                 var localPath = ResolveManagedPath(translationRoot, item.RelativePath);
                 Directory.CreateDirectory(Path.GetDirectoryName(localPath)!);
-                File.Move(stagedPath, localPath, true);
+                // Preserve the verified cache even if the process exits during
+                // installation. Move a sibling copy to avoid truncating live JSON.
+                var installPath = localPath + ".update-install";
+                File.Copy(stagedPath, installPath, true);
+                File.Move(installPath, localPath, true);
+                diagnostics.Progress($"install: {++installed}/{downloads.Count}");
             }
 
+            stage = "delete-obsolete";
+            currentFile = null;
             if (localManifest != null)
             {
                 var remotePaths = new HashSet<string>(
@@ -361,6 +420,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
                 foreach (var oldPathValue in localManifest.Files.Keys)
                 {
                     var oldPath = NormalizeRelativePath(oldPathValue);
+                    currentFile = oldPath;
                     if (remotePaths.Contains(oldPath) || IsRuntimeOwnedFile(oldPath))
                         continue;
 
@@ -375,13 +435,20 @@ public sealed class TranslationUpdateController : MonoBehaviour
             }
 
             var manifestTempPath = Path.Combine(translationRoot, "manifest.json.tmp");
+            stage = "manifest.commit";
+            currentFile = "manifest.json";
             await File.WriteAllBytesAsync(manifestTempPath, manifestBytes).ConfigureAwait(false);
             File.Move(manifestTempPath, localManifestPath, true);
+            // Once installed, the live files themselves preserve progress.
+            // Release redundant download copies only after manifest commit.
+            PruneDownloadCache(cacheRoot, Array.Empty<string>());
+            diagnostics.Info($"complete: installed={installed}, downloaded={downloaded}, reused={resumed}, deleted={deleted}, unchanged={unchanged}, commit={ManifestCommit(remoteManifest)}");
 
             return new UpdateResult
             {
                 Updated = downloads.Count > 0 || deleted > 0,
-                Downloaded = downloads.Count,
+                Downloaded = downloaded,
+                Resumed = resumed,
                 Deleted = deleted,
                 Unchanged = unchanged,
                 Commit = string.IsNullOrWhiteSpace(remoteManifest.Commit) ? "unknown" : remoteManifest.Commit
@@ -389,20 +456,267 @@ public sealed class TranslationUpdateController : MonoBehaviour
         }
         catch (Exception ex)
         {
-            return new UpdateResult { Error = ex.Message };
+            return new UpdateResult
+            {
+                Error = diagnostics.Failure(stage, currentFile, null, ex) +
+                $"; failed_files={diagnostics.FailedFiles}; download cache retained at {cacheRoot}"
+            };
         }
-        finally
+    }
+
+    private static async Task<byte[]> FetchManifestAsync(HttpClient client, string baseUrl, UpdateDiagnostics diagnostics)
+    {
+        var url = $"{baseUrl}/manifest.json";
+        var stage = "manifest.headers";
+        diagnostics.Info($"manifest.fetch: url={SafeLogUrl(url)}, idle_timeout={diagnostics.IdleTimeoutSeconds}s, total_timeout={RequestTotalTimeoutSeconds}s");
+        using var timeout = new RequestTimeout(TimeSpan.FromSeconds(diagnostics.IdleTimeoutSeconds),
+            TimeSpan.FromSeconds(RequestTotalTimeoutSeconds));
+        try
         {
-            try
+            using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead,
+                timeout.Token).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            timeout.DataReceived();
+            stage = "manifest.body";
+            var total = response.Content.Headers.ContentLength ?? -1;
+            diagnostics.Info($"manifest response: HTTP={(int)response.StatusCode}, expected_bytes={total}");
+            using var input = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false);
+            using var output = new MemoryStream();
+            var buffer = new byte[81920];
+            int count;
+            while ((count = await input.ReadAsync(buffer.AsMemory(), timeout.Token).ConfigureAwait(false)) > 0)
             {
-                if (Directory.Exists(stagingRoot))
-                    Directory.Delete(stagingRoot, true);
+                timeout.DataReceived();
+                output.Write(buffer, 0, count);
+                diagnostics.Received(count, "manifest.json", output.Length, total, "manifest.body");
             }
-            catch
+            var bytes = output.ToArray();
+            diagnostics.Info($"manifest received: bytes={bytes.Length}");
+            return bytes;
+        }
+        catch (Exception ex)
+        {
+            var failure = timeout.DescribeFailure(ex);
+            throw new UpdateStageException(diagnostics.Failure(stage, "manifest.json", url, failure), failure);
+        }
+    }
+
+    internal sealed class RequestTimeout : IDisposable
+    {
+        private readonly TimeSpan _idleDuration;
+        private readonly CancellationTokenSource _idle = new();
+        private readonly CancellationTokenSource _total;
+        private readonly CancellationTokenSource _linked;
+        public CancellationToken Token => _linked.Token;
+
+        public RequestTimeout(TimeSpan idleDuration, TimeSpan totalDuration)
+        {
+            _idleDuration = idleDuration;
+            _total = new CancellationTokenSource(totalDuration);
+            _linked = CancellationTokenSource.CreateLinkedTokenSource(_idle.Token, _total.Token);
+            DataReceived();
+        }
+
+        public void DataReceived() => _idle.CancelAfter(_idleDuration);
+        public Exception DescribeFailure(Exception ex) => ex is OperationCanceledException
+            ? new TimeoutException(_total.IsCancellationRequested ? "total-timeout: request duration limit reached"
+                : _idle.IsCancellationRequested ? "idle-timeout: no response data received within the idle limit"
+                : "request canceled", ex)
+            : ex;
+        public void Dispose()
+        {
+            _linked.Dispose();
+            _idle.Dispose();
+            _total.Dispose();
+        }
+    }
+
+    private static string SafeLogUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return "<invalid URL>";
+        // Do not expose credentials, tokens in query strings, or fragments.
+        var safe = new UriBuilder(uri) { UserName = "", Password = "", Query = "", Fragment = "" };
+        return safe.Uri.AbsoluteUri;
+    }
+
+    private sealed class UpdateStageException : Exception
+    {
+        public UpdateStageException(string message, Exception inner) : base(message, inner) { }
+    }
+
+    private sealed class UpdateDiagnostics
+    {
+        private readonly string _kind;
+        private readonly Stopwatch _timer = Stopwatch.StartNew();
+        private readonly object _gate = new();
+        private long _lastProgressMs;
+        private int _failures;
+        private long _receivedBytes;
+        private readonly int _timeoutSeconds;
+        public int IdleTimeoutSeconds => _timeoutSeconds;
+
+        public int FailedFiles => Volatile.Read(ref _failures);
+        public UpdateDiagnostics(string kind, int timeoutSeconds) { _kind = kind; _timeoutSeconds = timeoutSeconds; }
+        public void Info(string message) => Plugin.Log?.LogInfo($"{_kind} update [{_timer.Elapsed.TotalSeconds:0.0}s]: {message}");
+        public void Progress(string message, bool force = false)
+        {
+            lock (_gate)
             {
-                // A stale staging directory is harmless and can be removed on the next manual cleanup.
+                if (!force && _timer.ElapsedMilliseconds - _lastProgressMs < 5000) return;
+                _lastProgressMs = _timer.ElapsedMilliseconds;
+                Info(message + $", session_received_bytes={Interlocked.Read(ref _receivedBytes)}");
             }
         }
+        public void Received(int bytes, string file, long offset, long total, string phase = "download.body")
+        {
+            Interlocked.Add(ref _receivedBytes, bytes);
+            Progress($"{phase}: file={file}, file_bytes={offset}/{(total < 0 ? "unknown" : total.ToString())}");
+        }
+        public string Failure(string stage, string file, string url, Exception ex)
+        {
+            if (ex is UpdateStageException) return ex.Message;
+            var reason = ex is TimeoutException ? ex.Message.Split(':')[0] :
+                ex is OperationCanceledException ? "timeout/canceled" :
+                ex is HttpRequestException http && http.StatusCode.HasValue ? $"HTTP {(int)http.StatusCode.Value}" :
+                ex is HttpRequestException ? "network/proxy/DNS/TLS" :
+                ex is InvalidDataException || ex is JsonException ? "validation" :
+                ex is UnauthorizedAccessException ? "file-access-denied" :
+                ex is IOException ? "file-or-stream-IO" : ex.GetType().Name;
+            var detail = ex.Message;
+            var inner = ex.InnerException;
+            for (var depth = 0; inner != null && depth < 3; depth++, inner = inner.InnerException)
+                detail += $"; inner={inner.GetType().Name}: {inner.Message}";
+            if (!string.IsNullOrEmpty(url)) detail = detail.Replace(url, SafeLogUrl(url));
+            return $"stage={stage}, file={file ?? "<none>"}, url={(url == null ? "<none>" : SafeLogUrl(url))}, " +
+                $"elapsed={_timer.Elapsed.TotalSeconds:0.0}s, idle_timeout={_timeoutSeconds}s, total_timeout={RequestTotalTimeoutSeconds}s, reason={reason}, exception={ex.GetType().Name}: {detail}";
+        }
+        public void FileFailure(string detail)
+        {
+            var failures = Interlocked.Increment(ref _failures);
+            if (failures <= 5) Plugin.Log?.LogWarning($"{_kind} update file failed: {detail}");
+            else if (failures == 6) Plugin.Log?.LogWarning($"{_kind} update: further file failures suppressed; cache is retained");
+        }
+    }
+
+    private static string CacheKey(ManifestFile file)
+    {
+        if (file.Sha256 == null || file.Sha256.Length != 64 || !file.Sha256.All(Uri.IsHexDigit))
+            throw new InvalidDataException("Manifest contains an invalid SHA-256");
+        return file.Sha256.ToLowerInvariant();
+    }
+
+    private static void ValidateCachedFile(string path, string relativePath, ManifestFile expected)
+    {
+        if (expected.Size >= 0 && new FileInfo(path).Length != expected.Size)
+            throw new InvalidDataException($"Size check failed for {relativePath}");
+        if (!HashMatches(path, expected.Sha256))
+            throw new InvalidDataException($"SHA-256 check failed for {relativePath}");
+        if (relativePath.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            ValidateDownloadedFile(relativePath, expected, File.ReadAllBytes(path));
+    }
+
+    private static bool IsValidCachedFile(string path, string relativePath, ManifestFile expected)
+    {
+        if (!File.Exists(path)) return false;
+        try { ValidateCachedFile(path, relativePath, expected); return true; }
+        catch (InvalidDataException) { return false; }
+        catch (IOException) { return false; }
+    }
+
+    private static async Task<string> DownloadVerifiedAsync(HttpClient client, string url, string cacheRoot,
+        string relativePath, ManifestFile expected, UpdateDiagnostics diagnostics)
+    {
+        var stage = "cache-check";
+        using var timeout = new RequestTimeout(TimeSpan.FromSeconds(diagnostics.IdleTimeoutSeconds),
+            TimeSpan.FromSeconds(RequestTotalTimeoutSeconds));
+        try
+        {
+            Directory.CreateDirectory(cacheRoot);
+            var completedPath = Path.Combine(cacheRoot, CacheKey(expected) + ".bin");
+            var partialPath = Path.Combine(cacheRoot, CacheKey(expected) + ".part");
+            if (IsValidCachedFile(completedPath, relativePath, expected)) return completedPath;
+            // A shutdown may have happened after the last byte but before promotion.
+            if (IsValidCachedFile(partialPath, relativePath, expected))
+            {
+                File.Move(partialPath, completedPath, true);
+                return completedPath;
+            }
+            var offset = File.Exists(partialPath) ? new FileInfo(partialPath).Length : 0;
+            if (expected.Size >= 0 && offset >= expected.Size)
+            {
+                File.Delete(partialPath);
+                offset = 0;
+            }
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            if (offset > 0) request.Headers.Range = new RangeHeaderValue(offset, null);
+            stage = "download.headers";
+            if (offset > 0) diagnostics.Progress($"resume: file={relativePath}, offset={offset}, expected_bytes={expected.Size}");
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead,
+                timeout.Token).ConfigureAwait(false);
+            if (offset > 0 && response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
+            {
+                File.Delete(partialPath);
+                diagnostics.Progress($"server rejected Range; restarting file={relativePath}");
+                return await DownloadVerifiedAsync(client, url, cacheRoot, relativePath, expected, diagnostics).ConfigureAwait(false);
+            }
+            response.EnsureSuccessStatusCode();
+            timeout.DataReceived();
+            var append = offset > 0 && response.StatusCode == HttpStatusCode.PartialContent;
+            if (offset > 0 && !append) diagnostics.Progress($"server ignored Range; restarting file={relativePath}");
+            if (response.StatusCode == HttpStatusCode.PartialContent &&
+                response.Content.Headers.ContentRange?.From != (append ? offset : 0))
+                throw new InvalidDataException($"Invalid download range for {relativePath}");
+            stage = "download.body";
+            using (var output = new FileStream(partialPath, append ? FileMode.Append : FileMode.Create,
+                       FileAccess.Write, FileShare.Read, 81920, useAsync: true))
+            using (var input = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(false))
+            {
+                var buffer = new byte[81920];
+                var received = append ? offset : 0;
+                int count;
+                while ((count = await input.ReadAsync(buffer.AsMemory(), timeout.Token).ConfigureAwait(false)) > 0)
+                {
+                    timeout.DataReceived();
+                    await output.WriteAsync(buffer.AsMemory(0, count), timeout.Token).ConfigureAwait(false);
+                    diagnostics.Received(count, relativePath, received += count, expected.Size);
+                }
+            }
+            stage = "download.verify";
+            try { ValidateCachedFile(partialPath, relativePath, expected); }
+            catch (InvalidDataException)
+            {
+                // A corrupt prefix cannot be repaired by appending. Retry cleanly
+                // on the next sync, without discarding other verified downloads.
+                TryDeleteFile(partialPath);
+                throw;
+            }
+            stage = "cache-save";
+            File.Move(partialPath, completedPath, true);
+            return completedPath;
+        }
+        catch (Exception ex)
+        {
+            var detail = diagnostics.Failure(stage, relativePath, url, timeout.DescribeFailure(ex));
+            if (ex is not UpdateStageException) diagnostics.FileFailure(detail);
+            throw new UpdateStageException(detail, ex);
+        }
+    }
+
+    private static void PruneDownloadCache(string root, IEnumerable<string> activeKeys)
+    {
+        var keys = new HashSet<string>(activeKeys, StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(root)) return;
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(root))
+            {
+                var extension = Path.GetExtension(path);
+                if (extension != ".bin" && extension != ".part") continue;
+                if (!keys.Contains(Path.GetFileNameWithoutExtension(path))) TryDeleteFile(path);
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     private static TranslationManifest ParseManifest(byte[] bytes, string description)
@@ -490,21 +804,6 @@ public sealed class TranslationUpdateController : MonoBehaviour
                name.Equals("subskill_scan.tsv", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static void RemoveStaleStagingDirectories(string translationRoot)
-    {
-        foreach (var directory in Directory.EnumerateDirectories(translationRoot, ".update-*", SearchOption.TopDirectoryOnly))
-        {
-            try
-            {
-                Directory.Delete(directory, true);
-            }
-            catch
-            {
-                // A locked stale directory does not prevent a new update attempt.
-            }
-        }
-    }
-
     private static void RemoveEmptyParents(string directory, string root)
     {
         var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar);
@@ -536,6 +835,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
     {
         public bool Updated { get; set; }
         public int Downloaded { get; set; }
+        public int Resumed { get; set; }
         public int Deleted { get; set; }
         public int Unchanged { get; set; }
         public string Commit { get; set; } = "unknown";
