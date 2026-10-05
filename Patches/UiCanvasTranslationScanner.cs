@@ -23,6 +23,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
     private const float FastScanDurationSeconds = 0.8f;
 
     private readonly Dictionary<int, string> _observedValues = new();
+    private readonly Dictionary<int, (int Frame, string Path)> _hierarchyPaths = new();
     private readonly Dictionary<int, ProcessedTextState> _processedStates = new();
     private readonly Dictionary<int, TMP_Text> _unitDetailTexts = new();
     private readonly List<TMP_Text> _unitDetailTextSnapshot = new();
@@ -51,6 +52,8 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
     private double _projectionMilliseconds;
     private double _maxRefreshMilliseconds;
     private double _maxDiscoveryMilliseconds;
+    private int _lastProjectionFrame = -1;
+    private const int ProjectionIntervalFrames = 2;
 
     internal static bool IsApplying(object component) =>
         component is TMP_Text text && text != null && ApplyingTexts.Contains(text.GetInstanceID());
@@ -120,6 +123,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         _discoveryTexts.Clear();
         _discoveryActive = false;
         _processedStates.Clear();
+        _hierarchyPaths.Clear();
         _activeTextIds.Clear();
         _unitDetailTexts.Clear();
     }
@@ -188,6 +192,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
                 continue;
 
             var instanceId = text.GetInstanceID();
+            GetHierarchyPath(text, instanceId);
             _currentActiveTextIds.Add(instanceId);
             var isNew = !_activeTextIds.Contains(instanceId);
             var unchanged = IsProcessingStateCurrent(text, instanceId);
@@ -288,7 +293,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
 
         if (Plugin.Translations.TryTranslateUiText(
                 source,
-                TmpFontInstaller.GetHierarchyPath(text),
+                GetHierarchyPath(text),
                 out var translated))
         {
             if (allowDiagnostics && source.Contains('\n') && _mappedDiagnosticIds.Add(instanceId))
@@ -352,7 +357,12 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
             return;
 
         var projectionStarted = System.Diagnostics.Stopwatch.GetTimestamp();
-        UiStyleManager.SyncAllUnderlayLayers();
+        if (_lastProjectionFrame < 0 ||
+            Time.frameCount - _lastProjectionFrame >= ProjectionIntervalFrames)
+        {
+            _lastProjectionFrame = Time.frameCount;
+            UiStyleManager.SyncAllUnderlayLayers();
+        }
         _projectionMilliseconds += (System.Diagnostics.Stopwatch.GetTimestamp() - projectionStarted) *
             1000.0 / System.Diagnostics.Stopwatch.Frequency;
         if (Time.unscaledTime >= _nextMetricsTime)
@@ -425,6 +435,11 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
                 TmpFontInstaller.IsUiTextSoftOutlineLayer(text))
                 continue;
 
+            // A setter event and the periodic discovery pass can enqueue the
+            // same object before the render callback drains the queue.
+            if (IsProcessingStateCurrent(text, text.GetInstanceID()))
+                continue;
+
             ProcessText(text, allowDiagnostics: false, scheduleRetry: true);
             RecordProcessingState(text);
         }
@@ -442,7 +457,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         TmpFontInstaller.RestoreTranslatedUiText(text);
         if (Plugin.Translations.TryTranslateSubSkill(
                 content,
-                TmpFontInstaller.GetHierarchyPath(text),
+                GetHierarchyPath(text),
                 out var translated))
         {
             if (!string.Equals(content, translated, StringComparison.Ordinal))
@@ -469,7 +484,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         return state.Version == _processingVersion &&
                string.Equals(
                    state.HierarchyPath,
-                   TmpFontInstaller.GetHierarchyPath(text),
+                   GetHierarchyPath(text, instanceId),
                    StringComparison.Ordinal) &&
                state.FontId == GetInstanceId(text.font) &&
                state.MaterialId == GetInstanceId(text.fontSharedMaterial) &&
@@ -487,7 +502,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         UiStyleManager.SyncUnderlayLayer(text);
         _processedStates[text.GetInstanceID()] = new ProcessedTextState(
             text.text,
-            TmpFontInstaller.GetHierarchyPath(text),
+            GetHierarchyPath(text),
             GetInstanceId(text.font),
             GetInstanceId(text.fontSharedMaterial),
             text.lineSpacing,
@@ -507,12 +522,26 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         {
             _processedStates.Remove(instanceId);
             _observedValues.Remove(instanceId);
+            _hierarchyPaths.Remove(instanceId);
             _unitDetailTexts.Remove(instanceId);
         }
     }
 
     private static int GetInstanceId(UnityEngine.Object value) =>
         value == null ? 0 : value.GetInstanceID();
+
+    private string GetHierarchyPath(TMP_Text text, int instanceId = 0)
+    {
+        if (text == null)
+            return string.Empty;
+        instanceId = instanceId == 0 ? text.GetInstanceID() : instanceId;
+        if (_hierarchyPaths.TryGetValue(instanceId, out var cached) &&
+            cached.Frame == Time.frameCount)
+            return cached.Path;
+        var path = TmpFontInstaller.GetHierarchyPath(text);
+        _hierarchyPaths[instanceId] = (Time.frameCount, path);
+        return path;
+    }
 
     private static string GetHierarchy(Transform transform)
     {
