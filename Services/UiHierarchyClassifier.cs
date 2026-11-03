@@ -422,6 +422,27 @@ public static class UiHierarchyClassifier
     public static bool IsSubSkillScrollText(Transform root) =>
         (GetFlags(root) & UiPathFlags.SubSkillScrollText) != 0;
 
+    // These path predicates remain part of the shared scanner contract.  Keep
+    // them alongside the cached classifier so callers do not duplicate the
+    // old hierarchy string checks after the cache refactor.
+    public static bool IsCompleteSubSkillHierarchy(string hierarchy) =>
+        !string.IsNullOrEmpty(hierarchy) &&
+        ((hierarchy.Contains("unit_detail_rework", StringComparison.OrdinalIgnoreCase) &&
+          hierarchy.Contains("skilldialog", StringComparison.OrdinalIgnoreCase) &&
+          hierarchy.Contains("subskilltextarea", StringComparison.OrdinalIgnoreCase)) ||
+         IsAttachAbilitySubSkillHierarchy(hierarchy));
+
+    public static bool IsAttachAbilitySubSkillHierarchy(string hierarchy) =>
+        !string.IsNullOrEmpty(hierarchy) &&
+        hierarchy.Contains("unit_detail_attachability", StringComparison.OrdinalIgnoreCase) &&
+        hierarchy.Contains("windowbase/scrollview", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsLegacySubSkillListPath(string hierarchy) =>
+        !string.IsNullOrEmpty(hierarchy) &&
+        hierarchy.Contains("unit_detail_rework", StringComparison.OrdinalIgnoreCase) &&
+        hierarchy.Contains("skilldialog", StringComparison.OrdinalIgnoreCase) &&
+        hierarchy.Contains("scroll view", StringComparison.OrdinalIgnoreCase);
+
     public static bool IsHomeDeckSubSkillName(Transform root) =>
         (GetFlags(root) & UiPathFlags.HomeDeckSubSkillName) != 0;
 
@@ -560,6 +581,75 @@ public static class UiHierarchyClassifier
           path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)) ||
          (path.Contains("/StatusDialog/RaceFeatureArea/", StringComparison.OrdinalIgnoreCase) &&
           path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)));
+
+    public static bool IsDialogueBackground(Graphic graphic)
+    {
+        if (graphic is not Image && graphic is not RawImage)
+            return false;
+
+        var path = GetHierarchyPath(graphic.transform);
+        return path.Contains(
+            "MessageWindowManager/MessageWindow/RootChildren/",
+            StringComparison.OrdinalIgnoreCase) &&
+            (path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase) ||
+             path.Contains("Utage", StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static bool IsDialogueControlLabel(Text text)
+    {
+        if (text == null || text.transform == null)
+            return false;
+
+        var path = GetHierarchyPath(text.transform);
+        return IsDialogueControlPath(path) &&
+               (path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase) ||
+                path.Contains("Utage", StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static bool IsDialogueControlPath(string path) =>
+        !string.IsNullOrEmpty(path) &&
+        (path.Contains("/Auto/", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("/Skip/", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("/Log/", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("/BackLogButton/", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("/LogButton/", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("/BackLog/", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("/Backlog/", StringComparison.OrdinalIgnoreCase));
+
+    public static bool IsBackLogButtonBackground(Graphic graphic) =>
+        graphic != null &&
+        graphic.transform != null &&
+        GetHierarchyPath(graphic.transform).EndsWith(
+            "/BackLogButton", StringComparison.OrdinalIgnoreCase);
+
+    public static bool TryGetStoryOutlineColor(
+        Text text,
+        Color darkOutlineColor,
+        out Color outlineColor)
+    {
+        outlineColor = default;
+        if (text == null || text.transform == null)
+            return false;
+
+        var path = GetHierarchyPath(text.transform);
+        var leaf = text.transform.name;
+        if (!IsStoryMessagePath(path, leaf))
+            return false;
+
+        if (leaf.Equals("MessageText", StringComparison.OrdinalIgnoreCase))
+        {
+            outlineColor = Color.white;
+            return true;
+        }
+
+        if (leaf.Equals("NameText", StringComparison.OrdinalIgnoreCase))
+        {
+            outlineColor = darkOutlineColor;
+            return true;
+        }
+
+        return false;
+    }
 
     private static string BuildHierarchyPath(Transform current, int maxNodes, out string leafName)
     {

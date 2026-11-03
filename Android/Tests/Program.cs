@@ -85,6 +85,17 @@ try
     UiHierarchyClassifier.UnregisterInternalLayer(internalLayer, internalComponent);
     Check(!UiHierarchyClassifier.IsUiTextSoftOutlineLayer(internalComponent),
         "Internal outline layer registrations can be released");
+    const string legacySubSkillPath = "UICanvas/Unit_Detail_Rework/SkillDialog/Scroll View/SubSkillTextArea";
+    const string attachSubSkillPath = "UICanvas/Unit_Detail_AttachAbility/WindowBase/ScrollView/Content";
+    Check(UiHierarchyClassifier.IsLegacySubSkillListPath(legacySubSkillPath) &&
+          UiHierarchyClassifier.IsCompleteSubSkillHierarchy(legacySubSkillPath),
+        "Legacy sub-skill scanner predicates remain available");
+    Check(UiHierarchyClassifier.IsAttachAbilitySubSkillHierarchy(attachSubSkillPath) &&
+          UiHierarchyClassifier.IsCompleteSubSkillHierarchy(attachSubSkillPath),
+        "Attach-ability scanner predicates remain available");
+    Check(UiHierarchyClassifier.IsDialogueControlPath("AdvEngine/Auto/Label") &&
+          !UiHierarchyClassifier.IsDialogueControlPath("AdvEngine/MessageText"),
+        "Dialogue control path predicates remain available");
     var gray = UiStylePolicy.InheritButtonGray(new UnityEngine.Color(0.5f, 0.5f, 0.5f, 1f),
         new UnityEngine.Color(0.4f, 0.4f, 0.4f, 0f));
     Check(gray.r == 1f && gray.a == 1f, "Already dimmed labels are not darkened twice");
