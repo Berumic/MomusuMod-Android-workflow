@@ -443,6 +443,9 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         if (!_processedStates.TryGetValue(instanceId, out var state))
             return false;
 
+        if (UiStyleManager.IsInstanceStyled(instanceId) && !UiStyleManager.IsInstanceStyled(text))
+            return false;
+
         return state.Version == _processingVersion &&
                state.FontId == GetInstanceId(text.font) &&
                state.MaterialId == GetInstanceId(text.fontSharedMaterial) &&

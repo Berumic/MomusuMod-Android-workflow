@@ -479,10 +479,11 @@ public static class PatchManager
 
         public static void ApplyFont(object __instance)
         {
-            if (UiCanvasTranslationScanner.IsApplying(__instance)) return;
-            if (__instance is TMPro.TMP_Text)
+            if (UiStyleManager.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance)) return;
+            if (__instance is TMPro.TMP_Text tmpText)
             {
-                UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
+                UiStyleManager.ObserveGameMaterial(tmpText);
+                UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
                 return;
             }
             TmpFontInstaller.ApplyToCurrentText(__instance);
@@ -492,6 +493,13 @@ public static class PatchManager
 
         public static void QueueUiRefresh(object __instance)
         {
+            if (UiStyleManager.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance)) return;
+            if (__instance is TMPro.TMP_Text tmpText)
+            {
+                UiStyleManager.ObserveGameMaterial(tmpText);
+                UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
+                return;
+            }
             UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
         }
 
@@ -523,6 +531,8 @@ public static class PatchManager
                 return;
 
             UiStyleManager.PrepareUnderlayForTextChange(__instance);
+            if (__instance is TMPro.TMP_Text tmpInstance)
+                UiStyleManager.ObserveGameMaterial(tmpInstance);
 
             if (string.IsNullOrEmpty(__0))
             {
@@ -552,7 +562,7 @@ public static class PatchManager
                 // and skips mesh/material/color work completely.
                 if (SlotBindingCache.TryGetValue(instanceId, out var slotBinding) &&
                     string.Equals(slotBinding.Source, __0, StringComparison.Ordinal) &&
-                    UiStyleManager.IsInstanceStyled(instanceId))
+                    UiStyleManager.IsInstanceStyled(__instance))
                 {
                     __0 = slotBinding.Translated;
                     return;
