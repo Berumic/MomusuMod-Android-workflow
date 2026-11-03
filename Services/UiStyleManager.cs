@@ -33,6 +33,7 @@ internal static class UiStyleManager
     // Sibling __MMTDUnderlay projection layers for explicit "underlay": true style rules.
     private static readonly Dictionary<int, UnderlayLayerState> UnderlayLayers = new();
     private static readonly List<int> UnderlayCleanupBuffer = new();
+    private static readonly Dictionary<int, (int ChildCount, TMP_Text[] Texts)> SelectableTextsCache = new();
 
     private static StyleValues _defaults = new();
     private static string _stylePath;
@@ -171,28 +172,30 @@ internal static class UiStyleManager
     internal static bool IsModMaterial(Material material) =>
         material != null && ModMaterialIds.Contains(material.GetInstanceID());
 
+    internal static void InvalidateInstanceStyle(TMP_Text text)
+    {
+        if (text == null)
+            return;
+        var id = text.GetInstanceID();
+        InstanceStyleKeys.Remove(id);
+        var material = text.fontSharedMaterial;
+        if (material != null && !IsModMaterial(material))
+            OriginalGameMaterials[id] = material;
+    }
+
     internal static void ObserveGameMaterial(TMP_Text text)
     {
         if (text == null)
             return;
         var material = text.fontSharedMaterial;
         if (material != null && !IsModMaterial(material))
-        {
-            var id = text.GetInstanceID();
-            OriginalGameMaterials[id] = material;
-            if (material.HasProperty("_FaceColor"))
-                MaterialBaseFaceColors[id] = material.GetColor("_FaceColor");
-        }
+            OriginalGameMaterials[text.GetInstanceID()] = material;
     }
 
     private static void ObserveGameMaterial(Material material, int instanceId)
     {
         if (material != null && !IsModMaterial(material))
-        {
             OriginalGameMaterials[instanceId] = material;
-            if (material.HasProperty("_FaceColor"))
-                MaterialBaseFaceColors[instanceId] = material.GetColor("_FaceColor");
-        }
     }
 
     internal static bool SubmitBaseline(TMP_Text text, TMP_FontAsset font, float width,
@@ -217,7 +220,6 @@ internal static class UiStyleManager
 
     internal static void BeginPresentation(TMP_Text text)
     {
-        ObserveGameMaterial(text);
         _batchText = text;
         _batchRequested = false;
         _batchTranslated = false;
@@ -259,6 +261,7 @@ internal static class UiStyleManager
         SharedMaterials.Clear();
         InstanceStyleKeys.Clear();
         MaterialBaseFaceColors.Clear();
+        SelectableTextsCache.Clear();
         Rules.Clear();
         _defaults = new StyleValues();
         if (string.IsNullOrEmpty(_stylePath) || !File.Exists(_stylePath))
@@ -266,7 +269,7 @@ internal static class UiStyleManager
 
         try
         {
-            using var document = JsonDocument.Parse(File.ReadAllText(_stylePath));
+            using var document = JsonDocument.Parse(File.ReadAllBytes(_stylePath));
             var root = document.RootElement;
             if (root.TryGetProperty("$global", out var defaults) && defaults.ValueKind == JsonValueKind.Object)
                 _defaults = ReadValues(defaults);
@@ -330,10 +333,6 @@ internal static class UiStyleManager
         if (text?.transform == null)
             return false;
 
-        var instanceId = text.GetInstanceID();
-        var originalMaterial = text.fontSharedMaterial;
-        ObserveGameMaterial(originalMaterial, instanceId);
-
         var path = UiHierarchyClassifier.GetNormalizedHierarchyPath(text.transform);
         StyleRule matched = null;
         foreach (var rule in Rules)
@@ -347,9 +346,15 @@ internal static class UiStyleManager
         var values = UiStylePolicy.Resolve(matched?.Values, _defaults, _resolvedBaseline, isTranslated);
         if (values == null)
         {
-            DisableUnderlayLayer(instanceId);
+            if (UnderlayLayers.Count > 0)
+                DisableUnderlayLayer(text.GetInstanceID());
             return false;
         }
+
+        var instanceId = text.GetInstanceID();
+        var originalMaterial = text.fontSharedMaterial;
+        ObserveGameMaterial(originalMaterial, instanceId);
+
         var fontColor = values.FontColor;
         var outlineColor = values.OutlineColor ?? new Color32(0x54, 0x4A, 0x4A, 255);
         var outlineWidth = values.OutlineWidth ?? fallbackOutlineWidth;
@@ -478,7 +483,7 @@ internal static class UiStyleManager
                 underlayDilate,
                 underlaySoftness);
         }
-        else
+        else if (UnderlayLayers.Count > 0)
         {
             DisableUnderlayLayer(instanceId);
         }
@@ -868,43 +873,37 @@ internal static class UiStyleManager
 
     internal static bool IsInstanceStyled(int instanceId) => InstanceStyleKeys.ContainsKey(instanceId);
 
-    internal static bool IsInstanceStyled(object component)
+    internal static bool IsInstanceStyled(TMP_Text text, int instanceId) =>
+        text != null &&
+        InstanceStyleKeys.ContainsKey(instanceId) &&
+        TmpFontInstaller.IsModFont(text.font) &&
+        IsModMaterial(text.fontSharedMaterial);
+
+    internal static void NotifySelectableStateChanged(object instance)
     {
-        if (component is not TMP_Text text || text == null)
-            return false;
-        return IsInstanceStyled(text);
-    }
+        if (_applying || instance is not Selectable selectable || selectable == null ||
+            selectable.gameObject == null || !selectable.gameObject.activeInHierarchy)
+            return;
 
-    internal static bool IsInstanceStyled(TMP_Text text)
-    {
-        if (text == null)
-            return false;
-
-        var instanceId = text.GetInstanceID();
-        if (!InstanceStyleKeys.TryGetValue(instanceId, out var key))
-            return false;
-        if (!SharedMaterials.TryGetValue(key, out var expectedMaterial) || expectedMaterial == null)
-            return false;
-        if (text.fontSharedMaterial != expectedMaterial)
-            return false;
-
-        if (!PreStyleVertexColors.ContainsKey(instanceId) &&
-            OriginalGameMaterials.TryGetValue(instanceId, out var gameMaterial) &&
-            gameMaterial != null &&
-            gameMaterial.HasProperty("_FaceColor"))
+        var selectableId = selectable.GetInstanceID();
+        var transform = selectable.transform;
+        var childCount = transform != null ? transform.childCount : 0;
+        if (!SelectableTextsCache.TryGetValue(selectableId, out var cached) ||
+            cached.ChildCount != childCount ||
+            cached.Texts == null)
         {
-            var currentFaceColor = gameMaterial.GetColor("_FaceColor");
-            if (MaterialStyleKey.PackColor(currentFaceColor) != key.PackedFaceColor)
-                return false;
+            if (SelectableTextsCache.Count > 512)
+                SelectableTextsCache.Clear();
+            var il2cppArray = selectable.GetComponentsInChildren<TMP_Text>(true);
+            var managedArray = new TMP_Text[il2cppArray.Length];
+            for (var i = 0; i < il2cppArray.Length; i++)
+                managedArray[i] = il2cppArray[i];
+            cached = (childCount, managedArray);
+            SelectableTextsCache[selectableId] = cached;
         }
 
-        return true;
-    }
-
-    internal static void NotifySelectableStateChanged(object _)
-    {
-        // Per 0.1.121: button disabledColor is not forcibly applied to TMP labels;
-        // text color, gradients, and fade states are controlled by the game's own materials/components.
+        if (cached.Texts.Length > 0)
+            MonsterMusumeTDMod.Patches.UiCanvasTranslationScanner.NotifySelectableTransition(cached.Texts);
     }
 
     internal static void ReleasePresentation(TMP_Text text)
@@ -919,12 +918,13 @@ internal static class UiStyleManager
             PreStyleVertexColors.Remove(id);
             text.color = savedColor;
         }
-        DisableUnderlayLayer(id);
+        if (UnderlayLayers.Count > 0)
+            DisableUnderlayLayer(id);
     }
 
     internal static void SyncUnderlayLayer(TMP_Text text)
     {
-        if (text == null)
+        if (text == null || UnderlayLayers.Count == 0)
             return;
         if (UnderlayLayers.TryGetValue(text.GetInstanceID(), out var state))
             SyncUnderlayState(state, force: false);
@@ -932,6 +932,8 @@ internal static class UiStyleManager
 
     internal static void PrepareUnderlayForTextChange(object instance)
     {
+        if (UnderlayLayers.Count == 0)
+            return;
         if (instance is TMP_Text text && text != null &&
             UnderlayLayers.TryGetValue(text.GetInstanceID(), out var state) &&
             state != null)

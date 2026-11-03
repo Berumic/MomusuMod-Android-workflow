@@ -181,18 +181,17 @@ public static class UiHierarchyClassifier
         if (_primaryCache.TryGetValue(instanceId, out var cached))
         {
             // Once attached under a Canvas, OnTransformParentChanged / OnCanvasHierarchyChanged
-            // explicitly invalidates the entry if it ever moves. For unparented/detached nodes,
-            // re-check once per frame in case they were parented without firing a TMP hook.
-            if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0 ||
-                cached.ValidatedFrame == currentFrame)
+            // explicitly invalidates the entry if it ever moves. Never serve a cached unparented
+            // result because prefabs are often populated and then parented under UICanvas later
+            // within the exact same frame without firing child OnTransformParentChanged hooks.
+            if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
             {
                 return cached;
             }
         }
         else if (_secondaryCache.TryGetValue(instanceId, out cached))
         {
-            if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0 ||
-                cached.ValidatedFrame == currentFrame)
+            if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
             {
                 PromoteOrInsert(instanceId, cached);
                 return cached;

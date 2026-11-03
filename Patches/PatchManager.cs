@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using HarmonyLib;
 using Il2CppInterop.Runtime;
 using MonsterMusumeTDMod.Core;
@@ -12,7 +13,7 @@ public static class PatchManager
     private const int MaxAppliedValuesCapacity = 4096;
 
     private static HarmonyLib.Harmony _harmony;
-    private static readonly List<System.Reflection.MethodBase> PatchedMethods = new();
+    private static readonly List<MethodBase> PatchedMethods = new();
     private static TranslationManager _translations;
     private static ModConfig _config;
     private static bool _processingDiscoveredText;
@@ -24,6 +25,7 @@ public static class PatchManager
     private static Il2CppSystem.Func<string, Utage.TextParserBase> _previousStoryParser;
     private static Il2CppSystem.Func<string, Utage.TextParserBase> _storyParser;
     private static readonly Dictionary<string, Type> RuntimeTypeCache = new(StringComparer.Ordinal);
+    private static readonly Dictionary<Type, List<MethodInfo>> DeclaredMethodsCache = new();
 
     // The game writes the translated argument back through the same setter.
     // Track that value per UI component so a composed translation is not
@@ -61,15 +63,21 @@ public static class PatchManager
             nameof(Hooks.ApplySubSkillCardFont)
         );
         PatchFontSetters("TMPro.TMP_Text");
+        PatchFontSetters("TMPro.TextMeshProUGUI");
         PatchFontSetters("UnityEngine.UI.Text");
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "set_fontSharedMaterial", "set_fontMaterial" });
-        // TextMeshProUGUI.OnEnable calls base.OnEnable (TMP_Text.OnEnable).
-        // Patching TMP_Text.OnEnable alone covers all concrete subclasses
-        // without firing duplicate activation events on every TextMeshProUGUI.
+        PatchTmpRefreshTriggers("TMPro.TextMeshProUGUI", new[] { "set_fontSharedMaterial", "set_fontMaterial" });
+        // TextMeshProUGUI declares protected override void OnEnable(); TMP_Text does not.
+        // Patch both so whichever type declares OnEnable in this build fires the activation hook.
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "OnEnable" }, requestFastScan: true);
+        PatchTmpRefreshTriggers("TMPro.TextMeshProUGUI", new[] { "OnEnable" }, requestFastScan: true);
         // A pooled UI subtree can be populated before it joins its final
         // Canvas. Invalidate cached hierarchy paths and apply path styles
         // as soon as the hierarchy becomes valid.
+        PatchContextPostfixMethods(
+            "TMPro.TMP_Text",
+            new[] { "OnTransformParentChanged", "OnCanvasHierarchyChanged" },
+            nameof(Hooks.OnHierarchyChanged));
         PatchContextPostfixMethods(
             "TMPro.TextMeshProUGUI",
             new[] { "OnTransformParentChanged", "OnCanvasHierarchyChanged" },
@@ -78,7 +86,7 @@ public static class PatchManager
         // interactable state changes (or for Animation transitions).
         PatchContextPostfixMethods(
             "UnityEngine.UI.Selectable",
-            new[] { "DoStateTransition" },
+            new[] { "DoStateTransition", "OnPointerDown", "OnPointerUp", "OnSelect", "OnDeselect", "OnEnable" },
             nameof(Hooks.ApplyButtonState));
         // UTAGE 类型名和方法签名会随游戏版本变化；这些探针失败时只跳过，不阻止 TMP 补丁加载。
         foreach (var typeName in new[]
@@ -92,6 +100,7 @@ public static class PatchManager
             }, contextOnly: true);
         }
 
+        DeclaredMethodsCache.Clear();
         Plugin.Log.LogInfo($"Installed {PatchedMethods.Count} runtime patches");
     }
 
@@ -106,6 +115,7 @@ public static class PatchManager
         try { _harmony?.UnpatchSelf(); }
         catch (Exception ex) { Plugin.Log?.LogWarning($"Unpatch failed: {ex.Message}"); }
         PatchedMethods.Clear();
+        DeclaredMethodsCache.Clear();
         AppliedTextValues.Clear();
         SlotBindingCache.Clear();
     }
@@ -134,6 +144,16 @@ public static class PatchManager
         }
     }
 
+    private static List<MethodInfo> GetDeclaredMethodsCached(Type type)
+    {
+        if (!DeclaredMethodsCache.TryGetValue(type, out var methods))
+        {
+            methods = AccessTools.GetDeclaredMethods(type);
+            DeclaredMethodsCache[type] = methods;
+        }
+        return methods;
+    }
+
     private static void PatchTypeMethods(
         string typeName,
         IEnumerable<string> methodNames,
@@ -147,7 +167,7 @@ public static class PatchManager
             return;
         }
 
-        foreach (var method in AccessTools.GetDeclaredMethods(type))
+        foreach (var method in GetDeclaredMethodsCached(type))
         {
             if (!Matches(method.Name, methodNames))
                 continue;
@@ -233,7 +253,7 @@ public static class PatchManager
     {
         var type = FindRuntimeType(typeName);
         if (type == null) return;
-        foreach (var method in AccessTools.GetDeclaredMethods(type))
+        foreach (var method in GetDeclaredMethodsCached(type))
         {
             if (method.Name != name) continue;
             try
@@ -265,14 +285,42 @@ public static class PatchManager
         if (RuntimeTypeCache.TryGetValue(typeName, out var cached))
             return cached;
 
+        // Fast-path known assemblies before iterating AppDomain assemblies.
+        Type directType = typeName switch
+        {
+            "TMPro.TMP_Text" => typeof(TMPro.TMP_Text),
+            "TMPro.TextMeshProUGUI" => typeof(TMPro.TextMeshProUGUI),
+            "UnityEngine.UI.Text" => typeof(UnityEngine.UI.Text),
+            "UnityEngine.UI.Selectable" => typeof(UnityEngine.UI.Selectable),
+            "Utage.AdvScenarioData" => typeof(Utage.AdvScenarioData),
+            "Utage.AdvCommand" => typeof(Utage.AdvCommand),
+            "Utage.AdvCommandText" => typeof(Utage.AdvCommandText),
+            _ => null
+        };
+        if (directType != null)
+        {
+            RuntimeTypeCache[typeName] = directType;
+            return directType;
+        }
+
+        var utageAssembly = typeof(Utage.TextData).Assembly;
+        directType = TryResolveInAssembly(utageAssembly, typeName);
+        if (directType != null)
+        {
+            RuntimeTypeCache[typeName] = directType;
+            return directType;
+        }
+
         foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
             var asmName = assembly.GetName().Name ?? string.Empty;
             if (asmName.StartsWith("System", StringComparison.Ordinal) ||
                 asmName.StartsWith("Microsoft", StringComparison.Ordinal) ||
                 asmName.StartsWith("BepInEx", StringComparison.Ordinal) ||
+                asmName.StartsWith("MelonLoader", StringComparison.Ordinal) ||
                 asmName.StartsWith("Il2CppInterop", StringComparison.Ordinal) ||
                 asmName.StartsWith("MonoMod", StringComparison.Ordinal) ||
+                asmName.StartsWith("UnityEngine", StringComparison.Ordinal) ||
                 asmName.Equals("0Harmony", StringComparison.Ordinal) ||
                 asmName.Equals("netstandard", StringComparison.Ordinal) ||
                 asmName.Equals("mscorlib", StringComparison.Ordinal) ||
@@ -281,21 +329,7 @@ public static class PatchManager
                 continue;
             }
 
-            Type type;
-            try
-            {
-                type = assembly.GetType(typeName, false, false);
-#if ANDROID
-                type ??= assembly.GetType("Il2Cpp" + (typeName.Contains('.') ? "" : ".") + typeName, false, false);
-                if (type == null && !typeName.Contains('.'))
-                    type = assembly.GetType("Il2CppUtage." + typeName, false, false);
-#endif
-            }
-            catch
-            {
-                continue;
-            }
-
+            var type = TryResolveInAssembly(assembly, typeName);
             if (type == null)
                 continue;
 
@@ -307,13 +341,36 @@ public static class PatchManager
         return null;
     }
 
+    private static Type TryResolveInAssembly(Assembly assembly, string typeName)
+    {
+        if (assembly == null)
+            return null;
+        try
+        {
+            var type = assembly.GetType(typeName, false, false);
+#if ANDROID
+            type ??= assembly.GetType("Il2Cpp" + (typeName.Contains('.') ? "" : ".") + typeName, false, false);
+            if (type == null && !typeName.Contains('.'))
+                type = assembly.GetType("Il2CppUtage." + typeName, false, false);
+#else
+            if (type == null && !typeName.Contains('.'))
+                type = assembly.GetType("Utage." + typeName, false, false);
+#endif
+            return type;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static void PatchFontSetters(string typeName)
     {
         var type = FindRuntimeType(typeName);
         if (type == null)
             return;
 
-        foreach (var method in AccessTools.GetDeclaredMethods(type))
+        foreach (var method in GetDeclaredMethodsCached(type))
         {
             if (method.Name != "set_font" || method.GetParameters().Length != 1)
                 continue;
@@ -342,7 +399,7 @@ public static class PatchManager
         if (type == null)
             return;
 
-        foreach (var method in AccessTools.GetDeclaredMethods(type))
+        foreach (var method in GetDeclaredMethodsCached(type))
         {
             if (!Matches(method.Name, methodNames))
                 continue;
@@ -376,7 +433,7 @@ public static class PatchManager
         if (type == null)
             return;
 
-        foreach (var method in AccessTools.GetDeclaredMethods(type))
+        foreach (var method in GetDeclaredMethodsCached(type))
         {
             if (!Matches(method.Name, methodNames))
                 continue;
@@ -469,8 +526,12 @@ public static class PatchManager
 
         public static void OnHierarchyChanged(object __instance)
         {
+            if (UiStyleManager.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance)) return;
+            if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
             if (__instance is UnityEngine.Component component && component != null && component.transform != null)
                 UiHierarchyClassifier.InvalidateTransform(component.transform);
+            if (!DeferringTmpPresentation && __instance is TMPro.TMP_Text tmpText && tmpText != null)
+                UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
             UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
@@ -480,9 +541,16 @@ public static class PatchManager
         public static void ApplyFont(object __instance)
         {
             if (UiStyleManager.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance)) return;
-            if (__instance is TMPro.TMP_Text tmpText)
+            if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
+            if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
             {
-                UiStyleManager.ObserveGameMaterial(tmpText);
+                UiStyleManager.InvalidateInstanceStyle(tmpText);
+                if (!DeferringTmpPresentation)
+                {
+                    TmpFontInstaller.ApplyToCurrentText(tmpText);
+                    TmpFontInstaller.ApplyConfiguredUiStyle(tmpText);
+                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
+                }
                 UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
                 return;
             }
@@ -494,9 +562,16 @@ public static class PatchManager
         public static void QueueUiRefresh(object __instance)
         {
             if (UiStyleManager.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance)) return;
-            if (__instance is TMPro.TMP_Text tmpText)
+            if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
+            if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
             {
-                UiStyleManager.ObserveGameMaterial(tmpText);
+                UiStyleManager.InvalidateInstanceStyle(tmpText);
+                if (!DeferringTmpPresentation)
+                {
+                    TmpFontInstaller.ApplyToCurrentText(tmpText);
+                    TmpFontInstaller.ApplyConfiguredUiStyle(tmpText);
+                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
+                }
                 UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
                 return;
             }
@@ -505,6 +580,12 @@ public static class PatchManager
 
         public static void QueueUiActivationRefresh(object __instance)
         {
+            if (UiStyleManager.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance)) return;
+            if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
+            if (__instance is UnityEngine.Component component && component != null && component.transform != null)
+                UiHierarchyClassifier.InvalidateTransform(component.transform);
+            if (!DeferringTmpPresentation && __instance is TMPro.TMP_Text tmpText && tmpText != null)
+                UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
             UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
@@ -531,8 +612,6 @@ public static class PatchManager
                 return;
 
             UiStyleManager.PrepareUnderlayForTextChange(__instance);
-            if (__instance is TMPro.TMP_Text tmpInstance)
-                UiStyleManager.ObserveGameMaterial(tmpInstance);
 
             if (string.IsNullOrEmpty(__0))
             {
@@ -549,9 +628,12 @@ public static class PatchManager
             var instanceId = GetInstanceId(__instance);
             if (instanceId != 0)
             {
+                var tmpInstance = __instance as TMPro.TMP_Text;
                 if (AppliedTextValues.TryGetValue(instanceId, out var appliedValue) &&
                     string.Equals(appliedValue, __0, StringComparison.Ordinal))
                 {
+                    if (tmpInstance != null && !UiStyleManager.IsInstanceStyled(tmpInstance, instanceId))
+                        UiCanvasTranslationScanner.QueueActivationRefresh(tmpInstance);
                     return;
                 }
 
@@ -562,7 +644,7 @@ public static class PatchManager
                 // and skips mesh/material/color work completely.
                 if (SlotBindingCache.TryGetValue(instanceId, out var slotBinding) &&
                     string.Equals(slotBinding.Source, __0, StringComparison.Ordinal) &&
-                    UiStyleManager.IsInstanceStyled(__instance))
+                    UiStyleManager.IsInstanceStyled(tmpInstance, instanceId))
                 {
                     __0 = slotBinding.Translated;
                     return;
@@ -580,14 +662,16 @@ public static class PatchManager
             var isUnderUiCanvas = (flags & UiPathFlags.UnderUiCanvas) != 0;
             var isSubSkillText = (flags & UiPathFlags.SubSkillScrollText) != 0;
             var isUnitDetailDesc = (flags & UiPathFlags.UnitDetailUiDescription) != 0;
+            var isTmpText = __instance is TMPro.TMP_Text;
 
-            // Detail panels often assign TMP.text before the object is parented
-            // under UICanvasTopUnitDetail. Defer one refresh only when unparented.
-            if (__instance is TMPro.TMP_Text && !isUnderUiCanvas)
-                UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
+            // Detail panels and popups often assign TMP.text before the prefab root
+            // is parented under UICanvas. Translate immediately and also queue an
+            // activation refresh so full-canvas path styles apply once parented.
+            if (isTmpText && !isUnderUiCanvas)
+                UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
 
             if (_config.TranslateUiTexts.Value &&
-                isUnderUiCanvas &&
+                (isUnderUiCanvas || isTmpText) &&
                 !isSubSkillText &&
                 _translations.TryTranslateUiText(
                     __0,
@@ -610,10 +694,10 @@ public static class PatchManager
                     if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(__instance, __0, null, isSubSkill: true))
                         TmpFontInstaller.ApplyToTranslatedSubSkillText(__instance, __0);
                 }
-                else if (__instance is TMPro.TMP_Text && isUnderUiCanvas)
+                else if (isTmpText)
                 {
                     if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(__instance, __0, null, isSubSkill: false))
-                        UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
+                        TmpFontInstaller.ApplyToTranslatedUiText(__instance, __0);
                 }
                 return;
             }

@@ -63,6 +63,8 @@ public sealed class TranslationManager
         public readonly StoryTranslationIndex StoryDisplayIndex = new();
         public readonly Dictionary<char, List<KeyValuePair<string, string>>> StoryFragmentIndex = new();
         public readonly HashSet<string> KnownStoryTranslationValues = new(StringComparer.Ordinal);
+        public readonly object FragmentIndexLock = new();
+        public bool IsFragmentIndexBuilt;
         public bool IsLoaded;
     }
 
@@ -241,6 +243,7 @@ public sealed class TranslationManager
 
         Core.Plugin.Log?.LogInfo(
             $"Loaded UI/names/sub-skill tables in {loadTimer.ElapsedMilliseconds} ms " +
+            "and starting background scenario indexing " +
             $"(names={_names.Count}, ui={_uiTexts.Count}, subskills={_subSkills.Count})");
 
         var scenarioRoot = Path.Combine(_root, "scenarios");
@@ -267,77 +270,72 @@ public sealed class TranslationManager
             var promotedStoryTranslations = 0;
             foreach (var path in Directory.EnumerateFiles(scenarioRoot, $"{language}.json", SearchOption.AllDirectories))
             {
-                var table = ReadTable(path);
                 var scenarioId = Path.GetFileName(Path.GetDirectoryName(path));
-                var hasTranslations = false;
-                foreach (var val in table.Values)
+                try
                 {
-                    if (!string.IsNullOrEmpty(val))
+                    var bytes = File.ReadAllBytes(path);
+                    using var document = JsonDocument.Parse(bytes);
+                    var hasTranslations = false;
+                    foreach (var property in document.RootElement.EnumerateObject())
                     {
-                        hasTranslations = true;
-                        break;
-                    }
-                }
+                        if (property.Value.ValueKind != JsonValueKind.String)
+                            continue;
 
-                if (!string.IsNullOrEmpty(scenarioId))
-                {
-                    if (!snapshot.ScenarioPaths.ContainsKey(scenarioId) ||
-                        (hasTranslations && !scenarioIdsWithTranslations.Contains(scenarioId)))
-                        snapshot.ScenarioPaths[scenarioId] = path;
-                    if (hasTranslations)
-                        scenarioIdsWithTranslations.Add(scenarioId);
-                }
-
-                foreach (var pair in table)
-                {
-                    if (string.IsNullOrEmpty(pair.Value))
-                    {
-                        snapshot.Fallback.TryAdd(pair.Key, string.Empty);
-                        continue;
-                    }
-
-                    var parseKey = NormalizeSubSkillKey(pair.Key);
-                    snapshot.StoryParseIndex.Add(scenarioId, parseKey, pair.Value);
-                    var displayKey = NormalizeStoryDisplayValue(parseKey);
-                    if (!ReferenceEquals(displayKey, parseKey) &&
-                        !string.Equals(displayKey, parseKey, StringComparison.Ordinal))
-                    {
-                        snapshot.StoryDisplayIndex.Add(scenarioId, displayKey, pair.Value);
-                    }
-
-                    AddKnownStoryTranslationValue(snapshot.KnownStoryTranslationValues, pair.Value);
-
-                    if (!snapshot.Fallback.TryGetValue(pair.Key, out var existingFallback))
-                    {
-                        snapshot.Fallback.Add(pair.Key, pair.Value);
-                    }
-                    else if (string.IsNullOrEmpty(existingFallback))
-                    {
-                        snapshot.Fallback[pair.Key] = pair.Value;
-                        promotedStoryTranslations++;
-                    }
-
-                    if (!ReferenceEquals(parseKey, pair.Key) &&
-                        !string.Equals(parseKey, pair.Key, StringComparison.Ordinal))
-                    {
-                        if (!snapshot.Fallback.TryGetValue(parseKey, out var existingNormalized) ||
-                            string.IsNullOrEmpty(existingNormalized))
+                        var key = property.Name;
+                        var val = property.Value.GetString() ?? string.Empty;
+                        if (string.IsNullOrEmpty(val))
                         {
-                            snapshot.Fallback[parseKey] = pair.Value;
+                            snapshot.Fallback.TryAdd(key, string.Empty);
+                            continue;
+                        }
+
+                        hasTranslations = true;
+                        var parseKey = NormalizeSubSkillKey(key);
+                        snapshot.StoryParseIndex.Add(scenarioId, parseKey, val);
+                        var displayKey = NormalizeStoryDisplayValue(parseKey);
+                        if (!ReferenceEquals(displayKey, parseKey) &&
+                            !string.Equals(displayKey, parseKey, StringComparison.Ordinal))
+                        {
+                            snapshot.StoryDisplayIndex.Add(scenarioId, displayKey, val);
+                        }
+
+                        AddKnownStoryTranslationValue(snapshot.KnownStoryTranslationValues, val);
+
+                        if (!snapshot.Fallback.TryGetValue(key, out var existingFallback))
+                        {
+                            snapshot.Fallback.Add(key, val);
+                        }
+                        else if (string.IsNullOrEmpty(existingFallback))
+                        {
+                            snapshot.Fallback[key] = val;
+                            promotedStoryTranslations++;
+                        }
+
+                        if (!ReferenceEquals(parseKey, key) &&
+                            !string.Equals(parseKey, key, StringComparison.Ordinal))
+                        {
+                            if (!snapshot.Fallback.TryGetValue(parseKey, out var existingNormalized) ||
+                                string.IsNullOrEmpty(existingNormalized))
+                            {
+                                snapshot.Fallback[parseKey] = val;
+                            }
                         }
                     }
+
+                    if (!string.IsNullOrEmpty(scenarioId))
+                    {
+                        if (!snapshot.ScenarioPaths.ContainsKey(scenarioId) ||
+                            (hasTranslations && !scenarioIdsWithTranslations.Contains(scenarioId)))
+                            snapshot.ScenarioPaths[scenarioId] = path;
+                        if (hasTranslations)
+                            scenarioIdsWithTranslations.Add(scenarioId);
+                    }
+                }
+                catch (Exception fileEx)
+                {
+                    Core.Plugin.Log?.LogWarning($"读取剧情翻译表失败 {path}: {fileEx.Message}");
                 }
             }
-
-            foreach (var pair in snapshot.Fallback)
-            {
-                if (string.IsNullOrEmpty(pair.Value))
-                    continue;
-                var parseKey = NormalizeSubSkillKey(pair.Key);
-                if (snapshot.StoryParseIndex.TryGet(parseKey, null, out _, out _))
-                    AddFragmentRule(snapshot.StoryFragmentIndex, pair.Key, pair.Value, MinStoryFragmentLength);
-            }
-            SortFragmentIndex(snapshot.StoryFragmentIndex);
 
             Core.Plugin.Log?.LogInfo(
                 $"Loaded {snapshot.Fallback.Count} unique story row(s) in {scenarioTimer.ElapsedMilliseconds} ms; " +
@@ -351,6 +349,29 @@ public sealed class TranslationManager
         {
             snapshot.IsLoaded = true;
             Volatile.Write(ref _scenarioSnapshot, snapshot);
+        }
+    }
+
+    private static void EnsureStoryFragmentIndex(ScenarioSnapshot snapshot)
+    {
+        if (snapshot == null || snapshot.IsFragmentIndexBuilt)
+            return;
+
+        lock (snapshot.FragmentIndexLock)
+        {
+            if (snapshot.IsFragmentIndexBuilt)
+                return;
+
+            foreach (var pair in snapshot.Fallback)
+            {
+                if (string.IsNullOrEmpty(pair.Value))
+                    continue;
+                var parseKey = NormalizeSubSkillKey(pair.Key);
+                if (snapshot.StoryParseIndex.TryGet(parseKey, null, out _, out _))
+                    AddFragmentRule(snapshot.StoryFragmentIndex, pair.Key, pair.Value, MinStoryFragmentLength);
+            }
+            SortFragmentIndex(snapshot.StoryFragmentIndex);
+            snapshot.IsFragmentIndexBuilt = true;
         }
     }
 
@@ -741,6 +762,7 @@ public sealed class TranslationManager
         if (conflict)
             return false;
 
+        EnsureStoryFragmentIndex(snapshot);
         return TryTranslateIndexedFragments(source, snapshot.StoryFragmentIndex, out translated);
     }
 
@@ -1150,8 +1172,11 @@ public sealed class TranslationManager
              TryTranslateExTemplate(normalized, _subSkillExTemplates, out _)))
             return true;
 
-        return TryTranslateIndexedFragments(normalized, _subSkillFragmentIndex, out _) ||
-               TryTranslateIndexedFragments(source, snapshot.StoryFragmentIndex, out _);
+        if (TryTranslateIndexedFragments(normalized, _subSkillFragmentIndex, out _))
+            return true;
+
+        EnsureStoryFragmentIndex(snapshot);
+        return TryTranslateIndexedFragments(source, snapshot.StoryFragmentIndex, out _);
     }
 
     public bool HasRuntimeTranslation(string source, string scenePath) =>
@@ -1507,13 +1532,19 @@ public sealed class TranslationManager
             targetSet.Add(displayValue);
     }
 
+    private static bool HasUtageDisplayControlTag(string value) =>
+        value.IndexOf('<') >= 0 &&
+        (value.Contains("interval", StringComparison.OrdinalIgnoreCase) ||
+         value.Contains("speed", StringComparison.OrdinalIgnoreCase) ||
+         value.Contains("sound", StringComparison.OrdinalIgnoreCase));
+
     private static string NormalizeStoryDisplayValue(string value)
     {
         if (string.IsNullOrEmpty(value))
             return value;
 
         var normalized = NormalizeSubSkillKey(value);
-        return normalized.IndexOf('<') < 0
+        return !HasUtageDisplayControlTag(normalized)
             ? normalized
             : UtageDisplayControlTag.Replace(normalized, string.Empty);
     }
@@ -1524,7 +1555,7 @@ public sealed class TranslationManager
         {
             if (!File.Exists(path))
                 return new Dictionary<string, string>(StringComparer.Ordinal);
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
             var table = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var property in document.RootElement.EnumerateObject())
             {
@@ -1582,7 +1613,7 @@ public sealed class TranslationManager
         {
             if (!File.Exists(path))
                 return;
-            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
             foreach (var property in document.RootElement.EnumerateObject())
             {
                 if (property.Value.ValueKind == JsonValueKind.String)
@@ -1611,15 +1642,6 @@ public sealed class TranslationManager
                         if (row.Value.ValueKind == JsonValueKind.Object)
                         {
                             AddUiPathTable(pathTables, row);
-                            foreach (var child in row.Value.EnumerateObject())
-                            {
-                                if (child.Value.ValueKind == JsonValueKind.String)
-                                {
-                                    var childVal = child.Value.GetString() ?? string.Empty;
-                                    if (!string.IsNullOrEmpty(childVal))
-                                        globalTable.TryAdd(child.Name, childVal);
-                                }
-                            }
                         }
                     }
                 }
