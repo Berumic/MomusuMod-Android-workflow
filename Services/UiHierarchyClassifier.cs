@@ -384,14 +384,14 @@ public static class UiHierarchyClassifier
         return fullPath;
     }
 
-    public static void InvalidateTransform(Transform root)
+    public static void InvalidateTransform(Transform transform)
     {
-        if (root == null)
+        if (transform == null)
             return;
 
-        // Clear caches when hierarchy parenting changes so children re-evaluate paths cleanly.
-        _primaryCache.Clear();
-        _secondaryCache.Clear();
+        var id = transform.GetInstanceID();
+        _primaryCache.Remove(id);
+        _secondaryCache.Remove(id);
     }
 
     public static void ClearCache()
@@ -400,31 +400,42 @@ public static class UiHierarchyClassifier
         _secondaryCache.Clear();
     }
 
+    private static string BuildHierarchyPath(Transform transform, int maxNodes, out string leafName)
+    {
+        leafName = string.Empty;
+        try
+        {
+            var stack = new List<string>(16);
+            for (var current = transform;
+                 current != null && (maxNodes <= 0 || stack.Count < maxNodes);
+                 current = current.parent)
+            {
+                var currentName = current.name ?? string.Empty;
+                if (stack.Count == 0)
+                    leafName = currentName;
+                stack.Add(currentName);
+            }
+
+            stack.Reverse();
+            return string.Join("/", stack);
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
     public static bool IsUnderUiCanvas(object component) =>
         (GetFlags(component) & UiPathFlags.UnderUiCanvas) != 0;
 
-    public static bool IsUiTranslationExcluded(object component)
-    {
-        if (IsUiTextSoftOutlineLayer(component))
-            return true;
-        return component switch
-        {
-            Text => true,
-            Image => true,
-            RawImage => true,
-            _ => false
-        };
-    }
+    public static bool IsUiTranslationExcluded(object _) => false;
 
     public static bool IsSubSkillText(object component) =>
         (GetFlags(component) & UiPathFlags.SubSkillScrollText) != 0;
 
-    public static bool IsSubSkillScrollText(Transform root) =>
-        (GetFlags(root) & UiPathFlags.SubSkillScrollText) != 0;
+    public static bool IsSubSkillScrollText(Transform transform) =>
+        (GetFlags(transform) & UiPathFlags.SubSkillScrollText) != 0;
 
-    // These path predicates remain part of the shared scanner contract.  Keep
-    // them alongside the cached classifier so callers do not duplicate the
-    // old hierarchy string checks after the cache refactor.
     public static bool IsCompleteSubSkillHierarchy(string hierarchy) =>
         !string.IsNullOrEmpty(hierarchy) &&
         ((hierarchy.Contains("unit_detail_rework", StringComparison.OrdinalIgnoreCase) &&
@@ -443,14 +454,20 @@ public static class UiHierarchyClassifier
         hierarchy.Contains("skilldialog", StringComparison.OrdinalIgnoreCase) &&
         hierarchy.Contains("scroll view", StringComparison.OrdinalIgnoreCase);
 
-    public static bool IsHomeDeckSubSkillName(Transform root) =>
-        (GetFlags(root) & UiPathFlags.HomeDeckSubSkillName) != 0;
+    public static bool IsHomeDeckSubSkillName(Transform transform) =>
+        (GetFlags(transform) & UiPathFlags.HomeDeckSubSkillName) != 0;
 
-    public static bool IsHomeDeckExSkillSlotName(Transform root) =>
-        (GetFlags(root) & UiPathFlags.HomeDeckExSkillSlotName) != 0;
+    public static bool IsEquippedSubSkillAttachPath(string path) =>
+        !string.IsNullOrEmpty(path) &&
+        (path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase)) &&
+        path.Contains("/AttachAbilityButton", StringComparison.OrdinalIgnoreCase);
 
-    public static bool IsQuestDungeonSkillName(Transform root) =>
-        (GetFlags(root) & UiPathFlags.QuestDungeonSkillName) != 0;
+    public static bool IsHomeDeckExSkillSlotName(Transform transform) =>
+        (GetFlags(transform) & UiPathFlags.HomeDeckExSkillSlotName) != 0;
+
+    public static bool IsQuestDungeonSkillName(Transform transform) =>
+        (GetFlags(transform) & UiPathFlags.QuestDungeonSkillName) != 0;
 
     public static bool ShouldUseSubSkillPresentation(TMP_Text text) =>
         text != null && (GetFlags(text.transform) & UiPathFlags.ShouldUseSubSkillPresentation) != 0;
@@ -459,11 +476,27 @@ public static class UiHierarchyClassifier
         (GetFlags(component) & UiPathFlags.UnitDetailUiDescription) != 0;
 
     public static bool IsUnitDetailFontOverride(object component) =>
-        component is TMP_Text text &&
-        (GetFlags(text.transform) & UiPathFlags.UnitDetailFontOverride) != 0;
+        (GetFlags(component) & UiPathFlags.UnitDetailFontOverride) != 0;
 
     public static bool IsUnitDetailNoOutlineText(TMP_Text text) =>
         text != null && (GetFlags(text.transform) & UiPathFlags.UnitDetailNoOutline) != 0;
+
+    public static bool IsUnitDetailCompactDescription(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return false;
+
+        var isExSkillDescription =
+            path.Contains("/Unit_Detail_ExSkill", StringComparison.OrdinalIgnoreCase) &&
+            path.EndsWith("/WindowBase/Rein/Desc", StringComparison.OrdinalIgnoreCase);
+        var isUniqueWeaponAbility =
+            path.Contains("/UniqueWeapon_CreateDetailView", StringComparison.OrdinalIgnoreCase) &&
+            path.EndsWith(
+                "/UniqueWeapon_StatusView/LayoutGroup/Ability/AbilityText",
+                StringComparison.OrdinalIgnoreCase);
+
+        return isExSkillDescription || isUniqueWeaponAbility;
+    }
 
     public static bool IsUnitDetailFixedSpacingText(TMP_Text text) =>
         text != null && (GetFlags(text.transform) & UiPathFlags.UnitDetailFixedSpacing) != 0;
@@ -479,8 +512,26 @@ public static class UiHierarchyClassifier
         if (text == null || text.transform == null)
             return false;
 
-        var path = GetHierarchyPath(text.transform);
-        return IsStoryMessagePath(path, text.transform.name);
+        if (IsCurrentStoryDialogueText(text))
+            return true;
+
+        var fullPath = GetHierarchyPath(text.transform);
+        if (!fullPath.Contains("AdvEngine/", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var isStoryHistoryText =
+            fullPath.Contains("/BackLog", StringComparison.OrdinalIgnoreCase) ||
+            fullPath.Contains("/Backlog", StringComparison.OrdinalIgnoreCase) ||
+            fullPath.Contains("/FullScreenLog", StringComparison.OrdinalIgnoreCase) ||
+            fullPath.Contains("/History", StringComparison.OrdinalIgnoreCase) ||
+            fullPath.Contains("/Log", StringComparison.OrdinalIgnoreCase);
+        var isStorySelectionText =
+            fullPath.Contains("/Selection/Content/SelectionItem", StringComparison.OrdinalIgnoreCase);
+
+        return (isStoryHistoryText || isStorySelectionText) &&
+               !fullPath.Contains("/BackLogButton/", StringComparison.OrdinalIgnoreCase) &&
+               !fullPath.Contains("/Skip/", StringComparison.OrdinalIgnoreCase) &&
+               !fullPath.Contains("/Auto/", StringComparison.OrdinalIgnoreCase);
     }
 
     public static bool IsCurrentStoryDialogueText(Text text)
@@ -488,12 +539,12 @@ public static class UiHierarchyClassifier
         if (text == null || text.transform == null)
             return false;
 
-        var path = GetHierarchyPath(text.transform);
-        return (path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("Utage", StringComparison.OrdinalIgnoreCase)) &&
-               path.Contains("MessageWindow", StringComparison.OrdinalIgnoreCase) &&
-               string.Equals(text.transform.name, "Text", StringComparison.OrdinalIgnoreCase) &&
-               !path.Contains("BackLog", StringComparison.OrdinalIgnoreCase);
+        var fullPath = GetHierarchyPath(text.transform);
+        return fullPath.Contains(
+                   "AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/MessageTexts/",
+                   StringComparison.Ordinal) &&
+               (fullPath.EndsWith("/MessageText", StringComparison.Ordinal) ||
+                fullPath.EndsWith("/NameText", StringComparison.Ordinal));
     }
 
     public static bool IsStorySpeakerNameText(Text text)
@@ -501,86 +552,20 @@ public static class UiHierarchyClassifier
         if (text == null || text.transform == null)
             return false;
 
-        if (string.Equals(text.transform.name, "NameText", StringComparison.OrdinalIgnoreCase))
-            return true;
-
         var path = GetHierarchyPath(text.transform);
-        return (path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("Utage", StringComparison.OrdinalIgnoreCase)) &&
-               path.Contains("BackLog", StringComparison.OrdinalIgnoreCase) &&
-               path.EndsWith("/Name", StringComparison.OrdinalIgnoreCase);
-    }
-
-    public static bool IsStoryMessagePath(string path, string leafName = null)
-    {
-        if (string.IsNullOrEmpty(path))
-            return false;
-        if (!path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase) &&
-            !path.Contains("Utage", StringComparison.OrdinalIgnoreCase))
+        if (!path.Contains("AdvEngine/", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        var nodeName = leafName ?? GetLeafName(path);
-        var isLiveDialogue =
-            path.Contains("MessageWindow", StringComparison.OrdinalIgnoreCase) &&
-            (string.Equals(nodeName, "Text", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(nodeName, "NameText", StringComparison.OrdinalIgnoreCase));
-        var isBackLog =
-            path.Contains("BackLog", StringComparison.OrdinalIgnoreCase) &&
-            (string.Equals(nodeName, "Text", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(nodeName, "Name", StringComparison.OrdinalIgnoreCase));
-        var isSelection =
-            path.Contains("Selection", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(nodeName, "Text", StringComparison.OrdinalIgnoreCase);
-        return isLiveDialogue || isBackLog || isSelection;
-    }
-
-    private static string GetLeafName(string path)
-    {
-        var idx = path.LastIndexOf('/');
-        return idx < 0 ? path : path[(idx + 1)..];
-    }
-
-    private static bool IsEquippedSubSkillAttachPath(string path)
-    {
-        if (string.IsNullOrEmpty(path))
+        if (!path.EndsWith("/NameText", StringComparison.OrdinalIgnoreCase) &&
+            !path.EndsWith("/Name", StringComparison.OrdinalIgnoreCase) &&
+            !path.EndsWith("/CharacterName", StringComparison.OrdinalIgnoreCase))
             return false;
 
-        var isDeckSubSkill =
-            path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/SubSkillChangeButton/", StringComparison.OrdinalIgnoreCase);
-        var isUnitDetailSubSkill =
-            path.Contains("Unit_Detail_Rework", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/SubSkillArea/", StringComparison.OrdinalIgnoreCase);
-        var isQuestSubSkill =
-            path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase) &&
-            (path.Contains("/Quest_Challenge", StringComparison.OrdinalIgnoreCase) ||
-             path.Contains("/Quest_Story", StringComparison.OrdinalIgnoreCase) ||
-             path.Contains("/Quest_Event", StringComparison.OrdinalIgnoreCase) ||
-             path.Contains("/Quest_Daily", StringComparison.OrdinalIgnoreCase) ||
-             path.Contains("/Quest_Dungeon", StringComparison.OrdinalIgnoreCase)) &&
-            path.Contains("/SubSkill", StringComparison.OrdinalIgnoreCase);
-        var isAttachPopup =
-            path.Contains("Unit_Detail_AttachAbility", StringComparison.OrdinalIgnoreCase) &&
-            !path.Contains("/WindowBase/ScrollView/", StringComparison.OrdinalIgnoreCase);
-
-        return (isDeckSubSkill || isUnitDetailSubSkill || isQuestSubSkill || isAttachPopup) &&
-               path.Contains("SubSkillAttach", StringComparison.OrdinalIgnoreCase);
+        return path.Contains("/MessageWindow", StringComparison.OrdinalIgnoreCase) ||
+               path.Contains("/BackLog", StringComparison.OrdinalIgnoreCase) ||
+               path.Contains("/History", StringComparison.OrdinalIgnoreCase) ||
+               path.Contains("/Log", StringComparison.OrdinalIgnoreCase);
     }
-
-    private static bool IsUnitDetailCompactDescription(string path) =>
-        path.Contains("/Unit_Detail_Rework", StringComparison.OrdinalIgnoreCase) &&
-        ((path.Contains("/ExSkillArea/ExSkillTextArea/", StringComparison.OrdinalIgnoreCase) &&
-          path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)) ||
-         (path.Contains("/SkillDialog/SkillTextArea/", StringComparison.OrdinalIgnoreCase) &&
-          path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)) ||
-         (path.Contains("/SkillDialog/SubSkillTextArea", StringComparison.OrdinalIgnoreCase) &&
-          path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)) ||
-         (path.Contains("/StatusDialog/AwakeningBonusArea/", StringComparison.OrdinalIgnoreCase) &&
-          path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)) ||
-         (path.Contains("/StatusDialog/ClassChangeBonusArea/", StringComparison.OrdinalIgnoreCase) &&
-          path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)) ||
-         (path.Contains("/StatusDialog/RaceFeatureArea/", StringComparison.OrdinalIgnoreCase) &&
-          path.EndsWith("/Text", StringComparison.OrdinalIgnoreCase)));
 
     public static bool IsDialogueBackground(Graphic graphic)
     {
@@ -589,10 +574,8 @@ public static class UiHierarchyClassifier
 
         var path = GetHierarchyPath(graphic.transform);
         return path.Contains(
-            "MessageWindowManager/MessageWindow/RootChildren/",
-            StringComparison.OrdinalIgnoreCase) &&
-            (path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase) ||
-             path.Contains("Utage", StringComparison.OrdinalIgnoreCase));
+            "AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/",
+            StringComparison.Ordinal);
     }
 
     public static bool IsDialogueControlLabel(Text text)
@@ -601,9 +584,10 @@ public static class UiHierarchyClassifier
             return false;
 
         var path = GetHierarchyPath(text.transform);
-        return IsDialogueControlPath(path) &&
-               (path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("Utage", StringComparison.OrdinalIgnoreCase));
+        return path.Contains(
+                   "AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/",
+                   StringComparison.Ordinal) &&
+               IsDialogueControlPath(path);
     }
 
     public static bool IsDialogueControlPath(string path) =>
@@ -619,54 +603,34 @@ public static class UiHierarchyClassifier
     public static bool IsBackLogButtonBackground(Graphic graphic) =>
         graphic != null &&
         graphic.transform != null &&
-        GetHierarchyPath(graphic.transform).EndsWith(
-            "/BackLogButton", StringComparison.OrdinalIgnoreCase);
+        GetHierarchyPath(graphic.transform).EndsWith("/BackLogButton", StringComparison.OrdinalIgnoreCase);
 
-    public static bool TryGetStoryOutlineColor(
-        Text text,
-        Color darkOutlineColor,
-        out Color outlineColor)
+    public static bool TryGetStoryOutlineColor(Text text, Color darkOutlineColor, out Color outlineColor)
     {
         outlineColor = default;
         if (text == null || text.transform == null)
             return false;
 
         var path = GetHierarchyPath(text.transform);
-        var leaf = text.transform.name;
-        if (!IsStoryMessagePath(path, leaf))
+        if (!path.Contains(
+                "AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/MessageTexts/",
+                StringComparison.Ordinal))
+        {
             return false;
+        }
 
-        if (leaf.Equals("MessageText", StringComparison.OrdinalIgnoreCase))
+        if (path.EndsWith("/MessageText", StringComparison.OrdinalIgnoreCase))
         {
             outlineColor = Color.white;
             return true;
         }
 
-        if (leaf.Equals("NameText", StringComparison.OrdinalIgnoreCase))
+        if (path.EndsWith("/NameText", StringComparison.OrdinalIgnoreCase))
         {
             outlineColor = darkOutlineColor;
             return true;
         }
 
         return false;
-    }
-
-    private static string BuildHierarchyPath(Transform current, int maxNodes, out string leafName)
-    {
-        leafName = string.Empty;
-        if (current == null)
-            return string.Empty;
-
-        leafName = current.name ?? string.Empty;
-        var names = new List<string>(16);
-        var depth = 0;
-        while (current != null && (maxNodes <= 0 || depth < maxNodes))
-        {
-            names.Add(current.name);
-            current = current.parent;
-            depth++;
-        }
-        names.Reverse();
-        return string.Join("/", names);
     }
 }
