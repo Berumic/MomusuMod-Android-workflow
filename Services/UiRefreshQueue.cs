@@ -9,6 +9,7 @@ internal sealed class UiRefreshQueue<T> : IEnumerable<KeyValuePair<int, UiRefres
 {
     private readonly Dictionary<int, Entry> _entries = new();
     public int Count => _entries.Count;
+    public bool Contains(int id) => _entries.ContainsKey(id);
     public bool Enqueue(int id, T text, int readyFrame, bool activation)
     {
         if (_entries.TryGetValue(id, out var entry))

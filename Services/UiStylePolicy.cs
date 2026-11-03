@@ -1,23 +1,41 @@
-using UnityEngine;
 using System;
+using UnityEngine;
+
 namespace MonsterMusumeTDMod.Services;
+
 internal sealed class StyleValues
-    {
-        public Color? FontColor { get; set; }
-        public Color? OutlineColor { get; set; }
-        public Color? UnderlayColor { get; set; }
-        public float? OutlineWidth { get; set; }
-        public float? LineSpacing { get; set; }
-        public float? FaceDilate { get; set; }
-        public float? UnderlayOffsetX { get; set; }
-        public float? UnderlayOffsetY { get; set; }
-        public float? UnderlayDilate { get; set; }
-        public float? UnderlaySoftness { get; set; }
-        public bool? Outline { get; set; }
-        public bool? Underlay { get; set; }
-        public bool? TranslatedOnly { get; set; }
-        public string Font { get; set; }
-    }
+{
+    public Color? FontColor { get; set; }
+    public Color? OutlineColor { get; set; }
+    public Color? UnderlayColor { get; set; }
+    public float? OutlineWidth { get; set; }
+    public float? LineSpacing { get; set; }
+    public float? FaceDilate { get; set; }
+    public float? UnderlayOffsetX { get; set; }
+    public float? UnderlayOffsetY { get; set; }
+    public float? UnderlayDilate { get; set; }
+    public float? UnderlaySoftness { get; set; }
+    public bool? Outline { get; set; }
+    public bool? Underlay { get; set; }
+    public bool? TranslatedOnly { get; set; }
+    public string Font { get; set; }
+
+    public bool HasAnyValue =>
+        FontColor.HasValue ||
+        OutlineColor.HasValue ||
+        UnderlayColor.HasValue ||
+        OutlineWidth.HasValue ||
+        LineSpacing.HasValue ||
+        FaceDilate.HasValue ||
+        UnderlayOffsetX.HasValue ||
+        UnderlayOffsetY.HasValue ||
+        UnderlayDilate.HasValue ||
+        UnderlaySoftness.HasValue ||
+        Outline.HasValue ||
+        Underlay.HasValue ||
+        !string.IsNullOrEmpty(Font);
+}
+
 internal static class UiStylePolicy
 {
     // Button backgrounds may be invisible hit targets. Their alpha does not
@@ -29,6 +47,7 @@ internal static class UiStylePolicy
             return new Color(1f, 1f, 1f, 1f);
         return new Color(target.r, target.g, target.b, 1f);
     }
+
     public static string NormalizePath(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) return string.Empty;
@@ -47,8 +66,15 @@ internal static class UiStylePolicy
 
     public static StyleValues Resolve(StyleValues rule, StyleValues defaults, StyleValues baseline, bool translated)
     {
-        if (rule == null || ((rule.TranslatedOnly ?? defaults?.TranslatedOnly ?? false) && !translated))
+        var hasDefaults = defaults != null && defaults.HasAnyValue;
+        if (rule == null && !hasDefaults)
             return baseline;
+
+        var translatedOnly = rule?.TranslatedOnly ?? defaults?.TranslatedOnly ?? false;
+        if (translatedOnly && !translated)
+            return baseline;
+
+        rule ??= new StyleValues();
         defaults ??= new StyleValues();
         baseline ??= new StyleValues();
         return new StyleValues

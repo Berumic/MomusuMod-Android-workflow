@@ -1,5 +1,30 @@
 namespace UnityEngine
 {
+    public class Object
+    {
+        private static int _nextId;
+        private readonly int _instanceId = ++_nextId;
+        public int GetInstanceID() => _instanceId;
+    }
+    public class Component : Object
+    {
+        public Transform transform { get; set; }
+    }
+    public class Transform : Component
+    {
+        public string name { get; set; } = string.Empty;
+        public Transform parent { get; set; }
+    }
+    public class GameObject : Object
+    {
+        public Transform transform { get; } = new();
+        public string name { get => transform.name; set => transform.name = value; }
+    }
+    public static class Time
+    {
+        public static int frameCount { get; set; }
+        public static float unscaledTime { get; set; }
+    }
     public class AndroidJavaObject
     {
         public AndroidJavaObject() { }
@@ -13,13 +38,27 @@ namespace UnityEngine
         public T GetStatic<T>(string field) => default;
         public T CallStatic<T>(string method, params object[] args) => default;
     }
-    public readonly record struct Color(float r, float g, float b, float a);
-    public class MonoBehaviour { public MonoBehaviour(IntPtr pointer) { } }
+    public readonly record struct Color(float r, float g, float b, float a)
+    {
+        public static Color white => new(1f, 1f, 1f, 1f);
+    }
+    public class MonoBehaviour : Component { public MonoBehaviour(IntPtr pointer) { } }
     public class Material
     {
         public string[] shaderKeywords { get; set; }
         public bool IsKeywordEnabled(string keyword) => throw new NotSupportedException("Stripped Android ICall");
     }
+}
+namespace UnityEngine.UI
+{
+    public class Graphic : UnityEngine.Component { }
+    public class Image : Graphic { }
+    public class RawImage : Graphic { }
+    public class Text : Graphic { }
+}
+namespace Il2CppTMPro
+{
+    public class TMP_Text : UnityEngine.Component { }
 }
 namespace MonsterMusumeTDMod.Android
 {

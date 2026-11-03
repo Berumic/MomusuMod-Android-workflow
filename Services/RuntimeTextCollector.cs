@@ -6,6 +6,7 @@ using System.Linq;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 #if ANDROID
 using Il2CppTMPro;
@@ -18,7 +19,8 @@ using UnityEngine.UI;
 namespace MonsterMusumeTDMod.Services;
 
 /// <summary>
-/// Captures sub-skill names/descriptions from the complete runtime catalog.
+/// Captures sub-skill names/descriptions from the complete runtime catalog
+/// and appends untranslated UI strings on F8 without overwriting existing JSON structures.
 /// </summary>
 public sealed class RuntimeTextCollector
 {
@@ -52,11 +54,13 @@ public sealed class RuntimeTextCollector
         "魔法防御", "射程", "攻撃速度", "出撃コスト", "ブロック数", "移動速度"
     };
 
-    private static readonly Regex RichTextTag = new("<[^>]*>", RegexOptions.Compiled);
+    private static readonly Regex RichTextTag = new("<[^>]*>", RegexOptions.CultureInvariant);
+    private static readonly Regex NumberOrRichTextToken = new(@"<[^>]*>|\d+(?:[.,]\d+)?", RegexOptions.CultureInvariant);
 
     private readonly string _snapshotPath;
     private readonly string _missingPath;
     private readonly string _subSkillScanPath;
+    private readonly string _missingIndexPath;
     private readonly object _lock = new();
     private readonly HashSet<string> _subSkillScanObserved = new(StringComparer.Ordinal);
     private bool _subSkillScanActive;
@@ -66,6 +70,7 @@ public sealed class RuntimeTextCollector
         _snapshotPath = Path.Combine(translationsRoot, "ui_snapshot.tsv");
         _missingPath = Path.Combine(translationsRoot, "missing.json");
         _subSkillScanPath = Path.Combine(translationsRoot, "subskill_scan.tsv");
+        _missingIndexPath = Path.Combine(translationsRoot, "missing_index.json");
     }
 
     public void Observe(object instance, string source)
@@ -73,8 +78,8 @@ public sealed class RuntimeTextCollector
         if (instance is not Component component || !ContainsJapanese(source))
             return;
 
-        var hierarchy = GetHierarchy(component);
-        if (!IsCompleteSubSkillHierarchy(hierarchy) ||
+        var hierarchy = UiHierarchyClassifier.GetHierarchyPath(component, 12);
+        if (!UiHierarchyClassifier.IsCompleteSubSkillHierarchy(hierarchy) ||
             !LooksLikeSkillNameOrDescription(hierarchy, source))
             return;
 
@@ -146,21 +151,21 @@ public sealed class RuntimeTextCollector
         foreach (var text in Resources.FindObjectsOfTypeAll<TMP_Text>())
         {
             if (text != null && text.gameObject != null && text.gameObject.activeInHierarchy &&
-                IsCompleteSubSkillHierarchy(GetHierarchy(text)))
+                UiHierarchyClassifier.IsCompleteSubSkillHierarchy(UiHierarchyClassifier.GetHierarchyPath(text, 12)))
                 Observe(text, text.text);
         }
 
         foreach (var text in Resources.FindObjectsOfTypeAll<Text>())
         {
             if (text != null && text.gameObject != null && text.gameObject.activeInHierarchy &&
-                IsCompleteSubSkillHierarchy(GetHierarchy(text)))
+                UiHierarchyClassifier.IsCompleteSubSkillHierarchy(UiHierarchyClassifier.GetHierarchyPath(text, 12)))
                 Observe(text, text.text);
         }
     }
 
     /// <summary>
     /// Writes every active Japanese UI string for diagnosis and appends rows
-    /// not covered by a loaded translation rule to missing.json.
+    /// not covered by a loaded translation rule to missing.json or indexed files.
     /// </summary>
     public void CaptureActiveUiSnapshot(Func<string, bool> hasTranslation)
     {
@@ -175,7 +180,11 @@ public sealed class RuntimeTextCollector
         Func<string, string, bool> hasTranslation,
         Func<string, string> resolveCategory)
     {
-        var missingCandidates = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        // Preserves insertion order of discovered categories and strings.
+        var missingCandidates = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var routedCandidates = new Dictionary<string, Dictionary<string, List<string>>>(StringComparer.OrdinalIgnoreCase);
+        var missingIndexRules = LoadMissingIndexRules();
+
         try
         {
             var lines = new List<string>
@@ -194,11 +203,31 @@ public sealed class RuntimeTextCollector
             var observed = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (var text in Resources.FindObjectsOfTypeAll<TMP_Text>())
-            AddSnapshotLine(lines, observed, missingCandidates, hasTranslation, resolveCategory, "tmp", text, text?.text);
+                AddSnapshotLine(
+                    lines,
+                    observed,
+                    missingCandidates,
+                    routedCandidates,
+                    missingIndexRules,
+                    hasTranslation,
+                    resolveCategory,
+                    "tmp",
+                    text,
+                    text?.text);
             foreach (var subMesh in Resources.FindObjectsOfTypeAll<TMP_SubMeshUI>())
                 AddSubMeshSnapshotLine(lines, observed, subMesh);
             foreach (var text in Resources.FindObjectsOfTypeAll<Text>())
-            AddSnapshotLine(lines, observed, missingCandidates, hasTranslation, resolveCategory, "legacy", text, text?.text);
+                AddSnapshotLine(
+                    lines,
+                    observed,
+                    missingCandidates,
+                    routedCandidates,
+                    missingIndexRules,
+                    hasTranslation,
+                    resolveCategory,
+                    "legacy",
+                    text,
+                    text?.text);
             AddStoryRenderDiagnostics(lines, observed);
 
             Directory.CreateDirectory(Path.GetDirectoryName(_snapshotPath)!);
@@ -216,6 +245,7 @@ public sealed class RuntimeTextCollector
             try
             {
                 UpdateMissingFile(missingCandidates);
+                UpdateRoutedFiles(routedCandidates);
             }
             catch (Exception ex)
             {
@@ -235,10 +265,12 @@ public sealed class RuntimeTextCollector
         return false;
     }
 
-    private static void AddSnapshotLine(
+    private void AddSnapshotLine(
         ICollection<string> lines,
         ISet<string> observed,
-        IDictionary<string, HashSet<string>> missingCandidates,
+        IDictionary<string, List<string>> missingCandidates,
+        IDictionary<string, Dictionary<string, List<string>>> routedCandidates,
+        IReadOnlyList<KeyValuePair<string, string>> missingIndexRules,
         Func<string, string, bool> hasTranslation,
         Func<string, string> resolveCategory,
         string renderer,
@@ -246,106 +278,323 @@ public sealed class RuntimeTextCollector
         string source)
     {
         if (component == null || component.gameObject == null ||
-            !component.gameObject.activeInHierarchy || !ContainsJapanese(source))
+            !component.gameObject.activeInHierarchy ||
+            UiHierarchyClassifier.IsUiTextSoftOutlineLayer(component) ||
+            !ContainsJapanese(source))
             return;
 
+        var path = UiHierarchyClassifier.GetHierarchyPath(component, 64);
         var (fontName, materialName) = GetFontMetadata(component);
         var material = component is TMP_Text tmp ? tmp.fontSharedMaterial : null;
         var gradientDiagnostics = component is TMP_Text tmpText
             ? GetGradientDiagnostics(tmpText)
             : "\t\t\t\t\t\t";
-        var line = $"{renderer}\t{GetHierarchy(component, 64)}\t{EscapeForTsv(fontName)}\t" +
+        var line = $"{renderer}\t{path}\t{EscapeForTsv(fontName)}\t" +
                    $"{EscapeForTsv(materialName)}\t{EscapeForTsv(source)}\t\t\t\t\t" +
                    GetMaterialDiagnostics(material) + "\t\t\t\t\t\t\t" + gradientDiagnostics +
                    "\t" + GetSelectableDiagnostics(component) + "\t" + GetFaceDiagnostics(component);
         if (observed.Add(line))
             lines.Add(line);
 
-        var normalizedSource = NormalizeNewlines(source);
-        var path = GetHierarchy(component, 64);
-        if (hasTranslation == null || !hasTranslation(normalizedSource, path))
+        var normalizedSource = NormalizeNumbers(NormalizeNewlines(source));
+        // Skip components that are already displaying a translated value on screen
+        // or whose raw/numeric-template form is covered by loaded translation rules.
+        var alreadyTranslated =
+            TmpFontInstaller.IsCurrentlyTranslatedComponent(component, source) ||
+            (hasTranslation != null &&
+             (hasTranslation(source, path) || hasTranslation(normalizedSource, path)));
+        if (alreadyTranslated)
+            return;
+
+        var category = resolveCategory?.Invoke(path) ?? CreateStableUiCategory(path);
+        var routedFile = ResolveIndexedFile(path, missingIndexRules);
+        if (routedFile != null)
         {
-            var category = resolveCategory?.Invoke(path) ?? CreateStableUiCategory(path);
-            if (!missingCandidates.TryGetValue(category, out var values))
+            if (!routedCandidates.TryGetValue(routedFile, out var byCategory))
             {
-                values = new HashSet<string>(StringComparer.Ordinal);
-                missingCandidates[category] = values;
+                byCategory = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                routedCandidates[routedFile] = byCategory;
             }
-            values.Add(normalizedSource);
+            AddCandidate(byCategory, category, normalizedSource);
+        }
+        else
+        {
+            AddCandidate(missingCandidates, category, normalizedSource);
         }
     }
 
-    private void UpdateMissingFile(IReadOnlyDictionary<string, HashSet<string>> candidates)
+    private static void AddCandidate(
+        IDictionary<string, List<string>> target,
+        string category,
+        string source)
     {
-        var missing = new Dictionary<string, string>(StringComparer.Ordinal);
-        var pathMissing = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
-        if (File.Exists(_missingPath))
+        var key = string.IsNullOrEmpty(category) ? "$global" : category;
+        if (!target.TryGetValue(key, out var list))
+        {
+            list = new List<string>();
+            target[key] = list;
+        }
+        if (!list.Contains(source))
+            list.Add(source);
+    }
+
+    private void UpdateRoutedFiles(IReadOnlyDictionary<string, Dictionary<string, List<string>>> candidates)
+    {
+        foreach (var group in candidates)
+        {
+            var relative = group.Key.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+            var rootName = new DirectoryInfo(Path.GetDirectoryName(_missingPath)!).Name;
+            var rootPrefix = rootName + Path.DirectorySeparatorChar;
+            if (relative.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+                relative = relative[rootPrefix.Length..];
+            var translationsPrefix = "translations" + Path.DirectorySeparatorChar;
+            if (relative.StartsWith(translationsPrefix, StringComparison.OrdinalIgnoreCase))
+                relative = relative[translationsPrefix.Length..];
+            relative = relative.TrimStart(Path.DirectorySeparatorChar);
+            if (!relative.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                relative = Path.Combine(relative, "zh_Hans.json");
+            var path = Path.Combine(Path.GetDirectoryName(_missingPath)!, relative);
+
+            AppendCandidatesToJsonFile(path, group.Value, isMissingFile: false);
+        }
+    }
+
+    private void UpdateMissingFile(IReadOnlyDictionary<string, List<string>> candidates)
+    {
+        AppendCandidatesToJsonFile(_missingPath, candidates, isMissingFile: true);
+    }
+
+    /// <summary>
+    /// Non-destructively parses an existing translation/missing JSON file (supporting
+    /// "$global", "$globe", "$paths", nested path objects, and flat key-value tables)
+    /// and appends only new untranslated entries at the very end of the file.
+    /// </summary>
+    private static void AppendCandidatesToJsonFile(
+        string filePath,
+        IReadOnlyDictionary<string, List<string>> candidatesByCategory,
+        bool isMissingFile)
+    {
+        JsonObject root = null;
+        JsonObject originalRoot = null;
+        var hadExistingFile = File.Exists(filePath);
+        if (File.Exists(filePath))
         {
             try
             {
-                using var document = JsonDocument.Parse(File.ReadAllText(_missingPath, Encoding.UTF8));
-                foreach (var property in document.RootElement.EnumerateObject())
+                var existingText = File.ReadAllText(filePath, Encoding.UTF8);
+                if (!string.IsNullOrWhiteSpace(existingText))
                 {
-                    if (property.NameEquals("$paths") && property.Value.ValueKind == JsonValueKind.Object)
-                    {
-                        foreach (var pathProperty in property.Value.EnumerateObject())
+                    var parsed = JsonNode.Parse(
+                        existingText,
+                        nodeOptions: null,
+                        documentOptions: new JsonDocumentOptions
                         {
-                            var table = new Dictionary<string, string>(StringComparer.Ordinal);
-                            if (pathProperty.Value.ValueKind == JsonValueKind.Object)
-                                foreach (var row in pathProperty.Value.EnumerateObject())
-                                    if (row.Value.ValueKind == JsonValueKind.String)
-                                        table[row.Name] = row.Value.GetString() ?? string.Empty;
-                            pathMissing[pathProperty.Name] = table;
-                        }
-                    }
-                    else if (property.Value.ValueKind == JsonValueKind.String)
+                            CommentHandling = JsonCommentHandling.Skip,
+                            AllowTrailingCommas = true
+                        });
+                    root = parsed as JsonObject;
+                    if (root == null)
                     {
-                        missing[property.Name] = property.Value.GetString() ?? string.Empty;
+                        Core.Plugin.Log?.LogWarning(
+                            $"读取现有 JSON 失败（根节点不是对象），已停止更新以避免覆盖: {filePath}");
+                        return;
                     }
+
+                    // Keep an untouched copy of the parsed document.  F8 is an
+                    // append-only operation; this lets us verify below that a
+                    // merge never replaced an existing value or path table.
+                    originalRoot = JsonNode.Parse(
+                        existingText,
+                        nodeOptions: null,
+                        documentOptions: new JsonDocumentOptions
+                        {
+                            CommentHandling = JsonCommentHandling.Skip,
+                            AllowTrailingCommas = true
+                        }) as JsonObject;
                 }
             }
             catch (Exception ex)
             {
                 Core.Plugin.Log?.LogWarning(
-                    $"读取现有 missing.json 失败，已停止更新以避免覆盖: {ex.Message}");
+                    $"读取现有 JSON 失败，已停止更新以避免覆盖 ({filePath}): {ex.Message}");
                 return;
             }
         }
-        else
+
+        var isNewFile = root == null || root.Count == 0;
+        if (isNewFile)
         {
-            missing = new Dictionary<string, string>(StringComparer.Ordinal);
+            root = new JsonObject
+            {
+                ["$global"] = new JsonObject()
+            };
         }
 
+        var globalObj = (root["$global"] as JsonObject) ?? (root["$globe"] as JsonObject);
+        var pathsObj = root["$paths"] as JsonObject;
+
+        // Index all existing keys and path tables so existing translations or placeholders are never overwritten.
+        var existingGlobalKeys = new HashSet<string>(StringComparer.Ordinal);
+        var existingAllKeys = new HashSet<string>(StringComparer.Ordinal);
+        var existingPathObjects = new Dictionary<string, (JsonObject Parent, string PropertyName, JsonObject Table)>(
+            StringComparer.OrdinalIgnoreCase);
+
+        var hasAnyNestedPathObject = false;
+
+        void IndexContainer(JsonObject container, bool isDedicatedPathsContainer)
+        {
+            if (container == null)
+                return;
+
+            foreach (var pair in container)
+            {
+                if (pair.Value is JsonValue val && val.TryGetValue<string>(out _))
+                {
+                    if (!isDedicatedPathsContainer)
+                        existingGlobalKeys.Add(pair.Key);
+                    existingAllKeys.Add(pair.Key);
+                }
+                else if (pair.Value is JsonObject childObj &&
+                         !string.Equals(pair.Key, "$global", StringComparison.OrdinalIgnoreCase) &&
+                         !string.Equals(pair.Key, "$globe", StringComparison.OrdinalIgnoreCase) &&
+                         !string.Equals(pair.Key, "$paths", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasAnyNestedPathObject = true;
+                    var normalizedKey = UiStylePolicy.NormalizePath(pair.Key);
+                    if (!string.IsNullOrEmpty(normalizedKey))
+                        existingPathObjects[normalizedKey] = (container, pair.Key, childObj);
+                    existingPathObjects[pair.Key] = (container, pair.Key, childObj);
+
+                    foreach (var childPair in childObj)
+                    {
+                        if (childPair.Value is JsonValue)
+                            existingAllKeys.Add(childPair.Key);
+                    }
+                }
+            }
+        }
+
+        IndexContainer(root, isDedicatedPathsContainer: false);
+        IndexContainer(globalObj, isDedicatedPathsContainer: false);
+        IndexContainer(pathsObj, isDedicatedPathsContainer: true);
+
+        var flatContainer = globalObj ?? root;
+        var pathContainer = pathsObj ?? globalObj ?? root;
+        // Use path-object grouping for missing.json, new files, or any file that uses $global/$paths/nested path objects (like zh_Hans.json).
+        var usePathGrouping = isMissingFile || isNewFile || globalObj != null || pathsObj != null || hasAnyNestedPathObject;
+
         var added = 0;
-        foreach (var group in candidates.OrderBy(value => value.Key, StringComparer.OrdinalIgnoreCase))
+        foreach (var group in candidatesByCategory)
         {
             var category = string.IsNullOrEmpty(group.Key) ? "$global" : group.Key;
-            if (category == "$global")
+            if (!usePathGrouping || string.Equals(category, "$global", StringComparison.OrdinalIgnoreCase))
             {
-                foreach (var source in group.Value.OrderBy(value => value, StringComparer.Ordinal))
-                    if (missing.TryAdd(source, string.Empty)) added++;
+                foreach (var source in group.Value)
+                {
+                    if (string.IsNullOrEmpty(source) ||
+                        existingAllKeys.Contains(source) ||
+                        flatContainer.ContainsKey(source))
+                        continue;
+
+                    flatContainer[source] = string.Empty;
+                    existingGlobalKeys.Add(source);
+                    existingAllKeys.Add(source);
+                    added++;
+                }
+                continue;
+            }
+
+            var normalizedCategory = UiStylePolicy.NormalizePath(category);
+            if (existingPathObjects.TryGetValue(category, out var existingPathEntry) ||
+                (!string.IsNullOrEmpty(normalizedCategory) &&
+                 existingPathObjects.TryGetValue(normalizedCategory, out existingPathEntry)))
+            {
+                var addedToExistingPath = 0;
+                foreach (var source in group.Value)
+                {
+                    if (string.IsNullOrEmpty(source) ||
+                        existingGlobalKeys.Contains(source) ||
+                        existingPathEntry.Table.ContainsKey(source))
+                        continue;
+
+                    existingPathEntry.Table[source] = string.Empty;
+                    existingAllKeys.Add(source);
+                    added++;
+                    addedToExistingPath++;
+                }
+
+                // Move the updated path object to the very end of its parent container
+                // so newly appended entries always appear at the bottom of the file.
+                if (addedToExistingPath > 0)
+                {
+                    existingPathEntry.Parent.Remove(existingPathEntry.PropertyName);
+                    existingPathEntry.Parent[existingPathEntry.PropertyName] = existingPathEntry.Table;
+                }
             }
             else
             {
-                if (!pathMissing.TryGetValue(category, out var table))
+                // Never replace an existing scalar/object with a new path
+                // table.  A path collision can otherwise make a valid table
+                // disappear when the JsonObject indexer is assigned to.
+                if (pathContainer.ContainsKey(category) &&
+                    pathContainer[category] is not JsonObject)
                 {
-                    table = new Dictionary<string, string>(StringComparer.Ordinal);
-                    pathMissing[category] = table;
+                    Core.Plugin.Log?.LogWarning(
+                        $"F8 skipped path collision to preserve existing JSON: {filePath} ({category})");
+                    continue;
                 }
-                foreach (var source in group.Value.OrderBy(value => value, StringComparer.Ordinal))
-                    if (table.TryAdd(source, string.Empty)) added++;
+
+                JsonObject newPathTable = null;
+                foreach (var source in group.Value)
+                {
+                    if (string.IsNullOrEmpty(source) || existingAllKeys.Contains(source))
+                        continue;
+
+                    newPathTable ??= new JsonObject();
+                    if (newPathTable.ContainsKey(source))
+                        continue;
+
+                    newPathTable[source] = string.Empty;
+                    existingAllKeys.Add(source);
+                    added++;
+                }
+
+                if (newPathTable != null && newPathTable.Count > 0)
+                {
+                    pathContainer[category] = newPathTable;
+                    existingPathObjects[category] = (pathContainer, category, newPathTable);
+                    if (!string.IsNullOrEmpty(normalizedCategory))
+                        existingPathObjects[normalizedCategory] = (pathContainer, category, newPathTable);
+                }
             }
         }
 
         if (added == 0)
         {
-            Core.Plugin.Log?.LogInfo(
-                $"Missing UI translations: added=0, total={missing.Count} -> {_missingPath}");
+            if (isMissingFile)
+                Core.Plugin.Log?.LogInfo(
+                    $"Missing UI translations: added=0, existing={existingAllKeys.Count} -> {filePath}");
+            else
+                Core.Plugin.Log?.LogInfo(
+                    $"F8 indexed missing: added=0, existing={existingAllKeys.Count}, file={filePath}");
             return;
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(_missingPath)!);
-        var temporaryPath = _missingPath + ".tmp";
+        // Defensive invariant: if the file already contained an object, every
+        // original property (including nested path tables and non-string JSON
+        // values) must still be present with the same value before we replace
+        // it on disk.  This turns any future merge regression into a safe
+        // no-op instead of silently clearing translations.
+        if (hadExistingFile && originalRoot != null &&
+            !PreservesExistingJson(originalRoot, root))
+        {
+            Core.Plugin.Log?.LogError(
+                $"F8 merge rejected because existing JSON would be changed: {filePath}");
+            return;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+        var temporaryPath = filePath + ".tmp";
         var options = new JsonSerializerOptions
         {
             WriteIndented = true,
@@ -356,9 +605,9 @@ public sealed class RuntimeTextCollector
         {
             File.WriteAllText(
                 temporaryPath,
-                SerializeMissingFile(missing, pathMissing, options) + Environment.NewLine,
+                root.ToJsonString(options) + Environment.NewLine,
                 new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            File.Move(temporaryPath, _missingPath, overwrite: true);
+            File.Move(temporaryPath, filePath, overwrite: true);
         }
         finally
         {
@@ -366,21 +615,128 @@ public sealed class RuntimeTextCollector
                 File.Delete(temporaryPath);
         }
 
-        Core.Plugin.Log?.LogInfo(
-            $"Missing UI translations: added={added}, total={missing.Count} -> {_missingPath}");
+        if (isMissingFile)
+            Core.Plugin.Log?.LogInfo(
+                $"Missing UI translations: added={added}, total={existingAllKeys.Count} -> {filePath}");
+        else
+            Core.Plugin.Log?.LogInfo(
+                $"F8 indexed missing: added={added}, total={existingAllKeys.Count}, file={filePath}");
     }
 
-    private static string SerializeMissingFile(
-        IReadOnlyDictionary<string, string> global,
-        IReadOnlyDictionary<string, Dictionary<string, string>> paths,
-        JsonSerializerOptions options)
+    private static bool PreservesExistingJson(JsonObject original, JsonObject merged)
     {
-        var output = new Dictionary<string, object>(StringComparer.Ordinal);
-        foreach (var pair in global)
-            output[pair.Key] = pair.Value;
-        if (paths.Count > 0)
-            output["$paths"] = paths;
-        return JsonSerializer.Serialize(output, options);
+        foreach (var pair in original)
+        {
+            if (!merged.TryGetPropertyValue(pair.Key, out var mergedValue) ||
+                !PreservesExistingNode(pair.Value, mergedValue))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool PreservesExistingNode(JsonNode original, JsonNode merged)
+    {
+        if (original is JsonObject originalObject && merged is JsonObject mergedObject)
+        {
+            foreach (var pair in originalObject)
+            {
+                if (!mergedObject.TryGetPropertyValue(pair.Key, out var mergedValue) ||
+                    !PreservesExistingNode(pair.Value, mergedValue))
+                    return false;
+            }
+            return true;
+        }
+
+        if (original is JsonArray originalArray && merged is JsonArray mergedArray)
+        {
+            if (originalArray.Count != mergedArray.Count)
+                return false;
+            for (var index = 0; index < originalArray.Count; index++)
+                if (!PreservesExistingNode(originalArray[index], mergedArray[index]))
+                    return false;
+            return true;
+        }
+
+        if (original == null || merged == null)
+            return original == merged;
+
+        return string.Equals(
+            original.ToJsonString(),
+            merged.ToJsonString(),
+            StringComparison.Ordinal);
+    }
+
+    private IReadOnlyList<KeyValuePair<string, string>> LoadMissingIndexRules()
+    {
+        var indexPath = File.Exists(_missingIndexPath)
+            ? _missingIndexPath
+            : Path.Combine(Path.GetDirectoryName(_missingPath)!, "..", "missing_index.json");
+        if (!File.Exists(indexPath))
+            return Array.Empty<KeyValuePair<string, string>>();
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(indexPath, Encoding.UTF8));
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                return Array.Empty<KeyValuePair<string, string>>();
+
+            var rules = new List<KeyValuePair<string, string>>();
+            foreach (var row in document.RootElement.EnumerateObject())
+            {
+                if (row.Value.ValueKind != JsonValueKind.String)
+                    continue;
+                var key = row.Name.Replace('\\', '/').Trim('/');
+                var target = row.Value.GetString();
+                if (!string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(target))
+                    rules.Add(new KeyValuePair<string, string>(key, target));
+            }
+
+            rules.Sort((left, right) => right.Key.Length.CompareTo(left.Key.Length));
+            return rules;
+        }
+        catch (Exception ex)
+        {
+            Core.Plugin.Log?.LogWarning($"读取 missing_index.json 失败 ({indexPath}): {ex.Message}");
+            return Array.Empty<KeyValuePair<string, string>>();
+        }
+    }
+
+    private static string ResolveIndexedFile(
+        string path,
+        IReadOnlyList<KeyValuePair<string, string>> missingIndexRules)
+    {
+        if (missingIndexRules == null || missingIndexRules.Count == 0 || string.IsNullOrEmpty(path))
+            return null;
+
+        var normalizedPath = UiStylePolicy.NormalizePath(path);
+        foreach (var rule in missingIndexRules)
+        {
+            var key = rule.Key;
+            if (normalizedPath.Equals(key, StringComparison.OrdinalIgnoreCase) ||
+                normalizedPath.EndsWith("/" + key, StringComparison.OrdinalIgnoreCase) ||
+                normalizedPath.Contains("/" + key + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                Core.Plugin.Log?.LogInfo($"F8 index matched: {normalizedPath} -> {rule.Value}");
+                return rule.Value;
+            }
+        }
+
+        return null;
+    }
+
+    private static string NormalizeNumbers(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+
+        // Preserve all rich-text tags verbatim. Only numeric text outside
+        // tags becomes the reusable <num> placeholder; otherwise values such
+        // as <cspace=-2> would be corrupted into <cspace=-<num>>.
+        return NumberOrRichTextToken.Replace(value, match =>
+            match.Value.Length > 0 && match.Value[0] == '<'
+                ? match.Value
+                : "<num>");
     }
 
     public static string CreateStableUiCategory(string path)
@@ -423,7 +779,7 @@ public sealed class RuntimeTextCollector
         var fallbackMaterial = subMesh.fallbackMaterial;
         var fallbackSourceMaterial = subMesh.fallbackSourceMaterial;
         var renderingMaterial = subMesh.materialForRendering;
-        var line = $"tmp-submesh\t{GetHierarchy(subMesh, 64)}\t{EscapeForTsv(fontName)}\t" +
+        var line = $"tmp-submesh\t{UiHierarchyClassifier.GetHierarchyPath(subMesh, 64)}\t{EscapeForTsv(fontName)}\t" +
                    $"{EscapeForTsv(GetMaterialName(sharedMaterial))}\t{EscapeForTsv(source)}\t" +
                    $"{EscapeForTsv(GetMaterialName(fallbackMaterial))}\t" +
                    $"{EscapeForTsv(GetMaterialName(fallbackSourceMaterial))}\t" +
@@ -456,7 +812,7 @@ public sealed class RuntimeTextCollector
             !component.gameObject.activeInHierarchy)
             return;
 
-        var path = GetHierarchy(component, 64);
+        var path = UiHierarchyClassifier.GetHierarchyPath(component, 64);
         if (!path.Contains(
                 "AdvEngine/UI/MessageWindowManager",
                 StringComparison.OrdinalIgnoreCase))
@@ -523,7 +879,8 @@ public sealed class RuntimeTextCollector
 
     private static string GetFaceDiagnostics(Component component)
     {
-        if (component is not TMP_Text text) return "\t\t\t";
+        if (component is not TMP_Text text)
+            return "\t\t\t";
         try
         {
             var material = text.fontSharedMaterial;
@@ -568,7 +925,7 @@ public sealed class RuntimeTextCollector
         return $"{selectable.GetIl2CppType().Name}\t{selectable.interactable}\t" +
                $"{selectable.IsInteractable()}\t{selectable.transition}\t" +
                $"{FormatColor(selectable.colors.disabledColor)}\t" +
-               $"{(graphic != null ? EscapeForTsv(GetHierarchy(graphic, 64)) : "<none>")}\t" +
+               $"{(graphic != null ? EscapeForTsv(UiHierarchyClassifier.GetHierarchyPath(graphic, 64)) : "<none>")}\t" +
                $"{(graphic != null ? FormatColor(graphic.color) : "<none>")}\t" +
                $"{(graphic != null ? FormatColor(graphic.canvasRenderer.GetColor()) : "<none>")}";
     }
@@ -636,18 +993,6 @@ public sealed class RuntimeTextCollector
         return ("<unknown>", "<unknown>");
     }
 
-    private static bool IsCompleteSubSkillHierarchy(string hierarchy) =>
-        !string.IsNullOrEmpty(hierarchy) &&
-        ((hierarchy.Contains("unit_detail_rework", StringComparison.OrdinalIgnoreCase) &&
-          hierarchy.Contains("skilldialog", StringComparison.OrdinalIgnoreCase) &&
-          hierarchy.Contains("subskilltextarea", StringComparison.OrdinalIgnoreCase)) ||
-         IsAttachAbilitySubSkillHierarchy(hierarchy));
-
-    private static bool IsAttachAbilitySubSkillHierarchy(string hierarchy) =>
-        !string.IsNullOrEmpty(hierarchy) &&
-        hierarchy.Contains("unit_detail_attachability", StringComparison.OrdinalIgnoreCase) &&
-        hierarchy.Contains("windowbase/scrollview", StringComparison.OrdinalIgnoreCase);
-
     private static bool LooksLikeSkillNameOrDescription(string hierarchy, string source)
     {
         var candidate = source.Trim();
@@ -660,6 +1005,7 @@ public sealed class RuntimeTextCollector
             visibleText.Contains("サブスキルを選択", StringComparison.Ordinal) ||
             visibleText.Contains("セットする", StringComparison.Ordinal))
             return false;
+
         // Prefer named data fields when the prefab exposes them. Some game
         // versions put a SkillName inside a button, so this check must happen
         // before excluding generic control ancestors.
@@ -691,26 +1037,6 @@ public sealed class RuntimeTextCollector
             if (value.Contains(marker, StringComparison.OrdinalIgnoreCase))
                 return true;
         return false;
-    }
-
-    private static string GetHierarchy(Component component, int maxNodes = 12)
-    {
-        try
-        {
-            var names = new List<string>();
-            var current = component.transform;
-            while (current != null && names.Count < maxNodes)
-            {
-                names.Add(current.gameObject.name);
-                current = current.parent;
-            }
-            names.Reverse();
-            return string.Join("/", names);
-        }
-        catch
-        {
-            return string.Empty;
-        }
     }
 
     private static string EscapeForTsv(string source) =>

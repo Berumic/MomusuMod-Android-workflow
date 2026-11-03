@@ -30,6 +30,9 @@ public sealed class ModConfig
     public ConfigEntry<string> TranslationUpdateBaseUrl { get; }
     public ConfigEntry<string> TranslationAssetUpdateBaseUrl { get; }
     public ConfigEntry<int> TranslationUpdateTimeoutSeconds { get; }
+    public ConfigEntry<int> TranslationUpdateConcurrentDownloads { get; }
+    public ConfigEntry<string> TranslationUpdateProxyUrl { get; }
+    public ConfigEntry<bool> TranslationUpdateDirectConnection { get; }
 
     public ModConfig(ConfigFile config)
     {
@@ -107,7 +110,16 @@ public sealed class ModConfig
             "Translation.Update",
             "TimeoutSeconds",
             10,
-            "单次网络请求超时秒数（建议 3 至 60）");
+            "网络请求连续无数据超时秒数（建议 3 至 60）；每次收到数据重置计时，单个请求总时长上限为 600 秒");
+        TranslationUpdateProxyUrl = config.Bind(
+            "Translation.Update", "ProxyUrl", "",
+            "更新代理地址；留空使用系统代理。例：http://127.0.0.1:7890。DirectConnection=true 时忽略此项");
+        TranslationUpdateConcurrentDownloads = config.Bind(
+            "Translation.Update", "ConcurrentDownloads", 8,
+            "同时下载的翻译文件数量（1 至 16，默认 8）；过高可能导致带宽竞争或服务器限流");
+        TranslationUpdateDirectConnection = config.Bind(
+            "Translation.Update", "DirectConnection", false,
+            "启用后更新强制直连，不读取系统代理，也不使用 ProxyUrl；失败跳过本次更新，保留本地文件");
     }
 
     public void Reload() => _config.Reload();

@@ -1,11 +1,12 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using MonsterMusumeTDMod.Core;
 
 namespace MonsterMusumeTDMod.Services;
@@ -14,24 +15,26 @@ public sealed class TranslationManager
 {
     private const string NumberPlaceholder = "<num>";
     private const string ExPlaceholder = "<ex>";
+    private const int UiResultCapacity = 1024;
+    private const int MinSubSkillFragmentLength = 4;
+    private const int MinStoryFragmentLength = 6;
+
     private readonly string _root;
     private readonly ModConfig _config;
-    private readonly ConcurrentDictionary<string, Dictionary<string, string>> _scenarios = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _names = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _uiTexts = new(StringComparer.Ordinal);
-    // UI results depend on both text and path. Bound retained runtime strings;
-    // misses are cached too, and every table reload invalidates both kinds.
-    private readonly BoundedLruCache<(string Source, string Path), (bool Matched, string Value)> _uiResults = new(UiResultCapacity);
-    private readonly BoundedLruCache<(string Source, string Path), (bool Matched, string Value)> _subSkillResults = new(UiResultCapacity);
-    private readonly BoundedLruCache<(string Value, int Kind), bool> _knownResults = new(2048);
-    private const int UiResultCapacity = 1024;
+
+    // Two-generation cache: when primary reaches capacity, demote to secondary
+    // instead of wiping all cached UI translations at once.
+    private Dictionary<(string Source, string Path), (bool Matched, string Value)> _uiResultsPrimary = new(UiResultCapacity);
+    private Dictionary<(string Source, string Path), (bool Matched, string Value)> _uiResultsSecondary = new(UiResultCapacity);
+    private Dictionary<(string Source, string Path), (bool Matched, string Value)> _subSkillResultsPrimary = new(UiResultCapacity);
+    private Dictionary<(string Source, string Path), (bool Matched, string Value)> _subSkillResultsSecondary = new(UiResultCapacity);
+
     private readonly List<UiPathTable> _uiPathTables = new();
     private readonly Dictionary<string, List<UiPathTable>>
         _uiPathTablesByLeaf = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _subSkills = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, string> _fallback = new(StringComparer.Ordinal);
-    private readonly StoryTranslationIndex _storyParseIndex = new();
-    private readonly StoryTranslationIndex _storyDisplayIndex = new();
     private readonly List<SceneTemplate> _nameSceneTemplates = new();
     private readonly List<SceneTemplate> _uiSceneTemplates = new();
     private readonly List<SceneTemplate> _subSkillSceneTemplates = new();
@@ -41,32 +44,31 @@ public sealed class TranslationManager
     private readonly List<NumberTemplate> _subSkillNumberTemplates = new();
     private readonly List<ExTemplate> _subSkillExTemplates = new();
     private readonly Dictionary<char, List<KeyValuePair<string, string>>> _subSkillFragmentIndex = new();
-    private readonly Dictionary<char, List<KeyValuePair<string, string>>> _storyFragmentIndex = new();
-    private readonly ConcurrentDictionary<string, Dictionary<char, List<KeyValuePair<string, string>>>>
-        _scenarioFragmentIndexes = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, string> _scenarioPaths = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<string>> _r18ResourceScenarioIds = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<StorySourceEntry>> _storySourceIndex = new(StringComparer.Ordinal);
     private readonly HashSet<string> _knownTranslationValues = new(StringComparer.Ordinal);
     private readonly HashSet<string> _knownNameTranslationValues = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _knownStoryTranslationValues = new(StringComparer.Ordinal);
     private readonly HashSet<string> _knownUiTextTranslationValues = new(StringComparer.Ordinal);
     private readonly HashSet<string> _knownSubSkillTranslationValues = new(StringComparer.Ordinal);
     private readonly RuntimeTextCollector _runtimeTextCollector;
-    private List<string> _inferredScenarioIds;
-    private bool _inferenceStopped;
-    private string _lastLoggedInferredScenarioId;
-    private static readonly Regex R18ScenarioIdPattern = new(
-        @"^(?<base>\d+)[a-z]\d+_(?:nml|r18)$",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled
-    );
-    private static readonly Regex ResourceNumberPattern = new(
-        @"(?:r18|nml)_(?<base>\d+)(?:_|$)",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled
-    );
+
+    // Immutable copy-on-write snapshot for background scenario loading.
+    // Main thread reads Volatile.Read(ref _scenarioSnapshot) without locking or mutating live dictionaries.
+    private ScenarioSnapshot _scenarioSnapshot = new();
+    private Task _scenarioLoadTask;
+
+    private sealed class ScenarioSnapshot
+    {
+        public readonly Dictionary<string, string> ScenarioPaths = new(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, string> Fallback = new(StringComparer.Ordinal);
+        public readonly StoryTranslationIndex StoryParseIndex = new();
+        public readonly StoryTranslationIndex StoryDisplayIndex = new();
+        public readonly Dictionary<char, List<KeyValuePair<string, string>>> StoryFragmentIndex = new();
+        public readonly HashSet<string> KnownStoryTranslationValues = new(StringComparer.Ordinal);
+        public bool IsLoaded;
+    }
+
     private static readonly Regex UtageDisplayControlTag = new(
         @"</?(?:interval|speed|sound)(?:=[^>]*)?>",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
     );
 
     public TranslationManager(string pluginRoot, ModConfig config)
@@ -78,9 +80,21 @@ public sealed class TranslationManager
 
     public void LoadStatic()
     {
-        _uiResults.Clear();
-        _subSkillResults.Clear();
-        _knownResults.Clear();
+        var loadTimer = Stopwatch.StartNew();
+
+        // Wait for any previous in-flight background scenario load before starting a new one.
+        var previousTask = Volatile.Read(ref _scenarioLoadTask);
+        if (previousTask != null && !previousTask.IsCompleted)
+        {
+            try { previousTask.GetAwaiter().GetResult(); }
+            catch { }
+        }
+
+        UiHierarchyClassifier.ClearCache();
+        _uiResultsPrimary.Clear();
+        _uiResultsSecondary.Clear();
+        _subSkillResultsPrimary.Clear();
+        _subSkillResultsSecondary.Clear();
         _names.Clear();
         _nameExTemplates.Clear();
         _nameSceneTemplates.Clear();
@@ -92,10 +106,12 @@ public sealed class TranslationManager
         _uiSceneTemplates.Clear();
         _knownTranslationValues.Clear();
         _knownNameTranslationValues.Clear();
-        _knownStoryTranslationValues.Clear();
         _knownUiTextTranslationValues.Clear();
         _knownSubSkillTranslationValues.Clear();
-        foreach (var pair in ReadTable(Path.Combine(_root, "names", $"{_config.Language.Value}.json")))
+
+        var language = _config.Language.Value;
+
+        foreach (var pair in ReadTable(Path.Combine(_root, "names", $"{language}.json")))
         {
             if (TryParseSceneMarker(pair.Key, out var scenePath, out var sceneSource))
             {
@@ -115,15 +131,18 @@ public sealed class TranslationManager
                 _knownNameTranslationValues.Add(pair.Value);
         }
         _nameSceneTemplates.Sort((left, right) => right.SourceLength.CompareTo(left.SourceLength));
+        SortExTemplates(_nameExTemplates);
+
         var uiCanvasRoot = Path.Combine(_root, "UICanvas");
         if (Directory.Exists(uiCanvasRoot))
         {
             foreach (var path in Directory.EnumerateFiles(
                 uiCanvasRoot,
-                $"{_config.Language.Value}.json",
+                $"{language}.json",
                 SearchOption.AllDirectories))
             {
-                foreach (var pair in ReadTable(path))
+                ReadUiFile(path, out var globalEntries, out var pathTables);
+                foreach (var pair in globalEntries)
                 {
                     if (TryParseSceneMarker(pair.Key, out var scenePath, out var sceneSource))
                     {
@@ -136,8 +155,6 @@ public sealed class TranslationManager
                         continue;
                     }
 
-                    // Complete rows win first at lookup time; remaining rows
-                    // are also indexed for longest-first UI fragments.
                     if (!string.IsNullOrEmpty(pair.Value))
                     {
                         if (_uiTexts.ContainsKey(pair.Key))
@@ -153,36 +170,32 @@ public sealed class TranslationManager
                     }
                 }
 
-                foreach (var pathTable in ReadUiPathTables(path))
+                foreach (var pathTable in pathTables)
                 {
                     _uiPathTables.Add(pathTable);
-                    // Path names are metadata/categories only. Register the
-                    // child rows in the global UI index as well so a TMP
-                    // setter can translate immediately, before Unity has
-                    // finished attaching the final hierarchy.
                     foreach (var pair in pathTable.Exact)
                     {
                         if (string.IsNullOrEmpty(pair.Value))
                             continue;
-                        if (!_uiTexts.ContainsKey(pair.Key))
+                        if (_uiTexts.TryAdd(pair.Key, pair.Value))
                         {
-                            _uiTexts.Add(pair.Key, pair.Value);
-                            AddNumberTemplate(_uiNumberTemplates, pair.Key, pair.Value);
-                            AddExTemplate(_uiExTemplates, pair.Key, pair.Value);
+                            if (pair.Key.Contains(NumberPlaceholder, StringComparison.Ordinal))
+                                _uiNumberTemplates.Add(new NumberTemplate(pair.Key, pair.Value));
+                            if (pair.Key.Contains(ExPlaceholder, StringComparison.Ordinal))
+                                AddExTemplate(_uiExTemplates, pair.Key, pair.Value);
                         }
-                    }
-                    foreach (var value in pathTable.Exact.Values)
-                    {
-                        if (!string.IsNullOrEmpty(value))
-                        {
-                            AddKnownTranslationValue(value);
-                            _knownUiTextTranslationValues.Add(value);
-                        }
+                        AddKnownTranslationValue(pair.Value);
+                        _knownUiTextTranslationValues.Add(pair.Value);
+                        var normalizedVal = NormalizeSubSkillKey(pair.Value);
+                        if (!ReferenceEquals(normalizedVal, pair.Value))
+                            _knownUiTextTranslationValues.Add(normalizedVal);
                     }
                 }
             }
         }
         _uiSceneTemplates.Sort((left, right) => right.SourceLength.CompareTo(left.SourceLength));
+        SortNumberTemplates(_uiNumberTemplates);
+        SortExTemplates(_uiExTemplates);
         _uiPathTables.Sort((left, right) => right.Path.Length.CompareTo(left.Path.Length));
         foreach (var pathTable in _uiPathTables)
         {
@@ -194,15 +207,14 @@ public sealed class TranslationManager
             }
             candidates.Add(pathTable);
         }
+
         _subSkills.Clear();
         _subSkillNumberTemplates.Clear();
         _subSkillExTemplates.Clear();
         _subSkillSceneTemplates.Clear();
         _subSkillFragmentIndex.Clear();
-        foreach (var pair in ReadTable(Path.Combine(_root, "subskills", $"{_config.Language.Value}.json")))
+        foreach (var pair in ReadTable(Path.Combine(_root, "subskills", $"{language}.json")))
         {
-            // A blank entry is a worklist placeholder, never a usable
-            // translation.
             if (!string.IsNullOrEmpty(pair.Value))
             {
                 if (TryParseSceneMarker(pair.Key, out var scenePath, out var sceneSource))
@@ -217,107 +229,142 @@ public sealed class TranslationManager
                 _subSkills[normalizedKey] = pair.Value;
                 AddNumberTemplate(_subSkillNumberTemplates, normalizedKey, pair.Value);
                 AddExTemplate(_subSkillExTemplates, normalizedKey, pair.Value);
-                AddFragmentRule(_subSkillFragmentIndex, normalizedKey, pair.Value);
+                AddFragmentRule(_subSkillFragmentIndex, normalizedKey, pair.Value, MinSubSkillFragmentLength);
                 AddKnownTranslationValue(pair.Value);
                 _knownSubSkillTranslationValues.Add(pair.Value);
             }
         }
         _subSkillSceneTemplates.Sort((left, right) => right.SourceLength.CompareTo(left.SourceLength));
+        SortNumberTemplates(_subSkillNumberTemplates);
+        SortExTemplates(_subSkillExTemplates);
         SortFragmentIndex(_subSkillFragmentIndex);
-        _scenarios.Clear();
-        _scenarioFragmentIndexes.Clear();
-        _scenarioPaths.Clear();
-        _r18ResourceScenarioIds.Clear();
-        _storySourceIndex.Clear();
-        _fallback.Clear();
-        _storyParseIndex.Clear();
-        _storyDisplayIndex.Clear();
-        _storyFragmentIndex.Clear();
-        ResetInferredStoryScenario();
+
+        Core.Plugin.Log?.LogInfo(
+            $"Loaded UI/names/sub-skill tables in {loadTimer.ElapsedMilliseconds} ms " +
+            $"(names={_names.Count}, ui={_uiTexts.Count}, subskills={_subSkills.Count})");
+
         var scenarioRoot = Path.Combine(_root, "scenarios");
-        if (Directory.Exists(scenarioRoot))
+        // Publish an unloaded snapshot before starting the replacement task. This
+        // prevents readers during a reload from accepting the previous generation
+        // as complete and observing stale story translations.
+        Volatile.Write(ref _scenarioSnapshot, new ScenarioSnapshot());
+        var loadTask = Task.Run(() => LoadScenariosCore(scenarioRoot, language));
+        Volatile.Write(ref _scenarioLoadTask, loadTask);
+    }
+
+    private void LoadScenariosCore(string scenarioRoot, string language)
+    {
+        var scenarioTimer = Stopwatch.StartNew();
+        var snapshot = new ScenarioSnapshot();
+        try
         {
+            ResetInferredStoryScenario();
+
+            if (!Directory.Exists(scenarioRoot))
+                return;
+
             var scenarioIdsWithTranslations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var promotedStoryTranslations = 0;
-            foreach (var path in Directory.EnumerateFiles(scenarioRoot, $"{_config.Language.Value}.json", SearchOption.AllDirectories))
+            foreach (var path in Directory.EnumerateFiles(scenarioRoot, $"{language}.json", SearchOption.AllDirectories))
             {
                 var table = ReadTable(path);
-                // Translation sets can be arranged below category folders
-                // (for example qinshi/<character>/<scenario-id>). Keep an
-                // ID index that prefers a populated categorized file over an
-                // empty generated file with the same scenario ID.
                 var scenarioId = Path.GetFileName(Path.GetDirectoryName(path));
+                var hasTranslations = false;
+                foreach (var val in table.Values)
+                {
+                    if (!string.IsNullOrEmpty(val))
+                    {
+                        hasTranslations = true;
+                        break;
+                    }
+                }
+
                 if (!string.IsNullOrEmpty(scenarioId))
                 {
-                    var hasTranslations = table.Values.Any(value => !string.IsNullOrEmpty(value));
-                    if (!_scenarioPaths.ContainsKey(scenarioId) ||
+                    if (!snapshot.ScenarioPaths.ContainsKey(scenarioId) ||
                         (hasTranslations && !scenarioIdsWithTranslations.Contains(scenarioId)))
-                        _scenarioPaths[scenarioId] = path;
+                        snapshot.ScenarioPaths[scenarioId] = path;
                     if (hasTranslations)
                         scenarioIdsWithTranslations.Add(scenarioId);
-                    IndexR18ResourceScenario(scenarioId);
                 }
 
                 foreach (var pair in table)
                 {
-                    var parseKey = NormalizeSubSkillKey(pair.Key);
-                    _storyParseIndex.Add(scenarioId, parseKey, pair.Value);
-                    _storyDisplayIndex.Add(scenarioId, parseKey, pair.Value);
-                    _storyDisplayIndex.Add(scenarioId, NormalizeStoryDisplayValue(pair.Key), pair.Value);
-                    // Values are registered only to identify nested setter
-                    // writebacks. Preserve the first usable global mapping,
-                    // but never let an empty duplicate shadow a later
-                    // translated row from a categorized directory.
-                    AddKnownTranslationValue(pair.Value);
-                    AddKnownStoryTranslationValue(pair.Value);
-                    if (!string.IsNullOrEmpty(scenarioId))
-                        IndexStorySource(scenarioId, pair.Key, pair.Value);
-                    if (_fallback.TryAdd(pair.Key, pair.Value))
+                    if (string.IsNullOrEmpty(pair.Value))
                     {
-                        AddStoryFragment(pair.Key, pair.Value);
+                        snapshot.Fallback.TryAdd(pair.Key, string.Empty);
+                        continue;
                     }
-                    else if (string.IsNullOrEmpty(_fallback[pair.Key]) &&
-                             !string.IsNullOrEmpty(pair.Value))
+
+                    var parseKey = NormalizeSubSkillKey(pair.Key);
+                    snapshot.StoryParseIndex.Add(scenarioId, parseKey, pair.Value);
+                    var displayKey = NormalizeStoryDisplayValue(parseKey);
+                    if (!ReferenceEquals(displayKey, parseKey) &&
+                        !string.Equals(displayKey, parseKey, StringComparison.Ordinal))
                     {
-                        _fallback[pair.Key] = pair.Value;
-                        AddStoryFragment(pair.Key, pair.Value);
+                        snapshot.StoryDisplayIndex.Add(scenarioId, displayKey, pair.Value);
+                    }
+
+                    AddKnownStoryTranslationValue(snapshot.KnownStoryTranslationValues, pair.Value);
+
+                    if (!snapshot.Fallback.TryGetValue(pair.Key, out var existingFallback))
+                    {
+                        snapshot.Fallback.Add(pair.Key, pair.Value);
+                    }
+                    else if (string.IsNullOrEmpty(existingFallback))
+                    {
+                        snapshot.Fallback[pair.Key] = pair.Value;
                         promotedStoryTranslations++;
                     }
 
-                    // UTAGE may normalize line endings differently from the
-                    // JSON reader. Keep a second exact key for the normalized
-                    // form so the translated row is available before UTAGE
-                    // parses <interval> and other timing tags. This must be
-                    // an exact-key alias only; story wildcard matching stays
-                    // out of the pre-parse path.
-                    var normalizedStoryKey = NormalizeSubSkillKey(pair.Key);
-                    if (!string.Equals(normalizedStoryKey, pair.Key, StringComparison.Ordinal))
+                    if (!ReferenceEquals(parseKey, pair.Key) &&
+                        !string.Equals(parseKey, pair.Key, StringComparison.Ordinal))
                     {
-                        if (_fallback.TryAdd(normalizedStoryKey, pair.Value))
+                        if (!snapshot.Fallback.TryGetValue(parseKey, out var existingNormalized) ||
+                            string.IsNullOrEmpty(existingNormalized))
                         {
-                            AddStoryFragment(normalizedStoryKey, pair.Value);
-                        }
-                        else if (string.IsNullOrEmpty(_fallback[normalizedStoryKey]) &&
-                                 !string.IsNullOrEmpty(pair.Value))
-                        {
-                            _fallback[normalizedStoryKey] = pair.Value;
-                            AddStoryFragment(normalizedStoryKey, pair.Value);
+                            snapshot.Fallback[parseKey] = pair.Value;
                         }
                     }
                 }
             }
 
-            foreach (var candidates in _storyFragmentIndex.Values)
+            foreach (var pair in snapshot.Fallback)
             {
-                candidates.RemoveAll(pair => !_storyParseIndex.TryGet(
-                    NormalizeSubSkillKey(pair.Key), null, out _, out _));
-                candidates.Sort((left, right) => right.Key.Length.CompareTo(left.Key.Length));
+                if (string.IsNullOrEmpty(pair.Value))
+                    continue;
+                var parseKey = NormalizeSubSkillKey(pair.Key);
+                if (snapshot.StoryParseIndex.TryGet(parseKey, null, out _, out _))
+                    AddFragmentRule(snapshot.StoryFragmentIndex, pair.Key, pair.Value, MinStoryFragmentLength);
             }
+            SortFragmentIndex(snapshot.StoryFragmentIndex);
 
             Core.Plugin.Log?.LogInfo(
-                $"Loaded {_fallback.Count} unique story row(s); " +
+                $"Loaded {snapshot.Fallback.Count} unique story row(s) in {scenarioTimer.ElapsedMilliseconds} ms; " +
                 $"promoted {promotedStoryTranslations} translated duplicate(s) over empty rows");
         }
+        catch (Exception ex)
+        {
+            Core.Plugin.Log?.LogWarning($"加载剧情翻译表失败: {ex.Message}");
+        }
+        finally
+        {
+            snapshot.IsLoaded = true;
+            Volatile.Write(ref _scenarioSnapshot, snapshot);
+        }
+    }
+
+    private ScenarioSnapshot GetLoadedScenarioSnapshot()
+    {
+        var snapshot = Volatile.Read(ref _scenarioSnapshot);
+        if (snapshot.IsLoaded)
+            return snapshot;
+
+        var task = Volatile.Read(ref _scenarioLoadTask);
+        if (task != null && !task.IsCompleted)
+            task.GetAwaiter().GetResult();
+
+        return Volatile.Read(ref _scenarioSnapshot);
     }
 
     public bool TryTranslateName(string source, out string translated)
@@ -329,6 +376,21 @@ public sealed class TranslationManager
         if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
             return false;
 
+        if (TryTranslateNameCore(source, scenePath, out translated))
+        {
+            if (!string.IsNullOrEmpty(translated))
+            {
+                AddKnownTranslationValue(translated);
+                _knownNameTranslationValues.Add(translated);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private bool TryTranslateNameCore(string source, string scenePath, out string translated)
+    {
+        translated = source;
         if (TryTranslateSceneTemplate(source, scenePath, _nameSceneTemplates, out translated))
             return true;
 
@@ -396,16 +458,52 @@ public sealed class TranslationManager
         if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
             return false;
         if (source.Length > 8192 || (scenePath?.Length ?? 0) > 4096)
-            return TryTranslateUiTextCore(source, scenePath, out translated);
+        {
+            var matchedLong = TryTranslateUiTextCore(source, scenePath, out translated);
+            if (matchedLong && !string.IsNullOrEmpty(translated))
+            {
+                AddKnownTranslationValue(translated);
+                _knownUiTextTranslationValues.Add(translated);
+                _knownUiTextTranslationValues.Add(NormalizeSubSkillKey(translated));
+            }
+            return matchedLong;
+        }
+
         var key = (source, scenePath ?? string.Empty);
-        if (_uiResults.TryGetValue(key, out var cached))
+        if (_uiResultsPrimary.TryGetValue(key, out var cached))
         {
             translated = cached.Value;
             return cached.Matched;
         }
+
+        if (_uiResultsSecondary.TryGetValue(key, out cached))
+        {
+            PromoteOrInsertUiCache(key, cached);
+            translated = cached.Value;
+            return cached.Matched;
+        }
+
         var matched = TryTranslateUiTextCore(source, scenePath, out translated);
-        _uiResults.Set(key, (matched, translated));
+        if (matched && !string.IsNullOrEmpty(translated))
+        {
+            AddKnownTranslationValue(translated);
+            _knownUiTextTranslationValues.Add(translated);
+            _knownUiTextTranslationValues.Add(NormalizeSubSkillKey(translated));
+        }
+        PromoteOrInsertUiCache(key, (matched, translated));
         return matched;
+    }
+
+    private void PromoteOrInsertUiCache(
+        (string Source, string Path) key,
+        (bool Matched, string Value) entry)
+    {
+        if (_uiResultsPrimary.Count >= UiResultCapacity)
+        {
+            _uiResultsSecondary.Clear();
+            (_uiResultsPrimary, _uiResultsSecondary) = (_uiResultsSecondary, _uiResultsPrimary);
+        }
+        _uiResultsPrimary[key] = entry;
     }
 
     private bool TryTranslateUiTextCore(string source, string scenePath, out string translated)
@@ -438,16 +536,14 @@ public sealed class TranslationManager
         if (TryTranslateExTemplate(source, _uiExTemplates, TryTranslateCapturedUiText, out translated))
             return true;
 
-        // TMP descriptions may be populated with CRLF while JSON source
-        // tables use LF. Normalize only for a second complete-row lookup.
         var normalizedSource = NormalizeSubSkillKey(source);
-        if (string.Equals(normalizedSource, source, StringComparison.Ordinal))
+        if (ReferenceEquals(normalizedSource, source) ||
+            string.Equals(normalizedSource, source, StringComparison.Ordinal))
         {
             translated = source;
             return false;
         }
-        if (!string.Equals(normalizedSource, source, StringComparison.Ordinal) &&
-            TryTranslateSceneTemplate(normalizedSource, scenePath, _uiSceneTemplates, out translated))
+        if (TryTranslateSceneTemplate(normalizedSource, scenePath, _uiSceneTemplates, out translated))
             return true;
 
         if (TryTranslateUiPath(normalizedSource, scenePath, out translated))
@@ -526,15 +622,8 @@ public sealed class TranslationManager
         fullPath.EndsWith("/" + categoryPath, StringComparison.OrdinalIgnoreCase) ||
         fullPath.Contains("/" + categoryPath + "/", StringComparison.OrdinalIgnoreCase);
 
-    private static string NormalizeUiPath(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return string.Empty;
-        var parts = path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
-        for (var i = 0; i < parts.Length; i++)
-            parts[i] = parts[i].Replace("(Clone)", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return string.Join('/', parts);
-    }
+    private static string NormalizeUiPath(string path) =>
+        UiStylePolicy.NormalizePath(path);
 
     public bool TryTranslateSubSkill(string source, out string translated)
         => TryTranslateSubSkill(source, null, out translated);
@@ -542,26 +631,53 @@ public sealed class TranslationManager
     public bool TryTranslateSubSkill(string source, string scenePath, out string translated)
     {
         translated = source;
-        if (!_config.Enabled.Value || string.IsNullOrEmpty(source)) return false;
-        if (source.Length > 8192 || (scenePath?.Length ?? 0) > 4096)
-            return TryTranslateSubSkillCore(source, scenePath, out translated);
-        var key = (source, scenePath ?? string.Empty);
-        if (_subSkillResults.TryGetValue(key, out var cached))
+        if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
+            return false;
+
+        if (source.Length <= 8192 && (scenePath?.Length ?? 0) <= 4096)
         {
-            translated = cached.Value;
-            return cached.Matched;
+            var cacheKey = (source, scenePath ?? string.Empty);
+            if (_subSkillResultsPrimary.TryGetValue(cacheKey, out var cached))
+            {
+                translated = cached.Value;
+                return cached.Matched;
+            }
+            if (_subSkillResultsSecondary.TryGetValue(cacheKey, out cached))
+            {
+                PromoteOrInsertSubSkillCache(cacheKey, cached);
+                translated = cached.Value;
+                return cached.Matched;
+            }
+
+            var matched = TryTranslateSubSkillCore(source, scenePath, out translated);
+            if (matched && !string.IsNullOrEmpty(translated))
+            {
+                AddKnownTranslationValue(translated);
+                _knownSubSkillTranslationValues.Add(translated);
+                _knownSubSkillTranslationValues.Add(NormalizeSubSkillKey(translated));
+            }
+            PromoteOrInsertSubSkillCache(cacheKey, (matched, translated));
+            return matched;
         }
-        var matched = TryTranslateSubSkillCore(source, scenePath, out translated);
-        _subSkillResults.Set(key, (matched, translated));
-        return matched;
+
+        return TryTranslateSubSkillCore(source, scenePath, out translated);
+    }
+
+    private void PromoteOrInsertSubSkillCache(
+        (string Source, string Path) key,
+        (bool Matched, string Value) entry)
+    {
+        if (_subSkillResultsPrimary.Count >= UiResultCapacity)
+        {
+            _subSkillResultsSecondary.Clear();
+            (_subSkillResultsPrimary, _subSkillResultsSecondary) = (_subSkillResultsSecondary, _subSkillResultsPrimary);
+        }
+        _subSkillResultsPrimary[key] = entry;
     }
 
     private bool TryTranslateSubSkillCore(string source, string scenePath, out string translated)
     {
         translated = source;
-        if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
-            return false;
-
         var lookupKey = NormalizeSubSkillKey(source);
         if (TryTranslateSceneTemplate(lookupKey, scenePath, _subSkillSceneTemplates, out translated))
             return true;
@@ -578,9 +694,6 @@ public sealed class TranslationManager
             return true;
         }
 
-        // Exact ASCII entries such as "HP" are handled above. More expensive
-        // wildcard and embedded matching is useful only for Japanese source
-        // text, so unrelated UI assignments can return without scanning rules.
         if (!ContainsJapanese(lookupKey))
             return false;
 
@@ -593,43 +706,17 @@ public sealed class TranslationManager
         return TryTranslateIndexedFragments(lookupKey, _subSkillFragmentIndex, out translated);
     }
 
-    public bool IsKnownSubSkillTranslationValue(string value)
-    {
-        if (string.IsNullOrEmpty(value)) return false;
-        if (value.Length > 8192) return IsKnownSubSkillTranslationValueCore(value);
-        var key = (value, 1);
-        if (_knownResults.TryGetValue(key, out var cached)) return cached;
-        var result = IsKnownSubSkillTranslationValueCore(value);
-        _knownResults.Set(key, result);
-        return result;
-    }
-
-    private bool IsKnownSubSkillTranslationValueCore(string value) =>
+    public bool IsKnownSubSkillTranslationValue(string value) =>
         !string.IsNullOrEmpty(value) &&
         (_knownSubSkillTranslationValues.Contains(value) ||
-         MatchesSceneTemplateTranslation(value, _subSkillSceneTemplates) ||
-         MatchesNumberTemplateTranslation(value, _subSkillNumberTemplates) ||
-         MatchesExTemplateTranslation(value, _subSkillExTemplates));
+         _knownSubSkillTranslationValues.Contains(NormalizeSubSkillKey(value)));
 
-    public bool IsKnownUiTextTranslationValue(string value)
-    {
-        if (string.IsNullOrEmpty(value)) return false;
-        if (value.Length > 8192) return IsKnownUiTextTranslationValueCore(value);
-        var key = (value, 2);
-        if (_knownResults.TryGetValue(key, out var cached)) return cached;
-        var result = IsKnownUiTextTranslationValueCore(value);
-        _knownResults.Set(key, result);
-        return result;
-    }
-
-    private bool IsKnownUiTextTranslationValueCore(string value) =>
+    public bool IsKnownUiTextTranslationValue(string value) =>
         !string.IsNullOrEmpty(value) &&
         (_knownUiTextTranslationValues.Contains(value) ||
-         MatchesSceneTemplateTranslation(value, _uiSceneTemplates) ||
-         MatchesNumberTemplateTranslation(value, _uiNumberTemplates) ||
-         MatchesExTemplateTranslation(value, _uiExTemplates));
+         _knownUiTextTranslationValues.Contains(NormalizeSubSkillKey(value)));
 
-    /// <summary>Story and log text use one global source-to-translation table.</summary>
+    /// <summary>Story and log text use scene-indexed lookup with unique global fallback.</summary>
     public bool TryTranslateStoryExact(
         string source,
         string scenarioId,
@@ -641,12 +728,20 @@ public sealed class TranslationManager
         if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
             return false;
 
-        var scene = ResolveStoryScenarioId(scenarioId);
-        if (_storyDisplayIndex.TryGet(NormalizeSubSkillKey(source), scene, out translated, out var conflict))
+        var snapshot = GetLoadedScenarioSnapshot();
+        var scene = ResolveStoryScenarioIdCore(snapshot, scenarioId);
+        var normalized = NormalizeSubSkillKey(source);
+        if (snapshot.StoryParseIndex.TryGet(normalized, scene, out translated, out var conflict))
             return true;
-        if (conflict) return false;
+        if (conflict)
+            return false;
 
-        return TryTranslateIndexedStoryFragments(source, out translated);
+        if (snapshot.StoryDisplayIndex.TryGet(normalized, scene, out translated, out conflict))
+            return true;
+        if (conflict)
+            return false;
+
+        return TryTranslateIndexedFragments(source, snapshot.StoryFragmentIndex, out translated);
     }
 
     /// <summary>
@@ -663,20 +758,13 @@ public sealed class TranslationManager
             string.IsNullOrEmpty(source))
             return false;
 
-        // TextData.CreateTextParser can call TextParser(string,bool) after
-        // the outer TextData prefix has already supplied the translation.
-        // Treat a known translated value as idempotent so the second parser
-        // hook cannot chain it into another source row.
-        if (IsKnownStoryTranslationValue(source))
+        var snapshot = GetLoadedScenarioSnapshot();
+        if (IsKnownStoryTranslationValueCore(snapshot, source))
             return false;
 
-        // UTAGE can hand the parser CRLF while JSON rows are normalized to LF.
-        // If this lookup misses, translation happens later in the Text setter,
-        // after UTAGE has already recorded the original interval positions.
-        // Normalize only line endings here; keep all control tags untouched so
-        // the translated row's own <interval> positions are parsed.
         var lookup = NormalizeSubSkillKey(source);
-        if (_storyParseIndex.TryGet(lookup, ResolveStoryScenarioId(scenarioId), out translated, out _))
+        var scene = ResolveStoryScenarioIdCore(snapshot, scenarioId);
+        if (snapshot.StoryParseIndex.TryGet(lookup, scene, out translated, out _))
             return true;
         translated = source;
         return false;
@@ -684,201 +772,50 @@ public sealed class TranslationManager
 
     public string ResolveStoryScenarioId(string value)
     {
-        if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        return ResolveStoryScenarioIdCore(GetLoadedScenarioSnapshot(), value);
+    }
+
+    private static string ResolveStoryScenarioIdCore(ScenarioSnapshot snapshot, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
         var candidate = value.Trim().Replace('\\', '/');
-        if (_scenarioPaths.ContainsKey(candidate)) return candidate;
+        if (snapshot.ScenarioPaths.ContainsKey(candidate))
+            return candidate;
         var leaf = candidate[(candidate.LastIndexOf('/') + 1)..];
-        // UTAGE grid names may append a sheet name to the book resource.
         var sheetSeparator = leaf.IndexOf(':');
-        if (sheetSeparator > 0) leaf = leaf[..sheetSeparator];
+        if (sheetSeparator > 0)
+            leaf = leaf[..sheetSeparator];
         var dot = leaf.LastIndexOf('.');
-        if (dot > 0) leaf = leaf[..dot];
-        if (_scenarioPaths.ContainsKey(leaf)) return leaf;
-        if (leaf.StartsWith("*", StringComparison.Ordinal) && _scenarioPaths.ContainsKey(leaf[1..]))
+        if (dot > 0)
+            leaf = leaf[..dot];
+        if (snapshot.ScenarioPaths.ContainsKey(leaf))
+            return leaf;
+        if (leaf.StartsWith("*", StringComparison.Ordinal) && snapshot.ScenarioPaths.ContainsKey(leaf[1..]))
             return leaf[1..];
         return string.Empty;
     }
 
-    public bool IsKnownStoryTranslationValue(string value) =>
+    public bool IsKnownStoryTranslationValue(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return false;
+
+        return IsKnownStoryTranslationValueCore(GetLoadedScenarioSnapshot(), value);
+    }
+
+    private static bool IsKnownStoryTranslationValueCore(ScenarioSnapshot snapshot, string value) =>
         !string.IsNullOrEmpty(value) &&
-        (_knownStoryTranslationValues.Contains(value) ||
-         _knownStoryTranslationValues.Contains(NormalizeStoryDisplayValue(value)));
-
-    private bool TryTranslateFromCandidates(
-        string source,
-        IEnumerable<string> candidateScenarioIds,
-        out string translated
-    )
-    {
-        translated = source;
-        string candidateTranslation = null;
-        foreach (var candidateScenarioId in candidateScenarioIds)
-        {
-            if (!TryTranslateFromScenario(source, candidateScenarioId, out var localTranslation))
-                continue;
-
-            if (candidateTranslation == null)
-            {
-                candidateTranslation = localTranslation;
-                continue;
-            }
-
-            if (!string.Equals(candidateTranslation, localTranslation, StringComparison.Ordinal))
-                return false;
-        }
-
-        if (candidateTranslation == null)
-            return false;
-
-        translated = candidateTranslation;
-        return true;
-    }
-
-    /// <summary>
-    /// Some normal Utage scenes expose no script or resource ID. In that case,
-    /// narrow candidate tables using consecutive source rows. A row is shown
-    /// only when all remaining candidates agree on its translation.
-    /// </summary>
-    private bool TryTranslateByInference(string source, out string translated)
-    {
-        translated = source;
-        if (_inferenceStopped || !_storySourceIndex.TryGetValue(source, out var sourceEntries))
-        {
-            _inferenceStopped = true;
-            _inferredScenarioIds = null;
-            return false;
-        }
-
-        var sourceScenarioIds = new HashSet<string>(
-            sourceEntries.Select(entry => entry.ScenarioId),
-            StringComparer.OrdinalIgnoreCase
-        );
-        var candidates = _inferredScenarioIds == null
-            ? sourceScenarioIds
-            : new HashSet<string>(_inferredScenarioIds, StringComparer.OrdinalIgnoreCase);
-        candidates.IntersectWith(sourceScenarioIds);
-        if (candidates.Count == 0)
-        {
-            // Ordinary scenes can reuse MessageText without first assigning
-            // an empty value. Once a prior inference was fully resolved, a
-            // source row belonging only to other tables marks a new scene.
-            // Restart from that row; an entirely unknown row still stops the
-            // inference session as requested.
-            if (_inferredScenarioIds?.Count == 1)
-            {
-                candidates = sourceScenarioIds;
-                _lastLoggedInferredScenarioId = null;
-                Core.Plugin.Log?.LogInfo("Inferred story context reset for a new scene");
-            }
-            else
-            {
-                _inferenceStopped = true;
-                _inferredScenarioIds = null;
-                return false;
-            }
-        }
-
-        _inferredScenarioIds = candidates.OrderBy(id => id, StringComparer.OrdinalIgnoreCase).ToList();
-        var values = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var entry in sourceEntries)
-        {
-            if (candidates.Contains(entry.ScenarioId) && !string.IsNullOrEmpty(entry.Translation))
-                values.Add(entry.Translation);
-        }
-
-        if (_inferredScenarioIds.Count == 1 &&
-            !string.Equals(_lastLoggedInferredScenarioId, _inferredScenarioIds[0], StringComparison.OrdinalIgnoreCase))
-        {
-            _lastLoggedInferredScenarioId = _inferredScenarioIds[0];
-            Core.Plugin.Log?.LogInfo($"Inferred story context: {_inferredScenarioIds[0]}");
-        }
-
-        if (values.Count != 1)
-            return false;
-
-        translated = values.First();
-        return true;
-    }
+        (snapshot.KnownStoryTranslationValues.Contains(value) ||
+         snapshot.KnownStoryTranslationValues.Contains(NormalizeStoryDisplayValue(value)));
 
     public void ResetInferredStoryScenario()
     {
-        _inferredScenarioIds = null;
-        _inferenceStopped = false;
-        _lastLoggedInferredScenarioId = null;
-    }
-
-    private bool TryTranslateFromScenario(string source, string scenarioId, out string translated)
-    {
-        translated = source;
-        var table = _scenarios.GetOrAdd(scenarioId, LoadScenario);
-        if (table.TryGetValue(source, out var scenarioTranslation) && !string.IsNullOrEmpty(scenarioTranslation))
-        {
-            translated = scenarioTranslation;
-            return true;
-        }
-
-        if (TryTranslateNumberTemplate(source, table, out translated))
-            return true;
-
-        var fragmentIndex = _scenarioFragmentIndexes.GetOrAdd(
-            scenarioId,
-            _ => BuildFragmentIndex(table));
-        return TryTranslateIndexedFragments(source, fragmentIndex, out translated);
-    }
-
-    private bool HasScenarioTable(string scenarioId) =>
-        _scenarioPaths.ContainsKey(scenarioId) ||
-        File.Exists(Path.Combine(_root, "scenarios", scenarioId, $"{_config.Language.Value}.json"));
-
-    private void IndexR18ResourceScenario(string scenarioId)
-    {
-        var match = R18ScenarioIdPattern.Match(scenarioId);
-        if (!match.Success)
-            return;
-
-        var resourceNumber = match.Groups["base"].Value;
-        if (!_r18ResourceScenarioIds.TryGetValue(resourceNumber, out var scenarios))
-        {
-            scenarios = new List<string>();
-            _r18ResourceScenarioIds.Add(resourceNumber, scenarios);
-        }
-
-        scenarios.Add(scenarioId);
-    }
-
-    private void IndexStorySource(string scenarioId, string source, string translation)
-    {
-        if (string.IsNullOrEmpty(source))
-            return;
-
-        if (!_storySourceIndex.TryGetValue(source, out var entries))
-        {
-            entries = new List<StorySourceEntry>();
-            _storySourceIndex.Add(source, entries);
-        }
-
-        entries.Add(new StorySourceEntry(scenarioId, translation));
-    }
-
-    private static string ExtractSceneNumber(string resourceId)
-    {
-        if (string.IsNullOrEmpty(resourceId))
-            return string.Empty;
-
-        var match = ResourceNumberPattern.Match(resourceId);
-        return match.Success ? match.Groups["base"].Value : string.Empty;
-    }
-
-    private readonly struct StorySourceEntry
-    {
-        public StorySourceEntry(string scenarioId, string translation)
-        {
-            ScenarioId = scenarioId;
-            Translation = translation;
-        }
-
-        public string ScenarioId { get; }
-        public string Translation { get; }
+        // Preserved for API compatibility with story text reset hooks.
     }
 
     private sealed class SceneTemplate
@@ -930,34 +867,29 @@ public sealed class TranslationManager
             (_exTemplate != null && _exTemplate.MatchesTranslation(value));
     }
 
-    /// <summary>
-    /// An anchored template whose &lt;ex&gt; segments preserve arbitrary runtime
-    /// text. Captures are inserted into target placeholders in source order.
-    /// </summary>
     private sealed class ExTemplate
     {
-        private readonly Regex _sourcePattern;
-        private readonly Regex _translationPattern;
+        private readonly string[] _sourcePieces;
         private readonly string[] _translationPieces;
         private readonly string _requiredPrefix;
         private readonly string _requiredSuffix;
         private readonly string _translationPrefix;
         private readonly string _translationSuffix;
+        private Regex _sourcePattern;
+        private Regex _translationPattern;
 
         public ExTemplate(string source, string translation)
         {
             Source = source;
             SourceLength = source.Length;
-            var sourcePieces = source.Split(ExPlaceholder, StringSplitOptions.None);
+            _sourcePieces = source.Split(ExPlaceholder, StringSplitOptions.None);
             _translationPieces = translation.Split(ExPlaceholder, StringSplitOptions.None);
-            WildcardCount = sourcePieces.Length - 1;
+            WildcardCount = _sourcePieces.Length - 1;
             LiteralLength = source.Length - WildcardCount * ExPlaceholder.Length;
-            _requiredPrefix = sourcePieces[0];
-            _requiredSuffix = sourcePieces[^1];
+            _requiredPrefix = _sourcePieces[0];
+            _requiredSuffix = _sourcePieces[^1];
             _translationPrefix = _translationPieces[0];
             _translationSuffix = _translationPieces[^1];
-            _sourcePattern = BuildPattern(sourcePieces);
-            _translationPattern = BuildPattern(_translationPieces);
         }
 
         public string Source { get; }
@@ -982,6 +914,7 @@ public sealed class TranslationManager
                 return false;
             }
 
+            _sourcePattern ??= BuildPattern(_sourcePieces);
             var match = _sourcePattern.Match(source);
             if (!match.Success)
             {
@@ -1009,12 +942,19 @@ public sealed class TranslationManager
             return true;
         }
 
-        public bool MatchesTranslation(string value) =>
-            (string.IsNullOrEmpty(_translationPrefix) ||
-             value.StartsWith(_translationPrefix, StringComparison.Ordinal)) &&
-            (string.IsNullOrEmpty(_translationSuffix) ||
-             value.EndsWith(_translationSuffix, StringComparison.Ordinal)) &&
-            _translationPattern.IsMatch(value);
+        public bool MatchesTranslation(string value)
+        {
+            if ((!string.IsNullOrEmpty(_translationPrefix) &&
+                 !value.StartsWith(_translationPrefix, StringComparison.Ordinal)) ||
+                (!string.IsNullOrEmpty(_translationSuffix) &&
+                 !value.EndsWith(_translationSuffix, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            _translationPattern ??= BuildPattern(_translationPieces);
+            return _translationPattern.IsMatch(value);
+        }
 
         private static Regex BuildPattern(IReadOnlyList<string> pieces)
         {
@@ -1028,36 +968,49 @@ public sealed class TranslationManager
             pattern.Append(@"\z");
             return new Regex(
                 pattern.ToString(),
-                RegexOptions.CultureInvariant | RegexOptions.Compiled | RegexOptions.Singleline);
+                RegexOptions.CultureInvariant | RegexOptions.Singleline);
         }
     }
 
-    /// <summary>
-    /// A complete-row template such as "回復&lt;num&gt;HP". Values captured from
-    /// each source placeholder are inserted into the matching target
-    /// placeholder in order, without converting their original formatting.
-    /// </summary>
     private sealed class NumberTemplate
     {
         private const string NumberPattern = @"(?<number>[+\-−＋]?\d+(?:[.,．]\d+)?)";
-        private readonly Regex _sourcePattern;
-        private readonly Regex _translationPattern;
         private readonly string _translation;
+        private readonly string[] _sourcePieces;
         private readonly string[] _translationPieces;
+        private readonly string _requiredPrefix;
+        private readonly string _requiredSuffix;
+        private readonly string _translationPrefix;
+        private readonly string _translationSuffix;
+        private Regex _sourcePattern;
+        private Regex _translationPattern;
 
         public NumberTemplate(string source, string translation)
         {
-            SourceLength = source.Length;
-            _sourcePattern = BuildPattern(source);
-            _translationPattern = BuildPattern(translation);
             _translation = translation;
+            SourceLength = source.Length;
+            _sourcePieces = source.Split(NumberPlaceholder, StringSplitOptions.None);
             _translationPieces = translation.Split(NumberPlaceholder, StringSplitOptions.None);
+            _requiredPrefix = _sourcePieces[0];
+            _requiredSuffix = _sourcePieces[^1];
+            _translationPrefix = _translationPieces[0];
+            _translationSuffix = _translationPieces[^1];
         }
 
         public int SourceLength { get; }
 
         public bool TryTranslate(string source, out string translated)
         {
+            if ((!string.IsNullOrEmpty(_requiredPrefix) &&
+                 !source.StartsWith(_requiredPrefix, StringComparison.Ordinal)) ||
+                (!string.IsNullOrEmpty(_requiredSuffix) &&
+                 !source.EndsWith(_requiredSuffix, StringComparison.Ordinal)))
+            {
+                translated = source;
+                return false;
+            }
+
+            _sourcePattern ??= BuildPattern(_sourcePieces);
             var match = _sourcePattern.Match(source);
             if (!match.Success)
             {
@@ -1083,20 +1036,31 @@ public sealed class TranslationManager
             return true;
         }
 
-        public bool MatchesTranslation(string value) => _translationPattern.IsMatch(value);
-
-        private static Regex BuildPattern(string template)
+        public bool MatchesTranslation(string value)
         {
-            var pieces = template.Split(NumberPlaceholder, StringSplitOptions.None);
+            if ((!string.IsNullOrEmpty(_translationPrefix) &&
+                 !value.StartsWith(_translationPrefix, StringComparison.Ordinal)) ||
+                (!string.IsNullOrEmpty(_translationSuffix) &&
+                 !value.EndsWith(_translationSuffix, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            _translationPattern ??= BuildPattern(_translationPieces);
+            return _translationPattern.IsMatch(value);
+        }
+
+        private static Regex BuildPattern(IReadOnlyList<string> pieces)
+        {
             var pattern = new StringBuilder("^");
-            for (var index = 0; index < pieces.Length; index++)
+            for (var index = 0; index < pieces.Count; index++)
             {
                 pattern.Append(Regex.Escape(pieces[index]));
-                if (index < pieces.Length - 1)
+                if (index < pieces.Count - 1)
                     pattern.Append(NumberPattern);
             }
             pattern.Append('$');
-            return new Regex(pattern.ToString(), RegexOptions.CultureInvariant | RegexOptions.Compiled);
+            return new Regex(pattern.ToString(), RegexOptions.CultureInvariant);
         }
     }
 
@@ -1123,43 +1087,49 @@ public sealed class TranslationManager
 
     public bool IsKnownTranslationValue(string value)
     {
-        if (string.IsNullOrEmpty(value)) return false;
-        if (value.Length > 8192) return IsKnownTranslationValueCore(value);
-        var key = (value, 0);
-        if (_knownResults.TryGetValue(key, out var cached)) return cached;
-        var result = IsKnownTranslationValueCore(value);
-        _knownResults.Set(key, result);
-        return result;
+        if (string.IsNullOrEmpty(value))
+            return false;
+
+        if (_knownTranslationValues.Contains(value))
+            return true;
+
+        var normalized = NormalizeSubSkillKey(value);
+        if (!ReferenceEquals(normalized, value) && _knownTranslationValues.Contains(normalized))
+            return true;
+
+        var snapshot = Volatile.Read(ref _scenarioSnapshot);
+        if (snapshot.KnownStoryTranslationValues.Contains(value) ||
+            (!ReferenceEquals(normalized, value) && snapshot.KnownStoryTranslationValues.Contains(normalized)))
+            return true;
+
+        return false;
     }
 
-    private bool IsKnownTranslationValueCore(string value)
+    private bool IsRenderedTemplateTranslation(string value)
     {
         if (string.IsNullOrEmpty(value))
             return false;
 
-        var normalized = NormalizeSubSkillKey(value);
-        if (_knownTranslationValues.Contains(value) ||
-            _knownTranslationValues.Contains(normalized))
-            return true;
-        if (!ContainsJapanese(normalized))
-            return false;
-
-        return MatchesNumberTemplateTranslation(normalized, _uiNumberTemplates) ||
-               MatchesNumberTemplateTranslation(normalized, _subSkillNumberTemplates) ||
-               MatchesExTemplateTranslation(normalized, _nameExTemplates) ||
-               MatchesExTemplateTranslation(normalized, _uiExTemplates) ||
-               MatchesExTemplateTranslation(normalized, _subSkillExTemplates);
+        return MatchesNumberTemplateTranslation(value, _uiNumberTemplates) ||
+               MatchesNumberTemplateTranslation(value, _subSkillNumberTemplates) ||
+               MatchesExTemplateTranslation(value, _uiExTemplates) ||
+               MatchesExTemplateTranslation(value, _subSkillExTemplates) ||
+               MatchesExTemplateTranslation(value, _nameExTemplates) ||
+               MatchesSceneTemplateTranslation(value, _uiSceneTemplates) ||
+               MatchesSceneTemplateTranslation(value, _subSkillSceneTemplates) ||
+               MatchesSceneTemplateTranslation(value, _nameSceneTemplates);
     }
 
     private bool HasRuntimeTranslation(string source)
     {
-        if (string.IsNullOrEmpty(source) || IsKnownTranslationValue(source))
+        var snapshot = GetLoadedScenarioSnapshot();
+        if (string.IsNullOrEmpty(source) || IsKnownTranslationValue(source) || IsRenderedTemplateTranslation(source))
             return !string.IsNullOrEmpty(source);
 
         if ((_names.TryGetValue(source, out var value) && !string.IsNullOrEmpty(value)) ||
             (_uiTexts.TryGetValue(source, out value) && !string.IsNullOrEmpty(value)) ||
             (_subSkills.TryGetValue(NormalizeSubSkillKey(source), out value) && !string.IsNullOrEmpty(value)) ||
-            (_fallback.TryGetValue(source, out value) && !string.IsNullOrEmpty(value)))
+            (snapshot.Fallback.TryGetValue(source, out value) && !string.IsNullOrEmpty(value)))
             return true;
 
         if (TryTranslateNumberTemplate(source, _uiNumberTemplates, out _) ||
@@ -1170,7 +1140,8 @@ public sealed class TranslationManager
             return true;
 
         var normalized = NormalizeSubSkillKey(source);
-        if (!string.Equals(normalized, source, StringComparison.Ordinal) &&
+        if (!ReferenceEquals(normalized, source) &&
+            !string.Equals(normalized, source, StringComparison.Ordinal) &&
             ((_uiTexts.TryGetValue(normalized, out value) && !string.IsNullOrEmpty(value)) ||
              (_subSkills.TryGetValue(normalized, out value) && !string.IsNullOrEmpty(value)) ||
              TryTranslateNumberTemplate(normalized, _uiNumberTemplates, out _) ||
@@ -1180,29 +1151,24 @@ public sealed class TranslationManager
             return true;
 
         return TryTranslateIndexedFragments(normalized, _subSkillFragmentIndex, out _) ||
-               TryTranslateIndexedStoryFragments(source, out _);
+               TryTranslateIndexedFragments(source, snapshot.StoryFragmentIndex, out _);
     }
 
     public bool HasRuntimeTranslation(string source, string scenePath) =>
         HasRuntimeTranslation(source) ||
         TryTranslateUiText(source, scenePath, out _);
 
-    /// <summary>
-    /// F8 missing-text collection must only accept complete-row matches.
-    /// Runtime fragment translation remains available elsewhere, but a short
-    /// story/sub-skill fragment must not suppress collection of an otherwise
-    /// untranslated UI sentence.
-    /// </summary>
     private bool HasStrictRuntimeTranslation(string source, string scenePath)
     {
-        if (string.IsNullOrEmpty(source) || IsKnownTranslationValue(source))
+        var snapshot = GetLoadedScenarioSnapshot();
+        if (string.IsNullOrEmpty(source) || IsKnownTranslationValue(source) || IsRenderedTemplateTranslation(source))
             return !string.IsNullOrEmpty(source);
 
         var normalized = NormalizeSubSkillKey(source);
         if ((_names.TryGetValue(source, out var value) && !string.IsNullOrEmpty(value)) ||
             (_uiTexts.TryGetValue(source, out value) && !string.IsNullOrEmpty(value)) ||
             (_subSkills.TryGetValue(normalized, out value) && !string.IsNullOrEmpty(value)) ||
-            (_fallback.TryGetValue(source, out value) && !string.IsNullOrEmpty(value)))
+            (snapshot.Fallback.TryGetValue(source, out value) && !string.IsNullOrEmpty(value)))
             return true;
 
         if (TryTranslateUiPath(source, scenePath, out _) ||
@@ -1214,10 +1180,12 @@ public sealed class TranslationManager
             TryTranslateExTemplate(normalized, _subSkillExTemplates, out _))
             return true;
 
-        if (string.Equals(normalized, source, StringComparison.Ordinal))
+        if (ReferenceEquals(normalized, source) ||
+            string.Equals(normalized, source, StringComparison.Ordinal))
             return false;
 
         return (_uiTexts.TryGetValue(normalized, out value) && !string.IsNullOrEmpty(value)) ||
+               IsRenderedTemplateTranslation(normalized) ||
                TryTranslateUiPath(normalized, scenePath, out _) ||
                TryTranslateSceneTemplate(normalized, scenePath, _uiSceneTemplates, out _) ||
                TryTranslateNumberTemplate(normalized, _uiNumberTemplates, out _) ||
@@ -1231,7 +1199,12 @@ public sealed class TranslationManager
             return;
 
         templates.Add(new NumberTemplate(source, translated));
-        templates.Sort((left, right) => right.SourceLength.CompareTo(left.SourceLength));
+    }
+
+    private static void SortNumberTemplates(List<NumberTemplate> templates)
+    {
+        if (templates.Count > 1)
+            templates.Sort((left, right) => right.SourceLength.CompareTo(left.SourceLength));
     }
 
     private static bool TryTranslateSceneTemplate(
@@ -1263,6 +1236,26 @@ public sealed class TranslationManager
                 return true;
         }
 
+        return false;
+    }
+
+    private static bool MatchesNumberTemplateTranslation(
+        string value,
+        IEnumerable<NumberTemplate> templates)
+    {
+        foreach (var template in templates)
+            if (template.MatchesTranslation(value))
+                return true;
+        return false;
+    }
+
+    private static bool MatchesExTemplateTranslation(
+        string value,
+        IEnumerable<ExTemplate> templates)
+    {
+        foreach (var template in templates)
+            if (template.MatchesTranslation(value))
+                return true;
         return false;
     }
 
@@ -1308,6 +1301,13 @@ public sealed class TranslationManager
         }
 
         templates.Add(new ExTemplate(source, translated));
+    }
+
+    private static void SortExTemplates(List<ExTemplate> templates)
+    {
+        if (templates.Count <= 1)
+            return;
+
         templates.Sort((left, right) =>
         {
             var comparison = right.LiteralLength.CompareTo(left.LiteralLength);
@@ -1388,56 +1388,13 @@ public sealed class TranslationManager
         _subSkills.TryGetValue(NormalizeSubSkillKey(source), out translated) &&
         !string.IsNullOrEmpty(translated);
 
-    private static bool TryTranslateNumberTemplate(
-        string source,
-        Dictionary<string, string> table,
-        out string translated)
-    {
-        foreach (var pair in table
-            .Where(pair => pair.Key.Contains(NumberPlaceholder, StringComparison.Ordinal) &&
-                           !string.IsNullOrEmpty(pair.Value))
-            .OrderByDescending(pair => pair.Key.Length))
-        {
-            if (new NumberTemplate(pair.Key, pair.Value).TryTranslate(source, out translated))
-                return true;
-        }
-
-        translated = source;
-        return false;
-    }
-
-    private static bool MatchesNumberTemplateTranslation(string value, IEnumerable<NumberTemplate> templates)
-    {
-        foreach (var template in templates)
-            if (template.MatchesTranslation(value))
-                return true;
-        return false;
-    }
-
-    private static bool MatchesExTemplateTranslation(string value, IEnumerable<ExTemplate> templates)
-    {
-        foreach (var template in templates)
-            if (template.MatchesTranslation(value))
-                return true;
-        return false;
-    }
-
-    private static Dictionary<char, List<KeyValuePair<string, string>>> BuildFragmentIndex(
-        Dictionary<string, string> table)
-    {
-        var index = new Dictionary<char, List<KeyValuePair<string, string>>>();
-        foreach (var pair in table)
-            AddFragmentRule(index, pair.Key, pair.Value);
-        SortFragmentIndex(index);
-        return index;
-    }
-
     private static void AddFragmentRule(
         Dictionary<char, List<KeyValuePair<string, string>>> index,
         string source,
-        string translated)
+        string translated,
+        int minLength)
     {
-        if (source.Length < 4 || string.IsNullOrEmpty(translated) ||
+        if (source.Length < minLength || string.IsNullOrEmpty(translated) ||
             source.Contains(NumberPlaceholder, StringComparison.Ordinal) ||
             source.Contains(ExPlaceholder, StringComparison.Ordinal))
             return;
@@ -1464,28 +1421,43 @@ public sealed class TranslationManager
         out string translated)
     {
         translated = source;
-        var changed = false;
-        for (var characterIndex = 0; characterIndex < translated.Length; characterIndex++)
+        if (string.IsNullOrEmpty(source) || index.Count == 0)
+            return false;
+
+        StringBuilder builder = null;
+        var lastCopiedIndex = 0;
+        var sourceSpan = source.AsSpan();
+
+        for (var characterIndex = 0; characterIndex < source.Length; characterIndex++)
         {
-            if (!index.TryGetValue(translated[characterIndex], out var candidates))
+            if (!index.TryGetValue(source[characterIndex], out var candidates))
                 continue;
 
+            var remaining = sourceSpan[characterIndex..];
             foreach (var candidate in candidates)
             {
-                if (!translated.AsSpan(characterIndex).StartsWith(
-                        candidate.Key.AsSpan(),
-                        StringComparison.Ordinal))
+                if (!remaining.StartsWith(candidate.Key.AsSpan(), StringComparison.Ordinal))
                     continue;
 
-                translated = translated.Remove(characterIndex, candidate.Key.Length)
-                    .Insert(characterIndex, candidate.Value);
-                characterIndex += candidate.Value.Length - 1;
-                changed = true;
+                builder ??= new StringBuilder(source.Length + 16);
+                if (characterIndex > lastCopiedIndex)
+                    builder.Append(source, lastCopiedIndex, characterIndex - lastCopiedIndex);
+                builder.Append(candidate.Value);
+
+                characterIndex += candidate.Key.Length - 1;
+                lastCopiedIndex = characterIndex + 1;
                 break;
             }
         }
 
-        return changed;
+        if (builder == null)
+            return false;
+
+        if (lastCopiedIndex < source.Length)
+            builder.Append(source, lastCopiedIndex, source.Length - lastCopiedIndex);
+
+        translated = builder.ToString();
+        return true;
     }
 
     private static bool ContainsJapanese(string value)
@@ -1502,98 +1474,66 @@ public sealed class TranslationManager
         return false;
     }
 
-    private void AddStoryFragment(string source, string translated)
+    private static string NormalizeSubSkillKey(string value)
     {
-        if (source.Length < 4 || string.IsNullOrEmpty(translated) ||
-            source.Contains(NumberPlaceholder, StringComparison.Ordinal) ||
-            source.Contains(ExPlaceholder, StringComparison.Ordinal))
-            return;
+        if (string.IsNullOrEmpty(value) ||
+            (value.IndexOf('\r') < 0 && value.IndexOf('\\') < 0))
+            return value;
 
-        if (!_storyFragmentIndex.TryGetValue(source[0], out var candidates))
-        {
-            candidates = new List<KeyValuePair<string, string>>();
-            _storyFragmentIndex.Add(source[0], candidates);
-        }
-
-        candidates.Add(new KeyValuePair<string, string>(source, translated));
+        return value.Replace("\r\n", "\n", StringComparison.Ordinal)
+                    .Replace("\r", "\n", StringComparison.Ordinal)
+                    .Replace("\\r\\n", "\n", StringComparison.Ordinal)
+                    .Replace("\\n", "\n", StringComparison.Ordinal);
     }
-
-    private bool TryTranslateIndexedStoryFragments(string source, out string translated)
-    {
-        translated = source;
-        var changed = false;
-
-        for (var index = 0; index < translated.Length; index++)
-        {
-            if (!_storyFragmentIndex.TryGetValue(translated[index], out var candidates))
-                continue;
-
-            foreach (var candidate in candidates)
-            {
-                if (!translated.AsSpan(index).StartsWith(candidate.Key.AsSpan(), StringComparison.Ordinal))
-                    continue;
-
-                translated = translated.Remove(index, candidate.Key.Length)
-                    .Insert(index, candidate.Value);
-                index += candidate.Value.Length - 1;
-                changed = true;
-                break;
-            }
-        }
-
-        return changed;
-    }
-
-    private static string NormalizeSubSkillKey(string value) =>
-        value.Replace("\r\n", "\n", StringComparison.Ordinal)
-             .Replace("\r", "\n", StringComparison.Ordinal)
-             .Replace("\\r\\n", "\n", StringComparison.Ordinal)
-             .Replace("\\n", "\n", StringComparison.Ordinal);
 
     private void AddKnownTranslationValue(string value)
     {
         if (string.IsNullOrEmpty(value))
             return;
         _knownTranslationValues.Add(value);
-        _knownTranslationValues.Add(NormalizeSubSkillKey(value));
+        var normalized = NormalizeSubSkillKey(value);
+        if (!ReferenceEquals(normalized, value))
+            _knownTranslationValues.Add(normalized);
     }
 
-    private void AddKnownStoryTranslationValue(string value)
+    private static void AddKnownStoryTranslationValue(HashSet<string> targetSet, string value)
     {
         if (string.IsNullOrEmpty(value))
             return;
 
-        _knownStoryTranslationValues.Add(value);
-        _knownStoryTranslationValues.Add(NormalizeStoryDisplayValue(value));
+        targetSet.Add(value);
+        var displayValue = NormalizeStoryDisplayValue(value);
+        if (!ReferenceEquals(displayValue, value))
+            targetSet.Add(displayValue);
     }
 
-    private static string NormalizeStoryDisplayValue(string value) =>
-        string.IsNullOrEmpty(value)
-            ? value
-            : NormalizeSubSkillKey(UtageDisplayControlTag.Replace(value, string.Empty));
-
-    private Dictionary<string, string> LoadScenario(string scenarioId)
+    private static string NormalizeStoryDisplayValue(string value)
     {
-        var directPath = Path.Combine(_root, "scenarios", scenarioId, $"{_config.Language.Value}.json");
-        if (File.Exists(directPath))
-            return ReadTable(directPath);
+        if (string.IsNullOrEmpty(value))
+            return value;
 
-        return _scenarioPaths.TryGetValue(scenarioId, out var indexedPath)
-            ? ReadTable(indexedPath)
-            : new Dictionary<string, string>(StringComparer.Ordinal);
+        var normalized = NormalizeSubSkillKey(value);
+        return normalized.IndexOf('<') < 0
+            ? normalized
+            : UtageDisplayControlTag.Replace(normalized, string.Empty);
     }
 
     private static Dictionary<string, string> ReadTable(string path)
     {
         try
         {
-            if (!File.Exists(path)) return new Dictionary<string, string>(StringComparer.Ordinal);
+            if (!File.Exists(path))
+                return new Dictionary<string, string>(StringComparer.Ordinal);
             using var document = JsonDocument.Parse(File.ReadAllText(path));
             var table = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var property in document.RootElement.EnumerateObject())
             {
                 if (property.Value.ValueKind == JsonValueKind.String)
-                    table[property.Name] = property.Value.GetString() ?? string.Empty;
+                {
+                    var val = property.Value.GetString() ?? string.Empty;
+                    if (!string.IsNullOrEmpty(val) || !table.ContainsKey(property.Name))
+                        table[property.Name] = val;
+                }
                 else if ((property.NameEquals("$global") || property.NameEquals("$globe")) &&
                          property.Value.ValueKind == JsonValueKind.Object)
                 {
@@ -1601,16 +1541,24 @@ public sealed class TranslationManager
                     {
                         if (row.Value.ValueKind == JsonValueKind.String)
                         {
-                            table[row.Name] = row.Value.GetString() ?? string.Empty;
+                            var val = row.Value.GetString() ?? string.Empty;
+                            if (!string.IsNullOrEmpty(val) || !table.ContainsKey(row.Name))
+                                table[row.Name] = val;
                             continue;
                         }
 
-                        // A path/category key inside $global is metadata only;
-                        // its child rows are still global translations.
                         if (row.Value.ValueKind == JsonValueKind.Object)
+                        {
                             foreach (var child in row.Value.EnumerateObject())
+                            {
                                 if (child.Value.ValueKind == JsonValueKind.String)
-                                    table[child.Name] = child.Value.GetString() ?? string.Empty;
+                                {
+                                    var val = child.Value.GetString() ?? string.Empty;
+                                    if (!string.IsNullOrEmpty(val) || !table.ContainsKey(child.Name))
+                                        table[child.Name] = val;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1623,39 +1571,68 @@ public sealed class TranslationManager
         }
     }
 
-    private static IReadOnlyList<UiPathTable> ReadUiPathTables(string path)
+    private static void ReadUiFile(
+        string path,
+        out Dictionary<string, string> globalTable,
+        out List<UiPathTable> pathTables)
     {
-        var result = new List<UiPathTable>();
+        globalTable = new Dictionary<string, string>(StringComparer.Ordinal);
+        pathTables = new List<UiPathTable>();
         try
         {
             if (!File.Exists(path))
-                return result;
+                return;
             using var document = JsonDocument.Parse(File.ReadAllText(path));
             foreach (var property in document.RootElement.EnumerateObject())
             {
-                if (property.NameEquals("$paths") && property.Value.ValueKind == JsonValueKind.Object)
+                if (property.Value.ValueKind == JsonValueKind.String)
+                {
+                    var val = property.Value.GetString() ?? string.Empty;
+                    if (!string.IsNullOrEmpty(val) || !globalTable.ContainsKey(property.Name))
+                        globalTable[property.Name] = val;
+                }
+                else if (property.NameEquals("$paths") && property.Value.ValueKind == JsonValueKind.Object)
                 {
                     foreach (var pathProperty in property.Value.EnumerateObject())
-                        AddUiPathTable(result, pathProperty);
+                        AddUiPathTable(pathTables, pathProperty);
                 }
                 else if ((property.NameEquals("$global") || property.NameEquals("$globe")) &&
                          property.Value.ValueKind == JsonValueKind.Object)
                 {
-                    foreach (var globalProperty in property.Value.EnumerateObject())
-                        if (globalProperty.Value.ValueKind == JsonValueKind.Object)
-                            AddUiPathTable(result, globalProperty);
+                    foreach (var row in property.Value.EnumerateObject())
+                    {
+                        if (row.Value.ValueKind == JsonValueKind.String)
+                        {
+                            var val = row.Value.GetString() ?? string.Empty;
+                            if (!string.IsNullOrEmpty(val) || !globalTable.ContainsKey(row.Name))
+                                globalTable[row.Name] = val;
+                            continue;
+                        }
+                        if (row.Value.ValueKind == JsonValueKind.Object)
+                        {
+                            AddUiPathTable(pathTables, row);
+                            foreach (var child in row.Value.EnumerateObject())
+                            {
+                                if (child.Value.ValueKind == JsonValueKind.String)
+                                {
+                                    var childVal = child.Value.GetString() ?? string.Empty;
+                                    if (!string.IsNullOrEmpty(childVal))
+                                        globalTable.TryAdd(child.Name, childVal);
+                                }
+                            }
+                        }
+                    }
                 }
                 else if (!property.Name.StartsWith('$') && property.Value.ValueKind == JsonValueKind.Object)
                 {
-                    AddUiPathTable(result, property);
+                    AddUiPathTable(pathTables, property);
                 }
             }
         }
         catch (Exception ex)
         {
-            Core.Plugin.Log?.LogWarning($"读取 UI 路径分类失败 {path}: {ex.Message}");
+            Core.Plugin.Log?.LogWarning($"读取 UI 翻译表失败 {path}: {ex.Message}");
         }
-        return result;
     }
 
     private static void AddUiPathTable(
@@ -1666,8 +1643,14 @@ public sealed class TranslationManager
             return;
         var table = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var row in pathProperty.Value.EnumerateObject())
+        {
             if (row.Value.ValueKind == JsonValueKind.String)
-                table[row.Name] = row.Value.GetString() ?? string.Empty;
+            {
+                var val = row.Value.GetString() ?? string.Empty;
+                if (!string.IsNullOrEmpty(val) || !table.ContainsKey(row.Name))
+                    table[row.Name] = val;
+            }
+        }
         var normalizedPath = NormalizeUiPath(pathProperty.Name);
         if (table.Count > 0 && !string.IsNullOrEmpty(normalizedPath))
             result.Add(new UiPathTable(normalizedPath, table));
@@ -1688,6 +1671,8 @@ public sealed class TranslationManager
                 AddNumberTemplate(NumberTemplates, pair.Key, pair.Value);
                 AddExTemplate(ExTemplates, pair.Key, pair.Value);
             }
+            SortNumberTemplates(NumberTemplates);
+            SortExTemplates(ExTemplates);
         }
 
         public string Path { get; }
@@ -1695,5 +1680,4 @@ public sealed class TranslationManager
         public List<NumberTemplate> NumberTemplates { get; }
         public List<ExTemplate> ExTemplates { get; }
     }
-
 }

@@ -1,17 +1,24 @@
 using System;
 using System.Collections.Generic;
+using MonsterMusumeTDMod.Services;
 using UnityEngine;
 
 namespace MonsterMusumeTDMod.Patches;
 
 public sealed class MosaicSuppressor : MonoBehaviour
 {
-    private const float ScanIntervalSeconds = 0.5f;
+    private const float ActiveScanIntervalSeconds = 0.5f;
+    private const float IdleScanIntervalSeconds = 1.5f;
+
+    private static MosaicSuppressor _instance;
 
     private float _nextScanTime;
+    private int _lastRenderFrame = -1;
+    private bool _hasActiveR18Character;
     private readonly HashSet<int> _detectedSpineMosaics = new();
     private readonly HashSet<int> _currentSpineMosaicIds = new();
     private readonly Dictionary<int, SpineMosaic> _activeSpineMosaics = new();
+    private readonly Dictionary<int, (int ChildCount, Renderer[] Renderers)> _cachedRenderers = new();
     private readonly List<int> _removedSpineMosaicIds = new();
     private readonly Dictionary<int, Material> _transparentOverlayMaterials = new();
     private Camera.CameraCallback _preRenderCallback;
@@ -22,33 +29,79 @@ public sealed class MosaicSuppressor : MonoBehaviour
     {
     }
 
+    public static bool HasActiveR18Character()
+    {
+        if (_instance != null)
+        {
+            if (Time.unscaledTime >= _instance._nextScanTime)
+            {
+                _instance.ApplyToLoadedSpineMosaics();
+                var interval = _instance._activeSpineMosaics.Count > 0
+                    ? ActiveScanIntervalSeconds
+                    : IdleScanIntervalSeconds;
+                _instance._nextScanTime = Time.unscaledTime + interval;
+            }
+            return _instance._hasActiveR18Character;
+        }
+
+        return ScanForActiveR18CharacterFallback();
+    }
+
     public void Awake()
     {
+        _instance = this;
         _preRenderCallback = (Camera.CameraCallback)(Action<Camera>)ApplyTransparentOverlaysBeforeRender;
+        _nextScanTime = Time.unscaledTime + 1.2f;
         Camera.onPreRender += _preRenderCallback;
     }
 
     public void OnDestroy()
     {
+        if (_instance == this)
+            _instance = null;
+
         if (_preRenderCallback != null)
             Camera.onPreRender -= _preRenderCallback;
+
+        foreach (var material in _transparentOverlayMaterials.Values)
+            if (material != null)
+                UnityEngine.Object.Destroy(material);
+        _transparentOverlayMaterials.Clear();
+        _cachedRenderers.Clear();
+
+        if (_transparentTexture != null)
+        {
+            UnityEngine.Object.Destroy(_transparentTexture);
+            _transparentTexture = null;
+        }
     }
 
     public void Update()
     {
-        if (!Core.Plugin.Settings.EnableSpineMosaicReplacement.Value ||
-            Time.unscaledTime < _nextScanTime)
+        if (Time.unscaledTime < _nextScanTime)
             return;
 
-        _nextScanTime = Time.unscaledTime + ScanIntervalSeconds;
         ApplyToLoadedSpineMosaics();
+        var interval = _activeSpineMosaics.Count > 0
+            ? ActiveScanIntervalSeconds
+            : IdleScanIntervalSeconds;
+        _nextScanTime = Time.unscaledTime + interval;
     }
 
     // SpineMosaic initializes from native Unity callbacks, which do not reliably reach Harmony on this IL2CPP build.
     private void ApplyToLoadedSpineMosaics()
     {
         _currentSpineMosaicIds.Clear();
-        foreach (var mosaic in Resources.FindObjectsOfTypeAll<SpineMosaic>())
+        var foundR18 = false;
+
+#if ANDROID
+        var mosaics = Resources.FindObjectsOfTypeAll<SpineMosaic>();
+#else
+        var mosaics = UnityEngine.Object.FindObjectsByType<SpineMosaic>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
+        foreach (var mosaic in mosaics)
         {
             if (mosaic == null || mosaic.gameObject == null || !mosaic.gameObject.activeInHierarchy)
                 continue;
@@ -57,44 +110,75 @@ public sealed class MosaicSuppressor : MonoBehaviour
             _currentSpineMosaicIds.Add(instanceId);
             _activeSpineMosaics[instanceId] = mosaic;
 
+            var objectPath = UiHierarchyClassifier.GetHierarchyPath(mosaic.transform);
+            if (!foundR18 &&
+                (objectPath.Contains("/layer_R18/", StringComparison.OrdinalIgnoreCase) ||
+                 objectPath.Contains("/r18_scenes/", StringComparison.OrdinalIgnoreCase)))
+            {
+                foundR18 = true;
+            }
+
             if (_detectedSpineMosaics.Add(instanceId))
             {
-                var objectPath = GetObjectPath(mosaic.gameObject);
                 Core.Plugin.Log.LogInfo(
                     $"Detected SpineMosaic on {objectPath} " +
                     $"(children: {mosaic.transform.childCount})");
             }
         }
 
+        _hasActiveR18Character = foundR18;
+
         _removedSpineMosaicIds.Clear();
         foreach (var instanceId in _activeSpineMosaics.Keys)
             if (!_currentSpineMosaicIds.Contains(instanceId))
                 _removedSpineMosaicIds.Add(instanceId);
         foreach (var instanceId in _removedSpineMosaicIds)
+        {
             _activeSpineMosaics.Remove(instanceId);
+            _cachedRenderers.Remove(instanceId);
+        }
     }
 
     // This runs after game Update/LateUpdate and immediately before each camera renders.
     // Spine may rebuild its material array during its own updates, so the replacement must happen here.
+    // Guarded by frameCount so multi-camera scenes only run the material check once per frame.
     private void ApplyTransparentOverlaysBeforeRender(Camera _)
     {
-        if (!Core.Plugin.Settings.EnableSpineMosaicReplacement.Value)
+        if (_lastRenderFrame == Time.frameCount ||
+            _activeSpineMosaics.Count == 0 ||
+            !Core.Plugin.Settings.EnableSpineMosaicReplacement.Value)
             return;
 
-        foreach (var mosaic in _activeSpineMosaics.Values)
+        _lastRenderFrame = Time.frameCount;
+
+        foreach (var pair in _activeSpineMosaics)
         {
+            var mosaic = pair.Value;
             if (mosaic == null || mosaic.gameObject == null || !mosaic.gameObject.activeInHierarchy)
                 continue;
 
-            ReplaceRuntimeMosaicMaterials(mosaic);
+            ReplaceRuntimeMosaicMaterials(pair.Key, mosaic);
         }
     }
 
-    private void ReplaceRuntimeMosaicMaterials(SpineMosaic mosaic)
+    private void ReplaceRuntimeMosaicMaterials(int instanceId, SpineMosaic mosaic)
     {
         try
         {
-            foreach (var renderer in mosaic.gameObject.GetComponentsInChildren<Renderer>(includeInactive: true))
+            var childCount = mosaic.transform.childCount;
+            if (!_cachedRenderers.TryGetValue(instanceId, out var cached) ||
+                cached.ChildCount != childCount ||
+                cached.Renderers == null)
+            {
+                var il2cppRenderers = mosaic.gameObject.GetComponentsInChildren<Renderer>(includeInactive: true);
+                var managedRenderers = new Renderer[il2cppRenderers.Length];
+                for (var i = 0; i < il2cppRenderers.Length; i++)
+                    managedRenderers[i] = il2cppRenderers[i];
+                cached = (childCount, managedRenderers);
+                _cachedRenderers[instanceId] = cached;
+            }
+
+            foreach (var renderer in cached.Renderers)
             {
                 if (renderer == null)
                     continue;
@@ -138,7 +222,7 @@ public sealed class MosaicSuppressor : MonoBehaviour
     private Material GetTransparentOverlayMaterial(Material baseMaterial)
     {
         var materialKey = baseMaterial.GetInstanceID();
-        if (_transparentOverlayMaterials.TryGetValue(materialKey, out var existingMaterial))
+        if (_transparentOverlayMaterials.TryGetValue(materialKey, out var existingMaterial) && existingMaterial != null)
             return existingMaterial;
 
         var transparentOverlay = new Material(baseMaterial)
@@ -165,13 +249,26 @@ public sealed class MosaicSuppressor : MonoBehaviour
         return _transparentTexture;
     }
 
-    private static string GetObjectPath(GameObject gameObject)
+    private static bool ScanForActiveR18CharacterFallback()
     {
-        var names = new List<string>();
-        for (var transform = gameObject.transform; transform != null; transform = transform.parent)
-            names.Add(transform.name);
+#if ANDROID
+        var mosaics = Resources.FindObjectsOfTypeAll<SpineMosaic>();
+#else
+        var mosaics = UnityEngine.Object.FindObjectsByType<SpineMosaic>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
+        foreach (var mosaic in mosaics)
+        {
+            if (mosaic == null || mosaic.gameObject == null || !mosaic.gameObject.activeInHierarchy)
+                continue;
 
-        names.Reverse();
-        return string.Join("/", names);
+            var path = UiHierarchyClassifier.GetHierarchyPath(mosaic.transform);
+            if (path.Contains("/layer_R18/", StringComparison.OrdinalIgnoreCase) ||
+                path.Contains("/r18_scenes/", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 }

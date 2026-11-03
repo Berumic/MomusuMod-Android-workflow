@@ -1,12 +1,6 @@
 using System;
 using System.Collections.Generic;
-using MonsterMusumeTDMod.Patches;
 using MonsterMusumeTDMod.Services;
-#if ANDROID
-using Il2CppTMPro;
-#else
-using TMPro;
-#endif
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -15,10 +9,11 @@ namespace MonsterMusumeTDMod.Patches;
 public sealed class StoryLegacyFontReplacer : MonoBehaviour
 {
     private const float ScanIntervalSeconds = 0.05f;
-    private const float DiscoveryIntervalSeconds = 0.5f;
+    private const float ActiveDiscoveryIntervalSeconds = 0.5f;
+    private const float IdleDiscoveryIntervalSeconds = 1.5f;
 
-    private float _nextScanTime;
-    private float _nextDiscoveryTime;
+    private float _nextScanTime = 1.0f;
+    private float _nextDiscoveryTime = 1.0f;
     private readonly List<Text> _storyTexts = new();
 
     public StoryLegacyFontReplacer(IntPtr pointer)
@@ -34,8 +29,13 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
         _nextScanTime = Time.unscaledTime + ScanIntervalSeconds;
         if (Time.unscaledTime >= _nextDiscoveryTime)
         {
-            _nextDiscoveryTime = Time.unscaledTime + DiscoveryIntervalSeconds;
             RefreshStoryTextTargets();
+            var isStoryActive = _storyTexts.Count > 0 ||
+                                !string.IsNullOrEmpty(StorySceneContext.PlaybackId) ||
+                                !string.IsNullOrEmpty(ScenarioContext.CurrentId);
+            _nextDiscoveryTime = Time.unscaledTime + (isStoryActive
+                ? ActiveDiscoveryIntervalSeconds
+                : IdleDiscoveryIntervalSeconds);
         }
 
         if (_storyTexts.Count == 0)
@@ -46,7 +46,7 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
         {
             var text = _storyTexts[index];
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
-                !TmpFontInstaller.IsStoryMessageText(text))
+                !UiHierarchyClassifier.IsStoryMessageText(text))
             {
                 _storyTexts.RemoveAt(index);
                 continue;
@@ -60,10 +60,17 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
     private void RefreshStoryTextTargets()
     {
         _storyTexts.Clear();
-        foreach (var text in Resources.FindObjectsOfTypeAll<Text>())
+#if ANDROID
+        var texts = Resources.FindObjectsOfTypeAll<Text>();
+#else
+        var texts = UnityEngine.Object.FindObjectsByType<Text>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
+        foreach (var text in texts)
         {
             if (text != null && text.gameObject != null && text.gameObject.activeInHierarchy &&
-                TmpFontInstaller.IsStoryMessageText(text))
+                UiHierarchyClassifier.IsStoryMessageText(text))
                 _storyTexts.Add(text);
         }
     }

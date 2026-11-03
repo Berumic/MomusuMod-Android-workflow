@@ -2,8 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
-using Il2CppInterop.Runtime;
-using Il2CppInterop.Runtime.InteropTypes.Arrays;
 #if ANDROID
 using Il2CppTMPro;
 #else
@@ -17,14 +15,21 @@ namespace MonsterMusumeTDMod.Services;
 internal static class UiStyleManager
 {
     private static readonly List<StyleRule> Rules = new();
-    private static readonly Dictionary<int, Material> Materials = new();
-    private static readonly Dictionary<int, int> MaterialFontIds = new();
+
+    // Shared material pool keyed by visual style parameters so all scroll-list
+    // items with identical styling share a single Material instance and batch
+    // into one UGUI Canvas draw call.
+    private static readonly Dictionary<MaterialStyleKey, Material> SharedMaterials = new();
+    private static readonly Dictionary<int, MaterialStyleKey> InstanceStyleKeys = new();
     private static readonly Dictionary<int, Color> MaterialBaseFaceColors = new();
-    private static readonly Dictionary<int, TMP_Text> StyledTexts = new();
-    private static readonly Dictionary<int, TextMeshProUGUI> UnderlayTexts = new();
-    private static readonly Dictionary<int, TextMeshProUGUI> UnderlaySources = new();
-    private static readonly Dictionary<int, Material> UnderlayMaterials = new();
-    private static readonly List<int> InvalidUnderlayIds = new();
+
+    // Cache parent Selectable lookups per TMP_Text instanceId so we never call
+    // GetComponentInParent<Selectable>() across IL2CPP during scrolling.
+    private static readonly HashSet<int> CheckedSelectables = new();
+    private static readonly Dictionary<int, Selectable> ButtonSelectables = new();
+    private static readonly Dictionary<int, List<TMP_Text>> SelectableToTexts = new();
+    private static readonly Dictionary<int, bool> SelectableInteractableStates = new();
+
     private static StyleValues _defaults = new();
     private static string _stylePath;
     [ThreadStatic]
@@ -38,12 +43,110 @@ internal static class UiStyleManager
     private static StyleValues _batchBaseline;
     private static StyleValues _resolvedBaseline;
 
+    private readonly struct MaterialStyleKey : IEquatable<MaterialStyleKey>
+    {
+        public readonly int FontId;
+        public readonly int BaseMaterialId;
+        public readonly uint PackedFaceColor;
+        public readonly uint PackedOutlineColor;
+        public readonly short OutlineWidthMilli;
+        public readonly short FaceDilateMilli;
+        public readonly byte Flags; // bit 0: outline, bit 1: underlay
+        public readonly uint PackedUnderlayColor;
+        public readonly short UnderlayOffsetXMilli;
+        public readonly short UnderlayOffsetYMilli;
+        public readonly short UnderlayDilateMilli;
+        public readonly short UnderlaySoftnessMilli;
+
+        public MaterialStyleKey(
+            int fontId,
+            int baseMaterialId,
+            Color faceColor,
+            bool outline,
+            Color outlineColor,
+            float outlineWidth,
+            float faceDilate,
+            bool underlay,
+            Color underlayColor,
+            float underlayOffsetX,
+            float underlayOffsetY,
+            float underlayDilate,
+            float underlaySoftness)
+        {
+            FontId = fontId;
+            BaseMaterialId = baseMaterialId;
+            PackedFaceColor = PackColor(faceColor);
+            PackedOutlineColor = PackColor(outlineColor);
+            OutlineWidthMilli = Quantize(outline ? Mathf.Clamp01(outlineWidth) : 0f);
+            FaceDilateMilli = Quantize(Mathf.Clamp(faceDilate, -1f, 1f));
+            Flags = (byte)((outline ? 1 : 0) | (underlay ? 2 : 0));
+            PackedUnderlayColor = underlay ? PackColor(underlayColor) : 0u;
+            UnderlayOffsetXMilli = underlay ? Quantize(Mathf.Clamp(underlayOffsetX, -1f, 1f)) : (short)0;
+            UnderlayOffsetYMilli = underlay ? Quantize(Mathf.Clamp(underlayOffsetY, -1f, 1f)) : (short)0;
+            UnderlayDilateMilli = underlay ? Quantize(Mathf.Clamp(underlayDilate, -1f, 1f)) : (short)0;
+            UnderlaySoftnessMilli = underlay ? Quantize(Mathf.Clamp01(underlaySoftness)) : (short)0;
+        }
+
+        private static short Quantize(float value) =>
+            (short)Mathf.Clamp(Mathf.RoundToInt(value * 1000f), short.MinValue, short.MaxValue);
+
+        private static uint PackColor(Color c)
+        {
+            Color32 c32 = c;
+            return ((uint)c32.r << 24) | ((uint)c32.g << 16) | ((uint)c32.b << 8) | c32.a;
+        }
+
+        public bool Equals(MaterialStyleKey other) =>
+            FontId == other.FontId &&
+            BaseMaterialId == other.BaseMaterialId &&
+            PackedFaceColor == other.PackedFaceColor &&
+            PackedOutlineColor == other.PackedOutlineColor &&
+            OutlineWidthMilli == other.OutlineWidthMilli &&
+            FaceDilateMilli == other.FaceDilateMilli &&
+            Flags == other.Flags &&
+            PackedUnderlayColor == other.PackedUnderlayColor &&
+            UnderlayOffsetXMilli == other.UnderlayOffsetXMilli &&
+            UnderlayOffsetYMilli == other.UnderlayOffsetYMilli &&
+            UnderlayDilateMilli == other.UnderlayDilateMilli &&
+            UnderlaySoftnessMilli == other.UnderlaySoftnessMilli;
+
+        public override bool Equals(object obj) => obj is MaterialStyleKey other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            hash.Add(FontId);
+            hash.Add(BaseMaterialId);
+            hash.Add(PackedFaceColor);
+            hash.Add(PackedOutlineColor);
+            hash.Add(OutlineWidthMilli);
+            hash.Add(FaceDilateMilli);
+            hash.Add(Flags);
+            if ((Flags & 2) != 0)
+            {
+                hash.Add(PackedUnderlayColor);
+                hash.Add(UnderlayOffsetXMilli);
+                hash.Add(UnderlayOffsetYMilli);
+                hash.Add(UnderlayDilateMilli);
+                hash.Add(UnderlaySoftnessMilli);
+            }
+            return hash.ToHashCode();
+        }
+    }
+
     internal static bool SubmitBaseline(TMP_Text text, TMP_FontAsset font, float width,
         float dilate, Color outlineColor, float? spacing, bool outline = true)
     {
         if (_batchText == null || _batchText != text) return false;
-        _batchBaseline = new StyleValues { Font = font.name, OutlineWidth = width,
-            FaceDilate = dilate, OutlineColor = outlineColor, LineSpacing = spacing ?? _batchBaseline?.LineSpacing, Outline = outline };
+        _batchBaseline = new StyleValues
+        {
+            Font = font.name,
+            OutlineWidth = width,
+            FaceDilate = dilate,
+            OutlineColor = outlineColor,
+            LineSpacing = spacing ?? _batchBaseline?.LineSpacing,
+            Outline = outline
+        };
         _batchRequested = true;
         _batchFont = font;
         _batchWidth = width;
@@ -83,22 +186,16 @@ internal static class UiStyleManager
 
     public static void Reload()
     {
-        foreach (var material in Materials.Values)
+        foreach (var material in SharedMaterials.Values)
             if (material != null)
                 UnityEngine.Object.Destroy(material);
-        Materials.Clear();
-        MaterialFontIds.Clear();
+        SharedMaterials.Clear();
+        InstanceStyleKeys.Clear();
         MaterialBaseFaceColors.Clear();
-        StyledTexts.Clear();
-        foreach (var underlayText in UnderlayTexts.Values)
-            if (underlayText != null)
-                UnityEngine.Object.Destroy(underlayText.gameObject);
-        UnderlayTexts.Clear();
-        UnderlaySources.Clear();
-        foreach (var underlayMaterial in UnderlayMaterials.Values)
-            if (underlayMaterial != null)
-                UnityEngine.Object.Destroy(underlayMaterial);
-        UnderlayMaterials.Clear();
+        CheckedSelectables.Clear();
+        ButtonSelectables.Clear();
+        SelectableToTexts.Clear();
+        SelectableInteractableStates.Clear();
         Rules.Clear();
         _defaults = new StyleValues();
         if (string.IsNullOrEmpty(_stylePath) || !File.Exists(_stylePath))
@@ -170,7 +267,7 @@ internal static class UiStyleManager
         if (text?.transform == null)
             return false;
 
-        var path = UiStylePolicy.NormalizePath(TmpFontInstaller.GetHierarchyPath(text));
+        var path = UiHierarchyClassifier.GetNormalizedHierarchyPath(text.transform);
         StyleRule matched = null;
         foreach (var rule in Rules)
         {
@@ -197,18 +294,14 @@ internal static class UiStyleManager
         var underlaySoftness = values.UnderlaySoftness ?? 0f;
         var changed = false;
 
-        // TMP font assignment can replace the material preset and, depending
-        // on the game-side setter, reset the component's vertex colours.
-        // Capture both sources of tint before changing the font.
-        var originalColor = text.color;
-        var originalGradientEnabled = text.enableVertexGradient;
-        var originalGradient = text.colorGradient;
-        var originalGradientPreset = text.colorGradientPreset;
         var originalMaterial = text.fontSharedMaterial;
-
         var selectedFont = TmpFontInstaller.ResolveStyleFont(font, alimamaFont);
         if (selectedFont != null && text.font != selectedFont)
         {
+            var originalColor = text.color;
+            var originalGradientEnabled = text.enableVertexGradient;
+            var originalGradient = text.colorGradient;
+            var originalGradientPreset = text.colorGradientPreset;
             text.font = selectedFont;
             text.color = originalColor;
             text.enableVertexGradient = originalGradientEnabled;
@@ -231,125 +324,68 @@ internal static class UiStyleManager
         var instanceId = text.GetInstanceID();
         var materialFont = selectedFont ?? text.font;
         var selectedFontId = materialFont == null ? 0 : materialFont.GetInstanceID();
-        var materialUsesSelectedFont = MaterialFontIds.TryGetValue(instanceId, out var materialFontId) &&
-                                       materialFontId == selectedFontId;
-        if (!Materials.TryGetValue(instanceId, out var material) || material == null ||
-            !materialUsesSelectedFont)
+        var baseMaterial = materialFont != null ? materialFont.material : originalMaterial;
+        if (baseMaterial == null)
+            return changed;
+
+        if (!MaterialBaseFaceColors.TryGetValue(instanceId, out var baseFaceColor))
         {
-            if (material != null)
-                UnityEngine.Object.Destroy(material);
-            // A TMP material must belong to the selected font asset. Copying
-            // the old FOT material after switching to Alimama leaves the text
-            // bound to the wrong atlas and makes the font override ineffective.
-            var baseMaterial = materialFont != null ? materialFont.material : text.fontSharedMaterial;
-            if (baseMaterial == null)
-                return changed;
-            material = new Material(baseMaterial)
-            {
-                name = $"{baseMaterial.name}_PathStyle_{instanceId}"
-            };
-            if (!fontColor.HasValue && material.HasProperty("_FaceColor"))
+            baseFaceColor = Color.white;
+            if (!fontColor.HasValue)
             {
                 if (TmpFontInstaller.TryGetOriginalFaceColor(text, out var translatedFaceColor))
-                    material.SetColor("_FaceColor", translatedFaceColor);
+                    baseFaceColor = translatedFaceColor;
                 else if (originalMaterial != null && originalMaterial.HasProperty("_FaceColor"))
-                    material.SetColor("_FaceColor", originalMaterial.GetColor("_FaceColor"));
+                    baseFaceColor = originalMaterial.GetColor("_FaceColor");
+                else if (baseMaterial.HasProperty("_FaceColor"))
+                    baseFaceColor = baseMaterial.GetColor("_FaceColor");
             }
-            Materials[instanceId] = material;
-            StyledTexts[instanceId] = text;
-            MaterialFontIds[instanceId] = selectedFontId;
-            if (material.HasProperty("_FaceColor"))
-                MaterialBaseFaceColors[instanceId] = material.GetColor("_FaceColor");
-            changed = true;
+            MaterialBaseFaceColors[instanceId] = baseFaceColor;
         }
-        changed |= SyncButtonFaceColor(text, material, instanceId);
-        if (material.HasProperty("_OutlineColor") && material.GetColor("_OutlineColor") != outlineColor)
+        else if (fontColor.HasValue)
         {
-            material.SetColor("_OutlineColor", outlineColor);
-            changed = true;
+            baseFaceColor = Color.white;
         }
-        var targetWidth = outline ? Mathf.Clamp01(outlineWidth) : 0f;
-        if (material.HasProperty("_OutlineWidth") &&
-            !Mathf.Approximately(material.GetFloat("_OutlineWidth"), targetWidth))
-        {
-            material.SetFloat("_OutlineWidth", targetWidth);
-            changed = true;
-        }
-        if (material.HasProperty("_FaceDilate") &&
-            !Mathf.Approximately(material.GetFloat("_FaceDilate"), faceDilate))
-        {
-            material.SetFloat("_FaceDilate", Mathf.Clamp(faceDilate, -1f, 1f));
-            changed = true;
-        }
-        if (outline && !material.HasShaderKeyword("OUTLINE_ON"))
-        {
-            material.EnableKeyword("OUTLINE_ON");
-            changed = true;
-        }
-        else if (!outline && material.HasShaderKeyword("OUTLINE_ON"))
-        {
-            material.DisableKeyword("OUTLINE_ON");
-            changed = true;
-        }
-        // A reused slot may move from an underlay rule to a plain rule.
-        // Absence of underlay in the resolved style must retire the old layer.
-        if (!underlay.HasValue && UnderlayTexts.ContainsKey(instanceId))
-        {
-            changed |= RemoveUnderlayLayer(text);
-            if (material.HasShaderKeyword("UNDERLAY_ON"))
-            {
-                material.DisableKeyword("UNDERLAY_ON");
-                changed = true;
-            }
-        }
-        if (underlay.HasValue)
-        {
-            if (underlay.Value)
-            {
-                if (!material.HasProperty("_UnderlayColor") ||
-                    !material.HasProperty("_UnderlayOffsetX") ||
-                    !material.HasProperty("_UnderlayOffsetY") ||
-                    !material.HasProperty("_UnderlayDilate") ||
-                    !material.HasProperty("_UnderlaySoftness"))
-                {
-                    Core.Plugin.Log?.LogWarning(
-                        $"TMP font material does not expose full underlay properties: " +
-                        $"font={selectedFont?.name ?? text.font?.name ?? "<none>"}, " +
-                        $"shader={material.shader?.name ?? "<none>"}");
-                }
-                changed |= SetMaterialColor(material, "_UnderlayColor", underlayColor);
-                changed |= SetMaterialFloat(material, "_UnderlayOffsetX", underlayOffsetX, -1f, 1f);
-                changed |= SetMaterialFloat(material, "_UnderlayOffsetY", underlayOffsetY, -1f, 1f);
-                changed |= SetMaterialFloat(material, "_UnderlayDilate", underlayDilate, -1f, 1f);
-                changed |= SetMaterialFloat(material, "_UnderlaySoftness", underlaySoftness, 0f, 1f);
-                if (!material.HasShaderKeyword("UNDERLAY_ON"))
-                {
-                    material.EnableKeyword("UNDERLAY_ON");
-                    changed = true;
-                }
-#if !ANDROID
-                // Baked lighting flags are irrelevant to UI and stripped on Android.
-                material.globalIlluminationFlags = MaterialGlobalIlluminationFlags.EmissiveIsBlack;
-#endif
-                changed |= ApplyUnderlayLayer(
-                    text,
-                    materialFont,
-                    underlayColor,
-                    underlayOffsetX,
-                    underlayOffsetY,
-                    underlayDilate,
-                    underlaySoftness);
-            }
-            else
-            {
-                if (material.HasShaderKeyword("UNDERLAY_ON"))
-                {
-                    material.DisableKeyword("UNDERLAY_ON");
-                    changed = true;
-                }
-                changed |= RemoveUnderlayLayer(text);
-            }
-        }
+
+        var targetFaceColor = baseFaceColor * GetButtonTintCached(text, instanceId, baseFaceColor);
+        var useUnderlay = underlay.HasValue && underlay.Value;
+        var styleKey = new MaterialStyleKey(
+            selectedFontId,
+            baseMaterial.GetInstanceID(),
+            targetFaceColor,
+            outline,
+            outlineColor,
+            outlineWidth,
+            faceDilate,
+            useUnderlay,
+            underlayColor,
+            underlayOffsetX,
+            underlayOffsetY,
+            underlayDilate,
+            underlaySoftness);
+
+        var material = GetOrCreateSharedMaterial(
+            styleKey,
+            baseMaterial,
+            selectedFont,
+            text,
+            targetFaceColor,
+            outline,
+            outlineColor,
+            outlineWidth,
+            faceDilate,
+            useUnderlay,
+            underlayColor,
+            underlayOffsetX,
+            underlayOffsetY,
+            underlayDilate,
+            underlaySoftness);
+        InstanceStyleKeys[instanceId] = styleKey;
+
+        // Rely exclusively on TMP's native SDF shader UNDERLAY_ON keyword
+        // configured on the shared material above, instead of instantiating
+        // duplicate __MMTDUnderlay TextMeshProUGUI GameObjects that double
+        // vertex counts and trigger per-frame OnEnable/OnDisable rebuilds.
         if (text.fontSharedMaterial != material)
         {
             text.fontSharedMaterial = material;
@@ -360,347 +396,158 @@ internal static class UiStyleManager
         return true;
     }
 
-    private static bool ApplyUnderlayLayer(
+    private static Material GetOrCreateSharedMaterial(
+        MaterialStyleKey key,
+        Material baseMaterial,
+        TMP_FontAsset selectedFont,
         TMP_Text text,
-        TMP_FontAsset font,
-        Color color,
-        float offsetX,
-        float offsetY,
-        float dilate,
-        float softness)
+        Color targetFaceColor,
+        bool outline,
+        Color outlineColor,
+        float outlineWidth,
+        float faceDilate,
+        bool useUnderlay,
+        Color underlayColor,
+        float underlayOffsetX,
+        float underlayOffsetY,
+        float underlayDilate,
+        float underlaySoftness)
     {
-        if (text is not TextMeshProUGUI source || source.gameObject == null || font?.material == null)
-            return false;
+        if (SharedMaterials.TryGetValue(key, out var material) && material != null)
+            return material;
 
-        var id = text.GetInstanceID();
-        if (!UnderlayTexts.TryGetValue(id, out var layer) || layer == null)
+        material = new Material(baseMaterial)
         {
-            var layerObject = new GameObject(
-                $"{source.gameObject.name}__MMTDUnderlay",
-                new Il2CppReferenceArray<Il2CppSystem.Type>(new[] { Il2CppType.Of<RectTransform>() }));
-            layerObject.transform.SetParent(source.transform.parent, false);
-            layer = layerObject.AddComponent<TextMeshProUGUI>();
-            if (layer == null)
-            {
-                UnityEngine.Object.Destroy(layerObject);
-                return false;
-            }
-            layer.enabled = false;
-            var layout = layerObject.AddComponent<LayoutElement>();
-            if (layout != null)
-                layout.ignoreLayout = true;
-            layer.raycastTarget = false;
-            UnderlayTexts[id] = layer;
+            name = $"{baseMaterial.name}_SharedStyle_{SharedMaterials.Count}"
+        };
+        if (material.HasProperty("_FaceColor"))
+            material.SetColor("_FaceColor", targetFaceColor);
+        if (material.HasProperty("_OutlineColor"))
+            material.SetColor("_OutlineColor", outlineColor);
+        var targetWidth = outline ? Mathf.Clamp01(outlineWidth) : 0f;
+        if (material.HasProperty("_OutlineWidth"))
+            material.SetFloat("_OutlineWidth", targetWidth);
+        if (material.HasProperty("_FaceDilate"))
+            material.SetFloat("_FaceDilate", Mathf.Clamp(faceDilate, -1f, 1f));
+        if (outline && !material.HasShaderKeyword("OUTLINE_ON"))
+            material.EnableKeyword("OUTLINE_ON");
+        else if (!outline && material.HasShaderKeyword("OUTLINE_ON"))
+            material.DisableKeyword("OUTLINE_ON");
+
+        if (useUnderlay)
+        {
+            SetMaterialColor(material, "_UnderlayColor", underlayColor);
+            SetMaterialFloat(material, "_UnderlayOffsetX", underlayOffsetX, -1f, 1f);
+            SetMaterialFloat(material, "_UnderlayOffsetY", underlayOffsetY, -1f, 1f);
+            SetMaterialFloat(material, "_UnderlayDilate", underlayDilate, -1f, 1f);
+            SetMaterialFloat(material, "_UnderlaySoftness", underlaySoftness, 0f, 1f);
+            if (!material.HasShaderKeyword("UNDERLAY_ON"))
+                material.EnableKeyword("UNDERLAY_ON");
+#if !ANDROID
+            material.globalIlluminationFlags = MaterialGlobalIlluminationFlags.EmissiveIsBlack;
+#endif
         }
-        UnderlaySources[id] = source;
-
-        var changed = false;
-        if (!UnderlayMaterials.TryGetValue(id, out var layerMaterial) || layerMaterial == null ||
-            layer.font != font)
+        else if (material.HasShaderKeyword("UNDERLAY_ON"))
         {
-            if (layerMaterial != null)
-                UnityEngine.Object.Destroy(layerMaterial);
-            layerMaterial = new Material(font.material)
-            {
-                name = $"{font.material.name}_PathUnderlay_{id}"
-            };
-            UnderlayMaterials[id] = layerMaterial;
-            layer.font = font;
-            layer.fontSharedMaterial = layerMaterial;
-            changed = true;
+            material.DisableKeyword("UNDERLAY_ON");
         }
 
-        var targetColor = color;
-        targetColor.a = color.a <= 0f ? 1f : color.a;
-        changed |= SetMaterialColor(layerMaterial, "_FaceColor", targetColor);
-        changed |= SetMaterialFloat(layerMaterial, "_FaceDilate", dilate, -1f, 1f);
-        changed |= SetMaterialFloat(layerMaterial, "_OutlineWidth", softness, 0f, 1f);
-        changed |= SetMaterialColor(layerMaterial, "_OutlineColor", targetColor);
-        if (softness > 0f && !layerMaterial.HasShaderKeyword("OUTLINE_ON"))
-        {
-            layerMaterial.EnableKeyword("OUTLINE_ON");
-            changed = true;
-        }
-        else if (softness <= 0f && layerMaterial.HasShaderKeyword("OUTLINE_ON"))
-        {
-            layerMaterial.DisableKeyword("OUTLINE_ON");
-            changed = true;
-        }
-        if (layerMaterial.HasShaderKeyword("UNDERLAY_ON"))
-        {
-            layerMaterial.DisableKeyword("UNDERLAY_ON");
-            changed = true;
-        }
-
-        var sourceRect = source.rectTransform;
-        var layerRect = layer.rectTransform;
-        layerRect.anchorMin = sourceRect.anchorMin;
-        layerRect.anchorMax = sourceRect.anchorMax;
-        layerRect.pivot = sourceRect.pivot;
-        layerRect.sizeDelta = sourceRect.sizeDelta;
-        layerRect.localScale = sourceRect.localScale;
-        layerRect.localRotation = sourceRect.localRotation;
-        var distance = new Vector2(offsetX, offsetY) * 6f;
-        if (distance.sqrMagnitude < 0.01f)
-            distance = new Vector2(1f, -4f);
-        layerRect.anchoredPosition = sourceRect.anchoredPosition + distance;
-        // Keep the projection immediately behind the source. Setting both to
-        // the same index on every refresh swaps their order back and forth,
-        // which presents as flicker and can leave the dark layer in front.
-        var layerIndex = layer.transform.GetSiblingIndex();
-        var sourceIndex = source.transform.GetSiblingIndex();
-        if (layerIndex > sourceIndex)
-        {
-            layer.transform.SetSiblingIndex(sourceIndex);
-            changed = true;
-        }
-
-        if (!string.Equals(layer.text, source.text, StringComparison.Ordinal))
-            layer.text = source.text;
-        if (layer.fontSize != source.fontSize)
-            layer.fontSize = source.fontSize;
-        if (layer.fontStyle != source.fontStyle)
-            layer.fontStyle = source.fontStyle;
-        if (layer.alignment != source.alignment)
-            layer.alignment = source.alignment;
-        if (layer.enableAutoSizing != source.enableAutoSizing)
-            layer.enableAutoSizing = source.enableAutoSizing;
-        if (layer.fontSizeMin != source.fontSizeMin)
-            layer.fontSizeMin = source.fontSizeMin;
-        if (layer.fontSizeMax != source.fontSizeMax)
-            layer.fontSizeMax = source.fontSizeMax;
-        if (layer.enableWordWrapping != source.enableWordWrapping)
-            layer.enableWordWrapping = source.enableWordWrapping;
-        if (layer.overflowMode != source.overflowMode)
-            layer.overflowMode = source.overflowMode;
-        if (layer.richText != source.richText)
-            layer.richText = source.richText;
-        if (layer.characterSpacing != source.characterSpacing)
-            layer.characterSpacing = source.characterSpacing;
-        if (layer.wordSpacing != source.wordSpacing)
-            layer.wordSpacing = source.wordSpacing;
-        if (layer.lineSpacing != source.lineSpacing)
-            layer.lineSpacing = source.lineSpacing;
-        if (layer.paragraphSpacing != source.paragraphSpacing)
-            layer.paragraphSpacing = source.paragraphSpacing;
-        if (layer.margin != source.margin)
-            layer.margin = source.margin;
-        layer.color = source.color * source.canvasRenderer.GetColor() * GetButtonTint(source);
-        layer.enableVertexGradient = false;
-        if (layer.maskable != source.maskable)
-            layer.maskable = source.maskable;
-        // TMP property setters invalidate only the data that actually changed.
-        // Do not force a layout/mesh rebuild for an unchanged projection.
-        var visible = CanRenderUnderlay(source);
-        if (layer.enabled != visible)
-            layer.enabled = visible;
-        return changed;
+        SharedMaterials[key] = material;
+        return material;
     }
 
-    private static bool RemoveUnderlayLayer(TMP_Text text)
+    internal static bool HasUnderlay(int _) => false;
+
+    internal static bool IsInstanceStyled(int instanceId) => InstanceStyleKeys.ContainsKey(instanceId);
+
+    internal static void NotifySelectableStateChanged(object instance)
     {
-        if (text == null)
-            return false;
-        var id = text.GetInstanceID();
-        var removed = false;
-        if (UnderlayTexts.Remove(id, out var layer) && layer != null)
+        if (instance is not Selectable selectable || selectable == null)
+            return;
+
+        var selectableId = selectable.GetInstanceID();
+        if (!SelectableToTexts.TryGetValue(selectableId, out var texts) || texts.Count == 0)
+            return;
+
+        var isInteractable = selectable.IsInteractable();
+        if (SelectableInteractableStates.TryGetValue(selectableId, out var previousInteractable) &&
+            previousInteractable == isInteractable)
         {
-            UnityEngine.Object.Destroy(layer.gameObject);
-            removed = true;
+            return;
         }
-        UnderlaySources.Remove(id);
-        if (UnderlayMaterials.Remove(id, out var material) && material != null)
+
+        SelectableInteractableStates[selectableId] = isInteractable;
+        for (var i = texts.Count - 1; i >= 0; i--)
         {
-            UnityEngine.Object.Destroy(material);
-            removed = true;
+            var text = texts[i];
+            if (text == null || text.gameObject == null)
+            {
+                texts.RemoveAt(i);
+                continue;
+            }
+            MonsterMusumeTDMod.Patches.UiCanvasTranslationScanner.QueueActivationRefresh(text);
         }
-        return removed;
     }
 
     internal static void ReleasePresentation(TMP_Text text)
     {
         if (text == null) return;
         var id = text.GetInstanceID();
-        RemoveUnderlayLayer(text);
-        StyledTexts.Remove(id);
+        InstanceStyleKeys.Remove(id);
         MaterialBaseFaceColors.Remove(id);
-        MaterialFontIds.Remove(id);
-        if (Materials.Remove(id, out var material) && material != null)
-            UnityEngine.Object.Destroy(material);
+        CheckedSelectables.Remove(id);
+        ButtonSelectables.Remove(id);
     }
 
-    internal static void SyncUnderlayLayer(TMP_Text text)
+    internal static void SyncUnderlayLayer(TMP_Text _)
     {
-        if (text is not TextMeshProUGUI source ||
-            !UnderlayTexts.TryGetValue(text.GetInstanceID(), out var layer) || layer == null)
-            return;
-
-        // Run after translation processing so the projection never retains
-        // the source-language value seen by an earlier TMP setter hook.
-        if (!string.Equals(layer.text, source.text, StringComparison.Ordinal))
-            layer.text = source.text;
-        if (layer.fontSize != source.fontSize)
-            layer.fontSize = source.fontSize;
-        if (layer.fontStyle != source.fontStyle)
-            layer.fontStyle = source.fontStyle;
-        if (layer.alignment != source.alignment)
-            layer.alignment = source.alignment;
-        if (layer.enableAutoSizing != source.enableAutoSizing)
-            layer.enableAutoSizing = source.enableAutoSizing;
-        if (layer.fontSizeMin != source.fontSizeMin)
-            layer.fontSizeMin = source.fontSizeMin;
-        if (layer.fontSizeMax != source.fontSizeMax)
-            layer.fontSizeMax = source.fontSizeMax;
-        if (layer.enableWordWrapping != source.enableWordWrapping)
-            layer.enableWordWrapping = source.enableWordWrapping;
-        if (layer.overflowMode != source.overflowMode)
-            layer.overflowMode = source.overflowMode;
-        if (layer.richText != source.richText)
-            layer.richText = source.richText;
-        if (layer.characterSpacing != source.characterSpacing)
-            layer.characterSpacing = source.characterSpacing;
-        if (layer.wordSpacing != source.wordSpacing)
-            layer.wordSpacing = source.wordSpacing;
-        if (layer.lineSpacing != source.lineSpacing)
-            layer.lineSpacing = source.lineSpacing;
-        if (layer.paragraphSpacing != source.paragraphSpacing)
-            layer.paragraphSpacing = source.paragraphSpacing;
-        if (layer.margin != source.margin)
-            layer.margin = source.margin;
-        if (layer.maskable != source.maskable)
-            layer.maskable = source.maskable;
-        if (Materials.TryGetValue(source.GetInstanceID(), out var sourceMaterial) && sourceMaterial != null)
-            SyncButtonFaceColor(source, sourceMaterial, source.GetInstanceID());
-        var layerColor = source.color * source.canvasRenderer.GetColor() * GetButtonTint(source);
-        if (layer.color != layerColor)
-            layer.color = layerColor;
-
-        if (layer.transform.GetSiblingIndex() > source.transform.GetSiblingIndex())
-            layer.transform.SetSiblingIndex(source.transform.GetSiblingIndex());
-
-        // This runs before rendering every frame. Toggling enabled here would
-        // unregister/register the graphic and rebuild even completely static UI.
-        var visible = CanRenderUnderlay(source);
-        if (layer.enabled != visible)
-            layer.enabled = visible;
+        // Native SDF shader UNDERLAY_ON requires no sibling GameObject syncing.
     }
 
-    internal static void PrepareUnderlayForTextChange(object component)
+    internal static void PrepareUnderlayForTextChange(object _)
     {
-        if (component is TMP_Text text &&
-            UnderlayTexts.TryGetValue(text.GetInstanceID(), out var layer) && layer != null)
-            layer.enabled = false;
+        // Native SDF shader UNDERLAY_ON updates automatically with the main text mesh.
     }
 
     internal static void SyncAllUnderlayLayers()
     {
-        // Animated targets can change colour without a Selectable state event.
-        // Include styled labels without projection layers as well.
-        InvalidUnderlayIds.Clear();
-        foreach (var entry in StyledTexts)
-        {
-            var text = entry.Value;
-            if (text == null || text.gameObject == null)
-            {
-                InvalidUnderlayIds.Add(entry.Key);
-                continue;
-            }
-            if (text.gameObject.activeInHierarchy && !UnderlaySources.ContainsKey(entry.Key) &&
-                Materials.TryGetValue(entry.Key, out var material) && material != null)
-                SyncButtonFaceColor(text, material, entry.Key);
-        }
-        foreach (var id in InvalidUnderlayIds)
-        {
-            StyledTexts.Remove(id);
-            MaterialBaseFaceColors.Remove(id);
-            MaterialFontIds.Remove(id);
-            if (Materials.Remove(id, out var material) && material != null)
-                UnityEngine.Object.Destroy(material);
-        }
-        if (UnderlaySources.Count == 0)
-            return;
-
-        InvalidUnderlayIds.Clear();
-        foreach (var entry in UnderlaySources)
-        {
-            var source = entry.Value;
-            if (source == null || source.gameObject == null)
-            {
-                InvalidUnderlayIds.Add(entry.Key);
-                continue;
-            }
-            if (!source.gameObject.activeInHierarchy)
-            {
-                if (UnderlayTexts.TryGetValue(entry.Key, out var hiddenLayer) && hiddenLayer != null && hiddenLayer.enabled)
-                    hiddenLayer.enabled = false;
-                continue;
-            }
-            SyncUnderlayLayer(source);
-        }
-
-        foreach (var id in InvalidUnderlayIds)
-        {
-            if (UnderlayTexts.Remove(id, out var layer) && layer != null)
-                UnityEngine.Object.Destroy(layer.gameObject);
-            if (UnderlayMaterials.Remove(id, out var material) && material != null)
-                UnityEngine.Object.Destroy(material);
-            UnderlaySources.Remove(id);
-        }
+        // Native SDF shader UNDERLAY_ON + event-driven Selectable state transitions
+        // require zero per-frame polling in willRenderCanvases.
     }
 
-    private static bool CanRenderUnderlay(TextMeshProUGUI source)
+    private static Color GetButtonTintCached(TMP_Text text, int instanceId, Color baseFaceColor)
     {
-        if (!source.enabled || !source.gameObject.activeInHierarchy || source.color.a <= 0.001f)
-            return false;
+        if (!CheckedSelectables.Contains(instanceId))
+        {
+            CheckedSelectables.Add(instanceId);
+            // Scroll-list items sit inside a ScrollRect; their labels do not need
+            // per-button disabled-tint material splitting unless directly on a non-scroll button.
+            var parentSelectable = text.GetComponentInParent<Selectable>();
+            if (parentSelectable != null &&
+                parentSelectable.targetGraphic != text &&
+                parentSelectable.transition == Selectable.Transition.ColorTint)
+            {
+                ButtonSelectables[instanceId] = parentSelectable;
+                var selectableId = parentSelectable.GetInstanceID();
+                if (!SelectableToTexts.TryGetValue(selectableId, out var children))
+                {
+                    children = new List<TMP_Text>(2);
+                    SelectableToTexts[selectableId] = children;
+                }
+                if (!children.Contains(text))
+                    children.Add(text);
+                SelectableInteractableStates[selectableId] = parentSelectable.IsInteractable();
+            }
+        }
 
-        // A disabled Button still renders its label and its shadow/underlay;
-        // only the graphic color changes. Do not hide the projection here.
-        // The sibling projection inherits the same CanvasGroups naturally.
-        // Enumerating all parent groups here allocates an IL2CPP array for
-        // every label on every rendered frame.
-        return true;
-    }
-
-    private static bool SyncButtonFaceColor(TMP_Text text, Material material, int instanceId)
-    {
-        if (text == null || material == null || !material.HasProperty("_FaceColor") ||
-            !MaterialBaseFaceColors.TryGetValue(instanceId, out var baseColor))
-            return false;
-
-        var targetColor = baseColor * GetButtonTint(text);
-
-        if (material.GetColor("_FaceColor") == targetColor)
-            return false;
-        material.SetColor("_FaceColor", targetColor);
-        text.SetMaterialDirty();
-        return true;
-    }
-
-    private static Color GetButtonTint(TMP_Text text)
-    {
-        var selectable = text.GetComponentInParent<Selectable>();
-        if (selectable == null)
+        if (!ButtonSelectables.TryGetValue(instanceId, out var selectable) || selectable == null)
             return Color.white;
 
-        // A label which is itself the target graphic already receives Unity's
-        // colour transition. Multiplying it again would darken it twice.
-        if (selectable.targetGraphic == text)
+        if (selectable.IsInteractable())
             return Color.white;
-        var labelColor = text.color * text.canvasRenderer.GetColor();
-        if (MaterialBaseFaceColors.TryGetValue(text.GetInstanceID(), out var baseFace))
-            labelColor *= baseFace;
-        var target = selectable.targetGraphic;
-        if (selectable.transition == Selectable.Transition.Animation && target != null)
-        {
-            var tint = target.color * target.canvasRenderer.GetColor();
-            // Transfer neutral dimming, not decorative background hues.
-            // Read the actual animated value, never multiply yesterday's tint.
-            if (Mathf.Abs(tint.r - tint.g) < 0.005f &&
-                Mathf.Abs(tint.g - tint.b) < 0.005f)
-                return UiStylePolicy.InheritButtonGray(labelColor, tint);
-        }
-        return selectable.IsInteractable() ? Color.white :
-            UiStylePolicy.InheritButtonGray(labelColor, selectable.colors.disabledColor);
+
+        var labelColor = text.color * baseFaceColor;
+        return UiStylePolicy.InheritButtonGray(labelColor, selectable.colors.disabledColor);
     }
 
     private static StyleValues ReadValues(JsonElement element)
@@ -774,5 +621,4 @@ internal static class UiStyleManager
         public string Path { get; }
         public StyleValues Values { get; }
     }
-
 }

@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Generic;
 using MonsterMusumeTDMod.Core;
+using MonsterMusumeTDMod.Services;
 #if ANDROID
 using Il2CppTMPro;
 #else
@@ -48,14 +48,8 @@ public sealed class SubSkillOverviewScanner : MonoBehaviour
 
         if (_waitingForBinding)
         {
-            // Let the game's binding setters fire for this virtualised page.
-            // The translation prefix records their original arguments. Do not
-            // rely on it alone: some cards update their visible renderer
-            // without invoking a string setter.
             Plugin.Translations?.CaptureVisibleSubSkillScanText();
             _waitingForBinding = false;
-            // Some list entries complete their nested data binding one frame
-            // later. Keep a second dwell before moving to avoid missed rows.
             _nextActionAt = Time.unscaledTime + BindDelaySeconds;
             return;
         }
@@ -66,15 +60,11 @@ public sealed class SubSkillOverviewScanner : MonoBehaviour
             return;
         }
 
-        // Capture once more after the second dwell before moving away from
-        // this position. The collector deduplicates repeated text.
         Plugin.Translations?.CaptureVisibleSubSkillScanText();
         var progress = (float)_step / Steps;
         _scrollRect.velocity = Vector2.zero;
         _scrollRect.verticalNormalizedPosition = 1f - progress;
         _step++;
-        // ScrollRect rebuilds its virtualised children during the next Unity
-        // frame. The following delayed pass deliberately waits for that work.
         _waitingForBinding = true;
         _nextActionAt = Time.unscaledTime + BindDelaySeconds;
     }
@@ -92,7 +82,7 @@ public sealed class SubSkillOverviewScanner : MonoBehaviour
         _waitingForBinding = false;
         _nextActionAt = Time.unscaledTime;
         Plugin.Translations?.BeginSubSkillScan();
-        Plugin.Log?.LogInfo($"开始采集副技能列表: {GetHierarchy(_scrollRect)}");
+        Plugin.Log?.LogInfo($"开始采集副技能列表: {UiHierarchyClassifier.GetHierarchyPath(_scrollRect, 32)}");
         Plugin.Log?.LogInfo("请保持当前页面打开，约 40 秒内不要操作滚动条。");
     }
 
@@ -106,16 +96,12 @@ public sealed class SubSkillOverviewScanner : MonoBehaviour
 
     private static ScrollRect FindSubSkillList()
     {
-        // The current game uses the AttachAbility dialog for the complete
-        // assignable sub-skill list. Keep the older Rework dialog compatible.
-        // The recipe window is intentionally excluded: it only has crafting
-        // and ownership entries.
         foreach (var scrollRect in Resources.FindObjectsOfTypeAll<ScrollRect>())
         {
             if (scrollRect == null || scrollRect.gameObject == null ||
                 !scrollRect.gameObject.activeInHierarchy)
                 continue;
-            if (IsLegacySubSkillListPath(GetHierarchy(scrollRect)))
+            if (UiHierarchyClassifier.IsLegacySubSkillListPath(UiHierarchyClassifier.GetHierarchyPath(scrollRect, 32)))
                 return scrollRect;
         }
 
@@ -124,44 +110,25 @@ public sealed class SubSkillOverviewScanner : MonoBehaviour
             if (scrollRect == null || scrollRect.gameObject == null ||
                 !scrollRect.gameObject.activeInHierarchy)
                 continue;
-            if (IsAttachAbilitySubSkillListPath(GetHierarchy(scrollRect)))
+            if (UiHierarchyClassifier.IsAttachAbilitySubSkillHierarchy(UiHierarchyClassifier.GetHierarchyPath(scrollRect, 32)))
                 return scrollRect;
         }
 
-        // If the component itself is renamed, walk back from a visible
-        // SubSkillTextArea child to its parent ScrollRect.
         foreach (var text in Resources.FindObjectsOfTypeAll<TMP_Text>())
         {
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy)
                 continue;
-            var hierarchy = GetHierarchy(text);
+            var hierarchy = UiHierarchyClassifier.GetHierarchyPath(text, 32);
             if (!hierarchy.Contains("subskilltextarea", StringComparison.OrdinalIgnoreCase) &&
-                !IsAttachAbilitySubSkillListPath(hierarchy))
+                !UiHierarchyClassifier.IsAttachAbilitySubSkillHierarchy(hierarchy))
                 continue;
             var parent = text.GetComponentInParent<ScrollRect>();
             if (parent != null && parent.gameObject != null && parent.gameObject.activeInHierarchy &&
-                (IsLegacySubSkillListPath(hierarchy) || IsAttachAbilitySubSkillListPath(hierarchy)))
+                (UiHierarchyClassifier.IsLegacySubSkillListPath(hierarchy) ||
+                 UiHierarchyClassifier.IsAttachAbilitySubSkillHierarchy(hierarchy)))
                 return parent;
         }
 
         return null;
-    }
-
-    private static bool IsLegacySubSkillListPath(string hierarchy) =>
-        hierarchy.Contains("unit_detail_rework", StringComparison.OrdinalIgnoreCase) &&
-         hierarchy.Contains("skilldialog", StringComparison.OrdinalIgnoreCase) &&
-         hierarchy.Contains("scroll view", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsAttachAbilitySubSkillListPath(string hierarchy) =>
-        hierarchy.Contains("unit_detail_attachability", StringComparison.OrdinalIgnoreCase) &&
-        hierarchy.Contains("windowbase/scrollview", StringComparison.OrdinalIgnoreCase);
-
-    private static string GetHierarchy(Component component)
-    {
-        var names = new List<string>();
-        for (var current = component.transform; current != null && names.Count < 32; current = current.parent)
-            names.Add(current.gameObject.name);
-        names.Reverse();
-        return string.Join("/", names);
     }
 }

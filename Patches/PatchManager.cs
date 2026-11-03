@@ -9,6 +9,8 @@ namespace MonsterMusumeTDMod.Patches;
 
 public static class PatchManager
 {
+    private const int MaxAppliedValuesCapacity = 4096;
+
     private static HarmonyLib.Harmony _harmony;
     private static readonly List<System.Reflection.MethodBase> PatchedMethods = new();
     private static TranslationManager _translations;
@@ -22,10 +24,18 @@ public static class PatchManager
     private static Il2CppSystem.Func<string, Utage.TextParserBase> _previousStoryParser;
     private static Il2CppSystem.Func<string, Utage.TextParserBase> _storyParser;
     private static readonly Dictionary<string, Type> RuntimeTypeCache = new(StringComparer.Ordinal);
+
     // The game writes the translated argument back through the same setter.
     // Track that value per UI component so a composed translation is not
     // mistaken for a new untranslated Japanese string on the nested pass.
     private static readonly Dictionary<int, string> AppliedTextValues = new();
+    private static readonly Dictionary<int, (string Source, string Translated)> SlotBindingCache = new(1024);
+
+    public static void ClearSlotBindingCache()
+    {
+        AppliedTextValues.Clear();
+        SlotBindingCache.Clear();
+    }
 
     public static void Install(TranslationManager translations, ModConfig config)
     {
@@ -51,24 +61,21 @@ public static class PatchManager
             nameof(Hooks.ApplySubSkillCardFont)
         );
         PatchFontSetters("TMPro.TMP_Text");
-        PatchFontSetters("TMPro.TextMeshProUGUI");
         PatchFontSetters("UnityEngine.UI.Text");
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "set_fontSharedMaterial", "set_fontMaterial" });
-        PatchTmpRefreshTriggers("TMPro.TextMeshProUGUI", new[] { "OnEnable" }, requestFastScan: true);
-        // Some detail labels are concrete TMP_Text subclasses other than
-        // TextMeshProUGUI. Catch their activation too so first-entry binding
-        // gets a deferred hierarchy-aware translation pass.
+        // TextMeshProUGUI.OnEnable calls base.OnEnable (TMP_Text.OnEnable).
+        // Patching TMP_Text.OnEnable alone covers all concrete subclasses
+        // without firing duplicate activation events on every TextMeshProUGUI.
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "OnEnable" }, requestFastScan: true);
         // A pooled UI subtree can be populated before it joins its final
-        // Canvas. Apply path styles as soon as the hierarchy becomes valid,
-        // in the same frame and before rendering.
-        PatchTmpRefreshTriggers(
+        // Canvas. Invalidate cached hierarchy paths and apply path styles
+        // as soon as the hierarchy becomes valid.
+        PatchContextPostfixMethods(
             "TMPro.TextMeshProUGUI",
             new[] { "OnTransformParentChanged", "OnCanvasHierarchyChanged" },
-            requestFastScan: true);
-        // Button state transitions change the label's tint without changing its
-        // text. Reapply the cached material so disabled buttons use the game's
-        // darkened face color immediately instead of waiting for the scanner.
+            nameof(Hooks.OnHierarchyChanged));
+        // Button state transitions change the label's tint only when
+        // interactable state changes (or for Animation transitions).
         PatchContextPostfixMethods(
             "UnityEngine.UI.Selectable",
             new[] { "DoStateTransition" },
@@ -76,7 +83,7 @@ public static class PatchManager
         // UTAGE 类型名和方法签名会随游戏版本变化；这些探针失败时只跳过，不阻止 TMP 补丁加载。
         foreach (var typeName in new[]
         {
-            "Utage.AdvCommandText", "Utage.MessageControl", "Utage.AdvEngine"
+            "Utage.AdvCommandText", "Utage.AdvEngine", "Utage.MessageControl"
         })
         {
             PatchTypeMethods(typeName, new[]
@@ -99,6 +106,8 @@ public static class PatchManager
         try { _harmony?.UnpatchSelf(); }
         catch (Exception ex) { Plugin.Log?.LogWarning($"Unpatch failed: {ex.Message}"); }
         PatchedMethods.Clear();
+        AppliedTextValues.Clear();
+        SlotBindingCache.Clear();
     }
 
     public static void ProcessDiscoveredLegacyText(UnityEngine.UI.Text text)
@@ -117,10 +126,6 @@ public static class PatchManager
             if (!string.Equals(content, text.text, StringComparison.Ordinal))
                 text.text = content;
 
-            // The game's Utage binding can restore its original UGUI font
-            // after the translated value has been written. Reassert the
-            // bundled Legacy font here even when the translation writeback
-            // was intentionally ignored by the nested setter guard.
             TmpFontInstaller.ApplyToLegacyText(text);
         }
         finally
@@ -160,10 +165,7 @@ public static class PatchManager
                     : nameof(Hooks.TranslateString);
                 _harmony.Patch(
                     method,
-                    prefix: new HarmonyMethod(typeof(Hooks), prefixName),
-                    postfix: contextOnly || !typeName.StartsWith("TMPro.", StringComparison.Ordinal)
-                        ? null
-                        : new HarmonyMethod(typeof(Hooks), nameof(Hooks.ReapplyTranslatedText))
+                    prefix: new HarmonyMethod(typeof(Hooks), prefixName)
                 );
                 PatchedMethods.Add(method);
                 if (typeName == "AttachAbilityContent" || typeName == "SubSkillRecipeBannerBase")
@@ -178,9 +180,6 @@ public static class PatchManager
 
     private static void PatchStoryTextParserEntryPoints()
     {
-        // UTAGE exposes this native extension point specifically for custom
-        // parsing. Constructor Harmony hooks can fall back to managed-only
-        // patches and therefore miss native/inlined calls in IL2CPP builds.
         try
         {
             _previousStoryParser = Utage.TextData.CreateCustomTextParser;
@@ -211,8 +210,6 @@ public static class PatchManager
             }
         }
 
-        // Do not create TextData here: that would re-enter this callback.
-        // The original parser remains responsible for tags, glyphs and timing.
         return _previousStoryParser != null
             ? _previousStoryParser.Invoke(text)
             : new Utage.TextParser(text, false);
@@ -270,11 +267,23 @@ public static class PatchManager
 
         foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
+            var asmName = assembly.GetName().Name ?? string.Empty;
+            if (asmName.StartsWith("System", StringComparison.Ordinal) ||
+                asmName.StartsWith("Microsoft", StringComparison.Ordinal) ||
+                asmName.StartsWith("BepInEx", StringComparison.Ordinal) ||
+                asmName.StartsWith("Il2CppInterop", StringComparison.Ordinal) ||
+                asmName.StartsWith("MonoMod", StringComparison.Ordinal) ||
+                asmName.Equals("0Harmony", StringComparison.Ordinal) ||
+                asmName.Equals("netstandard", StringComparison.Ordinal) ||
+                asmName.Equals("mscorlib", StringComparison.Ordinal) ||
+                asmName.Equals("Il2Cppmscorlib", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
             Type type;
             try
             {
-                // Assembly.GetType performs an exact lookup without enumerating every
-                // generated IL2CPP type, some of which cannot be reflected safely.
                 type = assembly.GetType(typeName, false, false);
 #if ANDROID
                 type ??= assembly.GetType("Il2Cpp" + (typeName.Contains('.') ? "" : ".") + typeName, false, false);
@@ -294,6 +303,7 @@ public static class PatchManager
             return type;
         }
 
+        RuntimeTypeCache[typeName] = null;
         return null;
     }
 
@@ -378,7 +388,8 @@ public static class PatchManager
                     postfix: new HarmonyMethod(typeof(Hooks), postfixName)
                 );
                 PatchedMethods.Add(method);
-                Plugin.Log.LogInfo($"Patched sub-skill font method: {type.FullName}.{method.Name}");
+                if (typeName == "AttachAbilityContent")
+                    Plugin.Log.LogInfo($"Patched sub-skill font method: {type.FullName}.{method.Name}");
             }
             catch (Exception ex)
             {
@@ -398,7 +409,6 @@ public static class PatchManager
                 if (scene.Length == 0) scene = _translations.ResolveStoryScenarioId(__instance.DataGridName);
             }
             catch (Exception exception) { Plugin.Log.LogDebug($"Story script context: {exception.Message}"); }
-            // Even an unknown preloaded script suppresses the playback context.
             __state = StorySceneContext.EnterParsing(scene);
         }
 
@@ -435,8 +445,6 @@ public static class PatchManager
                 }
             }
             catch (Exception exception) { Plugin.Log.LogDebug($"Story command context: {exception.Message}"); }
-            // A command's own identity takes precedence; otherwise retain its
-            // enclosing parsing scope, including an explicitly unknown one.
             if (scene.Length == 0) scene = StorySceneContext.ParsingId;
             __state = StorySceneContext.EnterParsing(scene);
         }
@@ -459,32 +467,15 @@ public static class PatchManager
 
         public static void ObserveContext(object __instance) => ScenarioContext.Observe(__instance);
 
-        public static void ApplyButtonState(object __instance)
+        public static void OnHierarchyChanged(object __instance)
         {
-            if (__instance is not UnityEngine.Component component)
-                return;
-            foreach (var text in component.GetComponentsInChildren<TMPro.TMP_Text>(true))
-                UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            if (__instance is UnityEngine.Component component && component != null && component.transform != null)
+                UiHierarchyClassifier.InvalidateTransform(component.transform);
+            UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
-        public static void TranslateStoryBeforeParse(
-            System.Reflection.MethodBase __originalMethod,
-            ref string __0
-        )
-        {
-            if (_translations == null || string.IsNullOrEmpty(__0) ||
-                !_translations.TryTranslateStoryBeforeParse(__0, out var translated))
-                return;
-
-            __0 = translated;
-            if (!_storyPreParseHitLogged)
-            {
-                _storyPreParseHitLogged = true;
-                Plugin.Log.LogInfo(
-                    "UTAGE pre-parse story translation active via " +
-                    $"{__originalMethod?.Name ?? "unknown"}; control-tag timing uses translated text");
-            }
-        }
+        public static void ApplyButtonState(object __instance) =>
+            UiStyleManager.NotifySelectableStateChanged(__instance);
 
         public static void ApplyFont(object __instance)
         {
@@ -514,12 +505,6 @@ public static class PatchManager
         public static void ApplySubSkillCardFont(object __instance) =>
             TmpFontInstaller.ApplyToSubSkillCard(__instance);
 
-        public static void ReapplyTranslatedText(object __instance)
-        {
-            if (UiCanvasTranslationScanner.IsApplying(__instance)) return;
-            UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
-        }
-
         public static void TranslateString(object __instance, ref string __0)
         {
             if (UiCanvasTranslationScanner.IsApplying(__instance)) return;
@@ -533,27 +518,17 @@ public static class PatchManager
         {
             if (_config == null || !_config.Enabled.Value)
                 return;
-            // Projection text is already the final translated display value.
-            // Never send it back through translation/font hooks on each sync.
-            if (TmpFontInstaller.IsUiTextSoftOutlineLayer(__instance))
+
+            if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance))
                 return;
 
-            // A virtualized slot can receive its next source value before the
-            // translation scanner runs. Hide the previous projection now so
-            // an old Japanese/Chinese layer is never rendered with new text.
             UiStyleManager.PrepareUnderlayForTextChange(__instance);
-
-            // Detail panels often assign TMP.text before the object is parented
-            // under UICanvasTopUnitDetail. Defer one refresh so path-based UI
-            // translation runs after Unity finishes attaching the hierarchy.
-            if (__instance is TMPro.TMP_Text)
-                UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
 
             if (string.IsNullOrEmpty(__0))
             {
                 if (__instance is UnityEngine.UI.Text clearedStoryText &&
-                    TmpFontInstaller.IsStoryMessageText(clearedStoryText) &&
-                    !TmpFontInstaller.IsStorySpeakerNameText(clearedStoryText))
+                    UiHierarchyClassifier.IsStoryMessageText(clearedStoryText) &&
+                    !UiHierarchyClassifier.IsStorySpeakerNameText(clearedStoryText))
                 {
                     _translations.ResetInferredStoryScenario();
                     ScenarioContext.ClearResourceContext();
@@ -561,76 +536,98 @@ public static class PatchManager
                 return;
             }
 
-            if (TmpFontInstaller.IsUiTextSoftOutlineLayer(__instance))
-                return;
+            var instanceId = GetInstanceId(__instance);
+            if (instanceId != 0)
+            {
+                if (AppliedTextValues.TryGetValue(instanceId, out var appliedValue) &&
+                    string.Equals(appliedValue, __0, StringComparison.Ordinal))
+                {
+                    return;
+                }
 
-            // TMP can enter a nested setter after this prefix has changed the
-            // argument to Chinese. Ignore that second pass so F9 remains a
-            // source-text collector even with translation enabled.
-            // Assigning the translated value to a legacy Text re-enters this
-            // prefix. It is already the final Chinese value, so do not run it
-            // through the unmatched-source path that restores the Japanese
-            // font on the same reused component.
-            if (IsAppliedTranslationWriteback(__instance, __0))
-                return;
+                // Real-time ScrollView optimization: the game re-invokes set_text with the
+                // same Japanese source string on every visible slot every frame while scrolling.
+                // If this slot already translated this exact source string and its style is applied,
+                // substitute the cached translation immediately so TMP_Text.set_text sees m_text == value
+                // and skips mesh/material/color work completely.
+                if (SlotBindingCache.TryGetValue(instanceId, out var slotBinding) &&
+                    string.Equals(slotBinding.Source, __0, StringComparison.Ordinal) &&
+                    UiStyleManager.IsInstanceStyled(instanceId))
+                {
+                    __0 = slotBinding.Translated;
+                    return;
+                }
+            }
 
-            // Keep UTAGE's Legacy Text path independent from the later UI and
-            // sub-skill matching layers. This is the v0.1.23 story pipeline:
-            // exact global story row first, then indexed story fragments.
             if (__instance is UnityEngine.UI.Text storyText &&
-                TmpFontInstaller.IsStoryMessageText(storyText))
+                UiHierarchyClassifier.IsStoryMessageText(storyText))
             {
                 TranslateStoryString(storyText, ref __0);
                 return;
             }
 
-            // UICanvas entries must be considered before the known-value
-            // guard. A manual row such as "HP": "HP" deliberately retains
-            // its text while still requiring the same translated UI font.
+            var path = UiHierarchyClassifier.GetHierarchyPathAndFlags(__instance, out var flags);
+            var isUnderUiCanvas = (flags & UiPathFlags.UnderUiCanvas) != 0;
+            var isSubSkillText = (flags & UiPathFlags.SubSkillScrollText) != 0;
+            var isUnitDetailDesc = (flags & UiPathFlags.UnitDetailUiDescription) != 0;
+
+            // Detail panels often assign TMP.text before the object is parented
+            // under UICanvasTopUnitDetail. Defer one refresh only when unparented.
+            if (__instance is TMPro.TMP_Text && !isUnderUiCanvas)
+                UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
+
             if (_config.TranslateUiTexts.Value &&
-                TmpFontInstaller.IsUnderUiCanvas(__instance) &&
-                !TmpFontInstaller.IsSubSkillText(__instance) &&
-                !TmpFontInstaller.IsUiTranslationExcluded(__instance) &&
+                isUnderUiCanvas &&
+                !isSubSkillText &&
                 _translations.TryTranslateUiText(
                     __0,
-                    TmpFontInstaller.GetHierarchyPath(__instance),
+                    path,
                     out var uiTextTranslation))
             {
                 var uiSource = __0;
                 SetTranslatedArgument(__instance, ref __0, uiTextTranslation);
-                TmpFontInstaller.ApplyToTranslatedUiText(__instance, __0, uiSource);
+                if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(__instance, __0, uiSource, isSubSkill: false))
+                    TmpFontInstaller.ApplyToTranslatedUiText(__instance, __0, uiSource);
                 return;
             }
 
             if (_translations.IsKnownTranslationValue(__0))
             {
-                // AttachAbilityContent may receive the source first, then bind
-                // the translated value to a TMP child. This second setter must
-                // still apply the sub-skill font and its presentation.
                 if (_config.TranslateSubSkills.Value &&
                     _translations.IsKnownSubSkillTranslationValue(__0) &&
-                    !TmpFontInstaller.IsUnitDetailUiDescription(__instance))
-                    TmpFontInstaller.ApplyToTranslatedSubSkillText(__instance, __0);
+                    !isUnitDetailDesc)
+                {
+                    if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(__instance, __0, null, isSubSkill: true))
+                        TmpFontInstaller.ApplyToTranslatedSubSkillText(__instance, __0);
+                }
+                else if (__instance is TMPro.TMP_Text && isUnderUiCanvas)
+                {
+                    if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(__instance, __0, null, isSubSkill: false))
+                        UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
+                }
                 return;
             }
 
             _translations.ObserveCharacterOrSkillText(__instance, __0);
 
             if (_config.TranslateSubSkills.Value &&
-                !TmpFontInstaller.IsUnitDetailUiDescription(__instance) &&
+                !isUnitDetailDesc &&
                 _translations.TryTranslateSubSkill(
                     __0,
-                    TmpFontInstaller.GetHierarchyPath(__instance),
+                    path,
                     out var subSkillTranslation))
             {
                 SetTranslatedArgument(__instance, ref __0, subSkillTranslation);
-                TmpFontInstaller.ApplyToTranslatedSubSkillText(__instance, __0);
+                if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(__instance, __0, null, isSubSkill: true))
+                    TmpFontInstaller.ApplyToTranslatedSubSkillText(__instance, __0);
                 return;
             }
 
-            // Virtualized shop and list cards reuse the same TMP component.
-            // Restore its original Japanese font when a previously translated
-            // sub-skill/item slot receives an untranslated source string.
+            if (instanceId != 0)
+            {
+                AppliedTextValues.Remove(instanceId);
+                SlotBindingCache.Remove(instanceId);
+            }
             TmpFontInstaller.RestoreTranslatedUiText(__instance);
             TmpFontInstaller.RestoreTranslatedSubSkillText(__instance);
         }
@@ -642,11 +639,9 @@ public static class PatchManager
                 _storyTargetLogged = true;
                 Plugin.Log.LogInfo(
                     $"Legacy story translation target active: " +
-                    $"{TmpFontInstaller.GetHierarchyPath(storyText)}");
+                    $"{UiHierarchyClassifier.GetHierarchyPath(storyText)}");
             }
 
-            // This also catches the nested setter/writeback path used by the
-            // September 4 build without running translated Chinese as source.
             if (_translations.IsKnownStoryTranslationValue(source) ||
                 _translations.IsKnownTranslationValue(source))
             {
@@ -654,7 +649,7 @@ public static class PatchManager
                 return;
             }
 
-            if (TmpFontInstaller.IsStorySpeakerNameText(storyText))
+            if (UiHierarchyClassifier.IsStorySpeakerNameText(storyText))
             {
                 if (_config.TranslateNames.Value &&
                     _translations.TryTranslateName(source, out var nameTranslation))
@@ -705,22 +700,16 @@ public static class PatchManager
     {
         var instanceId = GetInstanceId(instance);
         if (instanceId != 0)
+        {
+            if (AppliedTextValues.Count >= MaxAppliedValuesCapacity)
+            {
+                AppliedTextValues.Clear();
+                SlotBindingCache.Clear();
+            }
             AppliedTextValues[instanceId] = translated;
+            SlotBindingCache[instanceId] = (argument, translated);
+        }
         argument = translated;
-    }
-
-    private static bool IsAppliedTranslationWriteback(object instance, string value)
-    {
-        var instanceId = GetInstanceId(instance);
-        if (instanceId == 0 || !AppliedTextValues.TryGetValue(instanceId, out var appliedValue))
-            return false;
-
-        if (string.Equals(appliedValue, value, StringComparison.Ordinal))
-            return true;
-
-        // The reused UI component has received a new source string.
-        AppliedTextValues.Remove(instanceId);
-        return false;
     }
 
     private static int GetInstanceId(object instance) =>

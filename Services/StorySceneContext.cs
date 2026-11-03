@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace MonsterMusumeTDMod.Services;
 
@@ -8,7 +9,9 @@ public static class StorySceneContext
 {
     private static readonly Dictionary<string, string> Labels = new(StringComparer.Ordinal);
     [ThreadStatic] private static Scope _scope;
-    public static string PlaybackId { get; private set; } = string.Empty;
+    private static string _playbackId = string.Empty;
+
+    public static string PlaybackId => Volatile.Read(ref _playbackId);
     public static string ParsingId => _scope == null ? PlaybackId : _scope.Scene;
 
     public static IDisposable EnterParsing(string scene) => new Scope(scene);
@@ -31,8 +34,8 @@ public static class StorySceneContext
         lock (Labels) return Labels.TryGetValue(label, out var scene) ? scene : string.Empty;
     }
 
-    public static void SetPlayback(string scene) => PlaybackId = scene ?? string.Empty;
-    public static void ClearPlayback() => PlaybackId = string.Empty;
+    public static void SetPlayback(string scene) => Volatile.Write(ref _playbackId, scene ?? string.Empty);
+    public static void ClearPlayback() => Volatile.Write(ref _playbackId, string.Empty);
 
     private sealed class Scope : IDisposable
     {

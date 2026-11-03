@@ -16,23 +16,22 @@ using UnityEngine.UI;
 
 namespace MonsterMusumeTDMod.Services;
 
-/// <summary>Loads an optional TMP_FontAsset AssetBundle for explicit translated-text rendering.</summary>
+/// <summary>Loads an optional TMP_FontAsset AssetBundle and manages translated-text TMP/Legacy presentation state.</summary>
 public static class TmpFontInstaller
 {
     private const float SubSkillMinimumLineSpacing = 8f;
     private const float DefaultUiTextOutlineWidth = 0.3f;
     private const float DefaultUiTextFaceDilate = 0.35f;
-    private const float UiTextSoftOutlineWidth = 0.2f;
-    private const float UiTextSoftOutlineSoftness = 0.06f;
-    private const float EquipmentSubSkillFaceDilate = 0.2f;
     private const float R18StoryOutlineWidth = 0.15f;
+
     private static readonly Color32 SubSkillOutlineColor = new(0x54, 0x4A, 0x4A, 255);
     private static readonly Color32 UiTextOutlineColor = new(0x54, 0x4A, 0x4A, 255);
-    private static readonly Regex SoundTag = new(@"</?sound(?:=[^>]*)?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex SoundTag = new(@"</?sound(?:=[^>]*)?>", RegexOptions.IgnoreCase);
     private static readonly string[] LegacyChineseFontFamilies =
     {
         "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "SimHei", "SimSun"
     };
+
     private static AssetBundle _loadedBundle;
     private static TMP_FontAsset _loadedFont;
     private static readonly Dictionary<string, TMP_FontAsset> LoadedFonts =
@@ -40,15 +39,19 @@ public static class TmpFontInstaller
     private static readonly HashSet<string> MissingStyleFonts =
         new(StringComparer.OrdinalIgnoreCase);
     internal static TMP_FontAsset LoadedFont => _loadedFont;
-    [System.ThreadStatic]
+
+    [ThreadStatic]
     private static bool _applyingConfiguredUiStyle;
+
     private static Font _loadedLegacyFont;
     private static Material _r18StoryOutlineMaterial;
     private static Material _unitDetailOutlineMaterial;
     private static Material _unitDetailNoOutlineMaterial;
+    private static readonly Dictionary<char, bool> SupportedCharCache = new(1024);
     private static bool _unitDetailMaterialsLogged;
     private static bool _replaceStoryNames = true;
     private static bool? _lastR18StoryOutlineState;
+
     private static readonly HashSet<int> StoryTextInstanceIds = new();
     private static readonly HashSet<int> SubSkillTextInstanceIds = new();
     private static readonly Dictionary<int, string> SubSkillTranslatedValues = new();
@@ -56,14 +59,180 @@ public static class TmpFontInstaller
     private static readonly Dictionary<int, string> UiTextTranslatedValues = new();
     private static readonly Dictionary<int, string> UiTextSourceValues = new();
     private static readonly Dictionary<int, TMP_Text> UiTextComponents = new();
-    private static readonly Dictionary<int, Material> UiTextMaterials = new();
-    private static readonly Dictionary<int, TextMeshProUGUI> UiTextSoftOutlineTexts = new();
-    private static readonly Dictionary<int, Material> UiTextSoftOutlineMaterials = new();
     private static readonly Dictionary<int, TmpPresentationState> OriginalTranslatedTmpFonts = new();
     private static readonly HashSet<int> SubSkillFontLoggedIds = new();
+    private static readonly Dictionary<int, TMP_Text[]> SubSkillCardTextsCache = new();
     private static readonly Dictionary<int, TextMeshProUGUI> StoryTmpTexts = new();
     private static readonly Dictionary<int, Font> StoryOriginalFonts = new();
     private static readonly HashSet<int> StoryTmpFailures = new();
+    private static readonly List<int> PruneIdsBuffer = new(64);
+
+    // Forwarding classifiers for API compatibility with existing callers
+    public static string GetHierarchyPath(object component) =>
+        UiHierarchyClassifier.GetHierarchyPath(component);
+
+    public static bool IsUnderUiCanvas(object component) =>
+        UiHierarchyClassifier.IsUnderUiCanvas(component);
+
+    public static bool IsUiTranslationExcluded(object component) =>
+        UiHierarchyClassifier.IsUiTranslationExcluded(component);
+
+    public static bool IsUiTextSoftOutlineLayer(object component) =>
+        UiHierarchyClassifier.IsUiTextSoftOutlineLayer(component);
+
+    public static bool IsSubSkillText(object component) =>
+        UiHierarchyClassifier.IsSubSkillText(component);
+
+    public static bool IsUnitDetailUiDescription(object component) =>
+        UiHierarchyClassifier.IsUnitDetailUiDescription(component);
+
+    public static bool IsUnitDetailFontOverride(object component) =>
+        UiHierarchyClassifier.IsUnitDetailFontOverride(component);
+
+    public static bool ShouldRefreshUnitDetailDescription(TMP_Text text) =>
+        text != null &&
+        UiHierarchyClassifier.IsUnitDetailFontOverride(text) &&
+        UiHierarchyClassifier.IsUnitDetailFixedSpacingText(text);
+
+    public static bool IsStoryMessageText(Text text) =>
+        UiHierarchyClassifier.IsStoryMessageText(text);
+
+    public static bool IsCurrentStoryDialogueText(Text text) =>
+        UiHierarchyClassifier.IsCurrentStoryDialogueText(text);
+
+    public static bool IsStorySpeakerNameText(Text text) =>
+        UiHierarchyClassifier.IsStorySpeakerNameText(text);
+
+    public static bool IsCurrentlyTranslatedComponent(Component component, string currentText)
+    {
+        if (component == null || string.IsNullOrEmpty(currentText))
+            return false;
+        var id = component.GetInstanceID();
+        if (UiTextTranslatedValues.TryGetValue(id, out var uiTranslated) &&
+            string.Equals(uiTranslated, currentText, StringComparison.Ordinal))
+            return true;
+        if (SubSkillTranslatedValues.TryGetValue(id, out var subSkillTranslated) &&
+            string.Equals(subSkillTranslated, currentText, StringComparison.Ordinal))
+            return true;
+        return StoryTextInstanceIds.Contains(id);
+    }
+
+    public static void PruneDestroyedInstances()
+    {
+        PruneIdsBuffer.Clear();
+        foreach (var pair in UiTextComponents)
+        {
+            if (pair.Value == null || pair.Value.gameObject == null)
+                PruneIdsBuffer.Add(pair.Key);
+        }
+        foreach (var id in PruneIdsBuffer)
+        {
+            UiTextComponents.Remove(id);
+            UiTextTranslatedValues.Remove(id);
+            UiTextSourceValues.Remove(id);
+            UiTextInstanceIds.Remove(id);
+            OriginalTranslatedTmpFonts.Remove(id);
+        }
+
+        PruneIdsBuffer.Clear();
+        foreach (var pair in StoryTmpTexts)
+        {
+            if (pair.Value == null || pair.Value.gameObject == null)
+                PruneIdsBuffer.Add(pair.Key);
+        }
+        foreach (var id in PruneIdsBuffer)
+        {
+            StoryTmpTexts.Remove(id);
+            StoryOriginalFonts.Remove(id);
+            StoryTextInstanceIds.Remove(id);
+            StoryTmpFailures.Remove(id);
+        }
+
+        if (SubSkillCardTextsCache.Count > 256)
+            SubSkillCardTextsCache.Clear();
+    }
+
+    public static void Unload()
+    {
+        if (_r18StoryOutlineMaterial != null)
+        {
+            UnityEngine.Object.Destroy(_r18StoryOutlineMaterial);
+            _r18StoryOutlineMaterial = null;
+        }
+        if (_unitDetailOutlineMaterial != null)
+        {
+            UnityEngine.Object.Destroy(_unitDetailOutlineMaterial);
+            _unitDetailOutlineMaterial = null;
+        }
+        if (_unitDetailNoOutlineMaterial != null)
+        {
+            UnityEngine.Object.Destroy(_unitDetailNoOutlineMaterial);
+            _unitDetailNoOutlineMaterial = null;
+        }
+        if (_loadedBundle != null)
+        {
+            _loadedBundle.Unload(false);
+            _loadedBundle = null;
+        }
+        _loadedFont = null;
+        LoadedFonts.Clear();
+        MissingStyleFonts.Clear();
+        SupportedCharCache.Clear();
+    }
+
+    /// <summary>Restores all active translated UI, sub-skill, and story components when F7 disables translation.</summary>
+    public static int RestoreAllVisibleTranslations()
+    {
+        var restored = 0;
+        var uiSnapshot = new List<KeyValuePair<int, TMP_Text>>(UiTextComponents);
+        foreach (var entry in uiSnapshot)
+        {
+            var text = entry.Value;
+            if (text == null || text.gameObject == null)
+                continue;
+
+            if (UiTextSourceValues.TryGetValue(entry.Key, out var source) &&
+                !string.IsNullOrEmpty(source) &&
+                !string.Equals(text.text, source, StringComparison.Ordinal))
+            {
+                text.text = source;
+            }
+            RestoreTranslatedUiText(text);
+            restored++;
+        }
+
+        foreach (var text in FindActiveTmpTexts())
+        {
+            if (text == null || text.gameObject == null)
+                continue;
+            if (SubSkillTextInstanceIds.Contains(text.GetInstanceID()))
+            {
+                RestoreTranslatedSubSkillText(text);
+                restored++;
+            }
+        }
+
+#if ANDROID
+        var legacyTexts = Resources.FindObjectsOfTypeAll<Text>();
+#else
+        var legacyTexts = UnityEngine.Object.FindObjectsByType<Text>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
+        foreach (var legacyText in legacyTexts)
+        {
+            if (legacyText == null || legacyText.gameObject == null)
+                continue;
+            var id = legacyText.GetInstanceID();
+            if (StoryTextInstanceIds.Contains(id) || StoryOriginalFonts.ContainsKey(id))
+            {
+                RestoreOriginalStoryPresentation(legacyText);
+                restored++;
+            }
+        }
+
+        return restored;
+    }
 
     public static void ApplyToStoryText(object component, string content)
     {
@@ -91,16 +260,17 @@ public static class TmpFontInstaller
         if (_applyingConfiguredUiStyle || UiStyleManager.IsApplying ||
             _loadedFont == null || component is not TMP_Text text)
             return;
-        if (IsUiTextSoftOutlineLayer(text) || IsUiTranslationExcluded(text))
+        if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(text) ||
+            UiHierarchyClassifier.IsUiTranslationExcluded(text))
             return;
 
-        if (IsHomeDeckExSkillSlotName(text.transform))
+        if (UiHierarchyClassifier.IsHomeDeckExSkillSlotName(text.transform))
         {
             ApplyForcedTmpTextPresentation(text, useSubSkillPresentation: true);
             return;
         }
 
-        if (IsUnitDetailFontOverride(text))
+        if (UiHierarchyClassifier.IsUnitDetailFontOverride(text))
         {
             ApplyUnitDetailFont(text);
             return;
@@ -133,7 +303,8 @@ public static class TmpFontInstaller
         // without assigning its text again. Do not depend on the previous
         // registration surviving that rebind; the translated value itself is
         // enough to restore the Alimama presentation.
-        if (!IsSubSkillText(text) && IsUnderUiCanvas(text) &&
+        if (!UiHierarchyClassifier.IsSubSkillText(text) &&
+            UiHierarchyClassifier.IsUnderUiCanvas(text) &&
             Plugin.Translations != null &&
             Plugin.Translations.IsKnownUiTextTranslationValue(text.text))
         {
@@ -154,7 +325,8 @@ public static class TmpFontInstaller
     public static void ApplyToVisibleSubSkillText(TMP_Text text)
     {
         if (_loadedFont == null || text == null || text.transform == null ||
-            !IsSubSkillScrollText(text.transform) || Plugin.Translations == null ||
+            !UiHierarchyClassifier.IsSubSkillScrollText(text.transform) ||
+            Plugin.Translations == null ||
             !Plugin.Translations.IsKnownSubSkillTranslationValue(text.text))
             return;
 
@@ -163,7 +335,7 @@ public static class TmpFontInstaller
         SubSkillTranslatedValues[instanceId] = text.text;
         ApplyTranslatedTmpText(text, text.text, useSubSkillPresentation: true);
         if (SubSkillFontLoggedIds.Add(instanceId))
-            Plugin.Log.LogInfo($"Applied TMP font to sub-skill text: {GetHierarchyPath(text.transform)}");
+            Plugin.Log.LogInfo($"Applied TMP font to sub-skill text: {UiHierarchyClassifier.GetHierarchyPath(text.transform)}");
     }
 
     /// <summary>
@@ -176,8 +348,26 @@ public static class TmpFontInstaller
             root.gameObject == null || !root.gameObject.activeInHierarchy)
             return;
 
-        foreach (var text in root.GetComponentsInChildren<TMP_Text>())
-            ApplyToVisibleSubSkillText(text);
+        var cardId = root.GetInstanceID();
+        if (!SubSkillCardTextsCache.TryGetValue(cardId, out var texts) || texts == null)
+        {
+            var il2cppArray = root.GetComponentsInChildren<TMP_Text>(true);
+            texts = new TMP_Text[il2cppArray.Length];
+            for (var i = 0; i < il2cppArray.Length; i++)
+                texts[i] = il2cppArray[i];
+            SubSkillCardTextsCache[cardId] = texts;
+        }
+
+        for (var i = 0; i < texts.Length; i++)
+        {
+            var text = texts[i];
+            if (text == null)
+                continue;
+            var textId = text.GetInstanceID();
+            if (SubSkillTextInstanceIds.Contains(textId) && UiStyleManager.IsInstanceStyled(textId))
+                continue;
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+        }
     }
 
     /// <summary>
@@ -185,6 +375,41 @@ public static class TmpFontInstaller
     /// attach-ability ScrollView. Mark the actual translation target so every
     /// TMP instance receives the same line spacing, outline, and weight.
     /// </summary>
+    internal static bool TryFastCompleteTranslatedTmpText(
+        object component,
+        string translated,
+        string source,
+        bool isSubSkill)
+    {
+        if (_loadedFont == null || component is not TMP_Text text || text == null)
+            return false;
+
+        var instanceId = text.GetInstanceID();
+        if (!UiStyleManager.IsInstanceStyled(instanceId) ||
+            UiStyleManager.HasUnderlay(instanceId))
+            return false;
+
+        if (isSubSkill)
+        {
+            if (!SubSkillTextInstanceIds.Contains(instanceId))
+                return false;
+            SubSkillTranslatedValues[instanceId] = translated;
+            UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, translated);
+            return true;
+        }
+
+        if (!UiTextInstanceIds.Contains(instanceId))
+            return false;
+        if (translated.IndexOf('\n') >= 0 &&
+            (!UiTextTranslatedValues.TryGetValue(instanceId, out var prevUi) || prevUi.IndexOf('\n') < 0))
+            return false;
+        UiTextTranslatedValues[instanceId] = translated;
+        if (!string.IsNullOrEmpty(source))
+            UiTextSourceValues[instanceId] = source;
+        UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, translated);
+        return true;
+    }
+
     public static void ApplyToTranslatedSubSkillText(object component, string content)
     {
         if (_loadedFont == null || component is not TMP_Text text)
@@ -195,13 +420,16 @@ public static class TmpFontInstaller
         SubSkillTranslatedValues[instanceId] = content;
         if (PatchManager.DeferringTmpPresentation)
         {
-            UiCanvasTranslationScanner.QueueImmediateRefresh(text);
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
             return;
         }
-        ApplyTranslatedTmpText(text, content, useSubSkillPresentation: ShouldUseSubSkillPresentation(text));
+        ApplyTranslatedTmpText(
+            text,
+            content,
+            useSubSkillPresentation: UiHierarchyClassifier.ShouldUseSubSkillPresentation(text));
 
         if (SubSkillFontLoggedIds.Add(instanceId))
-            Plugin.Log.LogInfo($"Applied TMP presentation to translated sub-skill: {GetHierarchyPath(text.transform)}");
+            Plugin.Log.LogInfo($"Applied TMP presentation to translated sub-skill: {UiHierarchyClassifier.GetHierarchyPath(text.transform)}");
     }
 
     /// <summary>Marks a translated UICanvas label so a recycled TMP component keeps its Chinese font.</summary>
@@ -209,7 +437,8 @@ public static class TmpFontInstaller
     {
         if (_loadedFont == null || component is not TMP_Text text)
             return;
-        if (IsUiTextSoftOutlineLayer(text) || IsUiTranslationExcluded(text))
+        if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(text) ||
+            UiHierarchyClassifier.IsUiTranslationExcluded(text))
             return;
 
         var instanceId = text.GetInstanceID();
@@ -226,7 +455,7 @@ public static class TmpFontInstaller
         UiTextComponents[instanceId] = text;
         if (PatchManager.DeferringTmpPresentation)
         {
-            UiCanvasTranslationScanner.QueueImmediateRefresh(text);
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
             return;
         }
         ApplyTranslatedTmpText(text, content, useSubSkillPresentation: false);
@@ -257,7 +486,7 @@ public static class TmpFontInstaller
                 removedIds.Add(entry.Key);
                 continue;
             }
-            if (IsUiTranslationExcluded(text))
+            if (UiHierarchyClassifier.IsUiTranslationExcluded(text))
             {
                 textsToRestore.Add(text);
                 processedIds.Add(entry.Key);
@@ -268,7 +497,7 @@ public static class TmpFontInstaller
 
             // Keep the hierarchy in the lookup so $paths categories and their
             // number/ex templates are applied during an F6 reload as well.
-            if (!translations.TryTranslateUiText(source, GetHierarchyPath(text), out var translated))
+            if (!translations.TryTranslateUiText(source, UiHierarchyClassifier.GetHierarchyPath(text), out var translated))
             {
                 text.text = source;
                 textsToRestore.Add(text);
@@ -278,7 +507,7 @@ public static class TmpFontInstaller
             if (!string.Equals(text.text, translated, StringComparison.Ordinal))
                 text.text = translated;
             UiTextTranslatedValues[entry.Key] = translated;
-            UiCanvasTranslationScanner.QueueImmediateRefresh(text);
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
             refreshed++;
             processedIds.Add(entry.Key);
         }
@@ -297,24 +526,25 @@ public static class TmpFontInstaller
         // setter saw the final UICanvas hierarchy, so it is not in
         // UiTextComponents yet. Include every visible UICanvas TMP in F6's
         // retry pass so first-entry path translations can be applied directly.
-        foreach (var text in Resources.FindObjectsOfTypeAll<TMP_Text>())
+        foreach (var text in FindActiveTmpTexts())
         {
             if (text == null || text.gameObject == null ||
                 !text.gameObject.activeInHierarchy ||
-                !IsUnderUiCanvas(text) || IsUiTextSoftOutlineLayer(text))
+                !UiHierarchyClassifier.IsUnderUiCanvas(text) ||
+                UiHierarchyClassifier.IsUiTextSoftOutlineLayer(text))
                 continue;
 
             var instanceId = text.GetInstanceID();
-            if (!processedIds.Add(instanceId) || IsUiTranslationExcluded(text))
+            if (!processedIds.Add(instanceId) || UiHierarchyClassifier.IsUiTranslationExcluded(text))
                 continue;
 
             var source = text.text;
             if (string.IsNullOrEmpty(source))
                 continue;
-            if (!translations.TryTranslateUiText(source, GetHierarchyPath(text), out var translated))
+            if (!translations.TryTranslateUiText(source, UiHierarchyClassifier.GetHierarchyPath(text), out var translated))
                 continue;
 
-            if (!string.Equals(source, translated, System.StringComparison.Ordinal))
+            if (!string.Equals(source, translated, StringComparison.Ordinal))
                 text.text = translated;
             UiTextSourceValues[instanceId] = source;
             UiCanvasTranslationScanner.QueueActivationRefresh(text);
@@ -328,7 +558,7 @@ public static class TmpFontInstaller
     public static int RefreshVisibleSubSkillPresentation()
     {
         var refreshed = 0;
-        foreach (var text in Resources.FindObjectsOfTypeAll<TMP_Text>())
+        foreach (var text in FindActiveTmpTexts())
         {
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
                 !SubSkillTextInstanceIds.Contains(text.GetInstanceID()))
@@ -343,21 +573,22 @@ public static class TmpFontInstaller
 
     public static void RestoreTranslatedSubSkillText(object component)
     {
-        if (PatchManager.DeferringTmpPresentation)
-        {
-            UiCanvasTranslationScanner.QueueActivationRefresh(component);
-            return;
-        }
-        if (component is not TMP_Text text)
+        if (component is not TMP_Text text || text == null)
             return;
 
         var instanceId = text.GetInstanceID();
-        if (!SubSkillTextInstanceIds.Remove(instanceId))
+        if (!SubSkillTextInstanceIds.Contains(instanceId))
             return;
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            return;
+        }
+        SubSkillTextInstanceIds.Remove(instanceId);
 
         UiStyleManager.ReleasePresentation(text);
         SubSkillTranslatedValues.Remove(instanceId);
-        if (IsUnitDetailFontOverride(text))
+        if (UiHierarchyClassifier.IsUnitDetailFontOverride(text))
         {
             OriginalTranslatedTmpFonts.Remove(instanceId);
             ApplyUnitDetailFont(text);
@@ -386,26 +617,25 @@ public static class TmpFontInstaller
 
     public static void RestoreTranslatedUiText(object component)
     {
-        if (PatchManager.DeferringTmpPresentation)
-        {
-            UiCanvasTranslationScanner.QueueActivationRefresh(component);
-            return;
-        }
-        if (component is not TMP_Text text)
+        if (component is not TMP_Text text || text == null)
             return;
 
         var instanceId = text.GetInstanceID();
-        if (!UiTextInstanceIds.Remove(instanceId))
+        if (!UiTextInstanceIds.Contains(instanceId))
             return;
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            return;
+        }
+        UiTextInstanceIds.Remove(instanceId);
 
         UiStyleManager.ReleasePresentation(text);
         UiTextTranslatedValues.Remove(instanceId);
         UiTextSourceValues.Remove(instanceId);
         UiTextComponents.Remove(instanceId);
-        ReleaseUiTextMaterial(instanceId);
-        ReleaseUiTextSoftOutline(instanceId);
 
-        if (IsUnitDetailFontOverride(text))
+        if (UiHierarchyClassifier.IsUnitDetailFontOverride(text))
         {
             OriginalTranslatedTmpFonts.Remove(instanceId);
             ApplyUnitDetailFont(text);
@@ -459,88 +689,19 @@ public static class TmpFontInstaller
 
         SubSkillTextInstanceIds.Add(instanceId);
         SubSkillTranslatedValues[instanceId] = visibleText;
-        ApplyTranslatedTmpText(text, visibleText, useSubSkillPresentation: ShouldUseSubSkillPresentation(text));
-    }
-
-    public static void ReapplyTranslatedText(object component)
-    {
-        if (_loadedFont == null || component is not TMP_Text text)
-            return;
-        if (IsUiTextSoftOutlineLayer(text))
-            return;
-        if (IsUiTranslationExcluded(text))
-        {
-            RestoreTranslatedUiText(text);
-            return;
-        }
-
-        if (IsUnitDetailFontOverride(text))
-        {
-            ApplyUnitDetailFont(text);
-            return;
-        }
-
-        var instanceId = text.GetInstanceID();
-        var visibleText = text.text;
-        var isMappedValue = UiTextTranslatedValues.TryGetValue(instanceId, out var mappedValue) &&
-                            string.Equals(visibleText, mappedValue, StringComparison.Ordinal);
-        var isKnownUiText = !IsSubSkillText(text) && IsUnderUiCanvas(text) &&
-                            Plugin.Translations != null &&
-                            Plugin.Translations.IsKnownUiTextTranslationValue(visibleText);
-        if (isMappedValue | isKnownUiText)
-        {
-            UiTextInstanceIds.Add(instanceId);
-            UiTextTranslatedValues[instanceId] = visibleText;
-            UiTextComponents[instanceId] = text;
-            ApplyTranslatedTmpText(text, visibleText, useSubSkillPresentation: false);
-            ApplyUiTextPresentation(text);
-        }
-        else
-        {
-            RestoreTranslatedUiText(text);
-            ReapplyTranslatedSubSkillText(text);
-
-            // Path styles are presentation rules, not translation rules.
-            // Apply them synchronously after TMP accepts a new value so a
-            // recycled active slot does not wait for the 0.2-second scanner.
-            if (IsUnderUiCanvas(text) && !IsSubSkillText(text))
-            {
-                UiStyleManager.Apply(
-                    text,
-                    GetUiTextOutlineWidth(),
-                    GetUiTextFaceDilate(),
-                    _loadedFont,
-                    isTranslated: false);
-            }
-        }
-    }
-
-    public static bool IsUnderUiCanvas(object component)
-    {
-        if (component is not Component unityComponent || unityComponent.transform == null)
-            return false;
-
-        var isGameStartLoadingScreen = false;
-        for (var current = unityComponent.transform; current != null; current = current.parent)
-        {
-            if (current.name.StartsWith("UICanvas", StringComparison.OrdinalIgnoreCase))
-                return true;
-            if (string.Equals(current.name, "GameStartLoadingScreen", StringComparison.OrdinalIgnoreCase))
-                isGameStartLoadingScreen = true;
-            if (isGameStartLoadingScreen &&
-                string.Equals(current.name, "ExtraCanvas", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
+        ApplyTranslatedTmpText(
+            text,
+            visibleText,
+            useSubSkillPresentation: UiHierarchyClassifier.ShouldUseSubSkillPresentation(text));
     }
 
     /// <summary>Applies a loaded path style immediately after UI hierarchy events.</summary>
     public static void ApplyConfiguredUiStyle(object component)
     {
         if (_applyingConfiguredUiStyle || _loadedFont == null || component is not TMP_Text text ||
-            text.transform == null || !IsUnderUiCanvas(text) ||
-            IsUiTextSoftOutlineLayer(text) || IsUiTranslationExcluded(text))
+            text.transform == null || !UiHierarchyClassifier.IsUnderUiCanvas(text) ||
+            UiHierarchyClassifier.IsUiTextSoftOutlineLayer(text) ||
+            UiHierarchyClassifier.IsUiTranslationExcluded(text))
             return;
 
         var isTranslated = Plugin.Translations != null &&
@@ -561,61 +722,27 @@ public static class TmpFontInstaller
         }
     }
 
-    /// <summary>
-    /// Actual sub-skill cards share UICanvas with normal UI labels, but must
-    /// use the dedicated subskills table rather than generic UI fragments.
-    /// </summary>
-    public static bool IsSubSkillText(object component) =>
-        component is Component unityComponent && unityComponent.transform != null &&
-        IsSubSkillScrollText(unityComponent.transform);
-
-    /// <summary>
-    /// These character-detail descriptions use the UICanvas translation table.
-    /// They can happen to share a value with a sub-skill entry, but applying
-    /// both presentations to one reused TMP component corrupts its restore
-    /// state when the selected unit changes.
-    /// </summary>
-    public static bool IsUnitDetailUiDescription(object component)
-    {
-        if (component is not Component unityComponent || unityComponent.transform == null)
-            return false;
-
-        var path = GetHierarchyPath(unityComponent.transform);
-        return path.Contains("/Unit_Detail_Rework", StringComparison.OrdinalIgnoreCase) &&
-               (path.Contains("/ExSkillArea/ExSkillTextArea/", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("/StatusDialog/UnitTribeTextArea/", StringComparison.OrdinalIgnoreCase));
-    }
-
-    /// <summary>
-    /// Unit-detail panels reuse their TMP renderers while rebinding a unit.
-    /// One complete font asset and two stable presentation materials own this
-    /// canvas, while decorative native titles retain the game's own styling.
-    /// </summary>
-    public static bool IsUnitDetailFontOverride(object component)
-    {
-        if (component is not Component unityComponent || unityComponent.transform == null)
-            return false;
-
-        var path = GetHierarchyPath(unityComponent.transform);
-        return path.Contains("/UICanvasTopUnitDetail/", StringComparison.OrdinalIgnoreCase);
-    }
-
     public static void ApplyUnitDetailFont(TMP_Text text)
     {
         if (_loadedFont == null || _loadedFont.material == null || text == null ||
-            !IsUnitDetailFontOverride(text))
+            !UiHierarchyClassifier.IsUnitDetailFontOverride(text))
             return;
 
-        var compact = IsUnitDetailNoOutlineText(text);
-        if (UiStyleManager.SubmitBaseline(text, _loadedFont,
-            compact ? 0f : GetUiTextOutlineWidth(), compact ? 0f : GetUiTextFaceDilate(),
-            UiTextOutlineColor, IsUnitDetailFixedSpacingText(text) || text.text.Contains('\n')
-                ? SubSkillMinimumLineSpacing : null, !compact))
+        var compact = UiHierarchyClassifier.IsUnitDetailNoOutlineText(text);
+        var requiresSpacing = UiHierarchyClassifier.IsUnitDetailFixedSpacingText(text) ||
+                              (!string.IsNullOrEmpty(text.text) && text.text.Contains('\n'));
+        if (UiStyleManager.SubmitBaseline(
+                text,
+                _loadedFont,
+                compact ? 0f : GetUiTextOutlineWidth(),
+                compact ? 0f : GetUiTextFaceDilate(),
+                UiTextOutlineColor,
+                requiresSpacing ? SubSkillMinimumLineSpacing : null,
+                !compact))
             return;
+
         EnsureUnitDetailMaterials();
-        var material = IsUnitDetailNoOutlineText(text)
-            ? _unitDetailNoOutlineMaterial
-            : _unitDetailOutlineMaterial;
+        var material = compact ? _unitDetailNoOutlineMaterial : _unitDetailOutlineMaterial;
         if (material == null)
             return;
 
@@ -630,16 +757,18 @@ public static class TmpFontInstaller
             text.fontSharedMaterial = material;
             changed = true;
         }
-        var requiresDescriptionSpacing = IsUnitDetailFixedSpacingText(text) ||
-                                         (!string.IsNullOrEmpty(text.text) && text.text.Contains('\n'));
-        if (requiresDescriptionSpacing &&
+        if (requiresSpacing &&
             !Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing))
         {
             text.lineSpacing = SubSkillMinimumLineSpacing;
             changed = true;
         }
 
-        UiStyleManager.Apply(text, GetUiTextOutlineWidth(), GetUiTextFaceDilate(), _loadedFont,
+        UiStyleManager.Apply(
+            text,
+            GetUiTextOutlineWidth(),
+            GetUiTextFaceDilate(),
+            _loadedFont,
             Plugin.Translations?.IsKnownUiTextTranslationValue(text.text) == true);
         if (changed)
             text.SetAllDirty();
@@ -656,16 +785,27 @@ public static class TmpFontInstaller
         ConfigureUnitDetailMaterial(_unitDetailNoOutlineMaterial, disableOutline: true);
 
         var refreshed = 0;
-        foreach (var text in Resources.FindObjectsOfTypeAll<TMP_Text>())
+        foreach (var text in FindActiveTmpTexts())
         {
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
-                !IsUnitDetailFontOverride(text))
+                !UiHierarchyClassifier.IsUnitDetailFontOverride(text))
                 continue;
 
             UiCanvasTranslationScanner.QueueActivationRefresh(text);
             refreshed++;
         }
         return refreshed;
+    }
+
+    private static IEnumerable<TMP_Text> FindActiveTmpTexts()
+    {
+#if ANDROID
+        return Resources.FindObjectsOfTypeAll<TMP_Text>();
+#else
+        return UnityEngine.Object.FindObjectsByType<TMP_Text>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
     }
 
     private static void EnsureUnitDetailMaterials()
@@ -723,17 +863,10 @@ public static class TmpFontInstaller
             material.DisableKeyword("UNDERLAY_ON");
     }
 
-    public static bool IsUiTranslationExcluded(object component) => false;
-
-    public static bool IsUiTextSoftOutlineLayer(object component) =>
-        component is Component unityComponent && unityComponent.gameObject != null &&
-        (unityComponent.gameObject.name.EndsWith("__MMTDSoftOutline", StringComparison.Ordinal) ||
-         unityComponent.gameObject.name.EndsWith("__MMTDUnderlay", StringComparison.Ordinal));
-
     public static void ApplyToLegacyText(object component)
     {
         if (_loadedLegacyFont == null || component is not Text text ||
-            !IsStoryMessageText(text) || Plugin.Translations == null ||
+            !UiHierarchyClassifier.IsStoryMessageText(text) || Plugin.Translations == null ||
             (!Plugin.Translations.IsKnownTranslationValue(text.text) &&
              !Plugin.Translations.IsKnownStoryTranslationValue(text.text)))
             return;
@@ -746,19 +879,19 @@ public static class TmpFontInstaller
 
     public static void ReplaceKnownStoryTextWithTmp(Text legacyText, string content = null)
     {
-        if (legacyText == null || !IsStoryMessageText(legacyText))
+        if (legacyText == null || !UiHierarchyClassifier.IsStoryMessageText(legacyText))
             return;
 
         var instanceId = legacyText.GetInstanceID();
         // UTAGE owns the reveal state of the live dialogue. A separate TMP
         // renderer cannot reproduce it from Text.text (which is the full line).
-        if (IsCurrentStoryDialogueText(legacyText))
+        if (UiHierarchyClassifier.IsCurrentStoryDialogueText(legacyText))
         {
             ApplyLegacyStoryFont(legacyText);
             RestoreOriginalText(legacyText);
             return;
         }
-        if (!_replaceStoryNames && IsStorySpeakerNameText(legacyText))
+        if (!_replaceStoryNames && UiHierarchyClassifier.IsStorySpeakerNameText(legacyText))
         {
             RestoreOriginalText(legacyText);
             return;
@@ -780,7 +913,6 @@ public static class TmpFontInstaller
         var textContent = content ?? legacyText.text;
         if (!Supports(textContent))
         {
-            // Keep the game's original renderer for Japanese/unmapped names or log entries.
             if (StoryTmpTexts.TryGetValue(instanceId, out var unsupportedOverlay) && unsupportedOverlay != null)
                 unsupportedOverlay.enabled = false;
             legacyText.enabled = true;
@@ -802,7 +934,6 @@ public static class TmpFontInstaller
             var overlayObject = gameObject.transform.Find("MonsterMusumeTDMod_StoryText")?.gameObject;
             if (overlayObject != null && overlayObject.GetComponent<RectTransform>() == null)
             {
-                // A prior build created this as a regular Transform. It cannot host a UI Graphic.
                 UnityEngine.Object.Destroy(overlayObject);
                 overlayObject = null;
             }
@@ -864,15 +995,15 @@ public static class TmpFontInstaller
 
     public static void SyncKnownStoryText(Text legacyText, string content)
     {
-        if (legacyText != null && IsCurrentStoryDialogueText(legacyText))
+        if (legacyText != null && UiHierarchyClassifier.IsCurrentStoryDialogueText(legacyText))
         {
             ApplyLegacyStoryFont(legacyText);
             RestoreOriginalText(legacyText);
             return;
         }
-        if (legacyText != null && _loadedLegacyFont != null && IsStoryMessageText(legacyText))
+        if (legacyText != null && _loadedLegacyFont != null && UiHierarchyClassifier.IsStoryMessageText(legacyText))
         {
-            if (!_replaceStoryNames && IsStorySpeakerNameText(legacyText))
+            if (!_replaceStoryNames && UiHierarchyClassifier.IsStorySpeakerNameText(legacyText))
             {
                 RestoreOriginalText(legacyText);
                 return;
@@ -919,8 +1050,6 @@ public static class TmpFontInstaller
 
         if (StoryTmpTexts.TryGetValue(legacyText.GetInstanceID(), out var overlay) && overlay != null)
             overlay.enabled = false;
-        // Also recover an overlay whose initialization failed before it was
-        // entered in StoryTmpTexts. Never leave an orphan full-line renderer.
         var orphan = legacyText.transform.Find("MonsterMusumeTDMod_StoryText");
         if (orphan != null)
             orphan.gameObject.SetActive(false);
@@ -1015,17 +1144,7 @@ public static class TmpFontInstaller
 
     private static void ApplyTranslatedTmpText(TMP_Text source, string content, bool useSubSkillPresentation)
     {
-        if (source == null || string.IsNullOrEmpty(content))
-            return;
-
-        // TMP_Text can only use TMP_FontAsset. The bundled UnityEngine.Font is
-        // reserved for the game's native UGUI story component; replacing a
-        // TMP text with a UGUI overlay breaks masks and layout in several UI.
-        // Translated and explicitly managed TMP slots must switch away from
-        // the game's Japanese-only font even when HasCharacter() does not
-        // search the bundled font's fallback tables. Otherwise the translated
-        // value is accepted first and remains blank until a later UI scan.
-        if (_loadedFont == null)
+        if (source == null || string.IsNullOrEmpty(content) || _loadedFont == null)
             return;
 
         ApplyForcedTmpTextPresentation(source, useSubSkillPresentation);
@@ -1061,8 +1180,14 @@ public static class TmpFontInstaller
             if (text.font != _loadedFont &&
                 (SubSkillTextInstanceIds.Contains(id) || UiTextInstanceIds.Contains(id)))
                 OriginalTranslatedTmpFonts.TryAdd(id, new TmpPresentationState(text));
-            UiStyleManager.SubmitBaseline(text, _loadedFont, 0f, GetUiTextFaceDilate(),
-                UiTextOutlineColor, null, false);
+            UiStyleManager.SubmitBaseline(
+                text,
+                _loadedFont,
+                0f,
+                GetUiTextFaceDilate(),
+                UiTextOutlineColor,
+                null,
+                false);
             return false;
         }
 
@@ -1070,14 +1195,13 @@ public static class TmpFontInstaller
         var changed = fontChanged;
         if (fontChanged)
         {
-            var currentPresentation = new TmpPresentationState(text);
             var instanceId = text.GetInstanceID();
             if (SubSkillTextInstanceIds.Contains(instanceId) || UiTextInstanceIds.Contains(instanceId))
                 OriginalTranslatedTmpFonts.TryAdd(instanceId, new TmpPresentationState(text));
             text.font = _loadedFont;
 
-            currentPresentation.RestoreVertexColors(text);
-
+            if (OriginalTranslatedTmpFonts.TryGetValue(instanceId, out var originalPresentation))
+                originalPresentation.RestoreVertexColors(text);
         }
 
         // A reused TMP component can retain the Alimama font while the game
@@ -1150,84 +1274,54 @@ public static class TmpFontInstaller
 
         public bool TryGetFaceColor(out Color faceColor)
         {
-            faceColor = HasFaceColor && Material != null ? Material.GetColor("_FaceColor") : FaceColor;
+            faceColor = FaceColor;
             return HasFaceColor;
         }
     }
 
     private static void ApplySubSkillPresentationIfNeeded(TMP_Text text)
     {
-        if (!ShouldUseSubSkillPresentation(text))
+        if (!UiHierarchyClassifier.ShouldUseSubSkillPresentation(text))
             return;
 
-        if (IsUnitDetailFontOverride(text))
+        if (UiHierarchyClassifier.IsUnitDetailFontOverride(text))
         {
             ApplyUnitDetailFont(text);
             return;
         }
 
-        if (UiStyleManager.SubmitBaseline(text, _loadedFont, GetUiTextOutlineWidth(),
-            GetUiTextFaceDilate(), SubSkillOutlineColor, SubSkillMinimumLineSpacing))
+        var width = GetUiTextOutlineWidth();
+        var dilate = GetUiTextFaceDilate();
+        if (UiStyleManager.SubmitBaseline(
+                text,
+                _loadedFont,
+                width,
+                dilate,
+                SubSkillOutlineColor,
+                SubSkillMinimumLineSpacing))
             return;
 
-        var changed = false;
-        if (!Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing))
+        UiStyleManager.BeginPresentation(text);
+        try
         {
-            text.lineSpacing = SubSkillMinimumLineSpacing;
-            changed = true;
+            UiStyleManager.SubmitBaseline(
+                text,
+                _loadedFont,
+                width,
+                dilate,
+                SubSkillOutlineColor,
+                SubSkillMinimumLineSpacing);
+            UiStyleManager.Apply(
+                text,
+                width,
+                dilate,
+                _loadedFont,
+                Plugin.Translations?.IsKnownTranslationValue(text.text) == true);
         }
-
-        var material = text.fontMaterial;
-        if (material != null)
+        finally
         {
-            var materialChanged = false;
-            var faceDilate = GetUiTextFaceDilate();
-            var outlineWidth = GetUiTextOutlineWidth();
-            if (material.HasProperty("_FaceDilate") &&
-                !Mathf.Approximately(material.GetFloat("_FaceDilate"), faceDilate))
-            {
-                material.SetFloat("_FaceDilate", faceDilate);
-                materialChanged = true;
-            }
-            if (material.HasProperty("_OutlineColor") &&
-                material.GetColor("_OutlineColor") != (Color)SubSkillOutlineColor)
-            {
-                material.SetColor("_OutlineColor", SubSkillOutlineColor);
-                materialChanged = true;
-            }
-            if (material.HasProperty("_OutlineWidth") &&
-                !Mathf.Approximately(material.GetFloat("_OutlineWidth"), outlineWidth))
-            {
-                material.SetFloat("_OutlineWidth", outlineWidth);
-                materialChanged = true;
-            }
-            if (!material.HasShaderKeyword("OUTLINE_ON"))
-            {
-                material.EnableKeyword("OUTLINE_ON");
-                materialChanged = true;
-            }
-            if (materialChanged)
-            {
-                text.fontMaterial = material;
-                changed = true;
-            }
+            UiStyleManager.EndPresentation();
         }
-
-        if ((Color)text.outlineColor != (Color)SubSkillOutlineColor)
-        {
-            text.outlineColor = SubSkillOutlineColor;
-            changed = true;
-        }
-        var targetOutlineWidth = GetUiTextOutlineWidth();
-        if (!Mathf.Approximately(text.outlineWidth, targetOutlineWidth))
-        {
-            text.outlineWidth = targetOutlineWidth;
-            changed = true;
-        }
-        UiStyleManager.Apply(text, GetUiTextOutlineWidth(), GetUiTextFaceDilate(), _loadedFont,
-            Plugin.Translations?.IsKnownTranslationValue(text.text) == true);
-        if (changed)
-            text.SetAllDirty();
     }
 
     private static void ApplyUiTextPresentation(TMP_Text text)
@@ -1235,144 +1329,66 @@ public static class TmpFontInstaller
         if (text == null || _loadedFont?.material == null)
             return;
 
-        if (IsUnitDetailFontOverride(text))
+        if (UiHierarchyClassifier.IsUnitDetailFontOverride(text))
         {
             ApplyUnitDetailFont(text);
             return;
         }
 
-        if (UiStyleManager.SubmitBaseline(text, _loadedFont, GetUiTextOutlineWidth(),
-            GetUiTextFaceDilate(), GetUiTextOutlineColor(text), null))
+        var width = GetUiTextOutlineWidth();
+        var dilate = GetUiTextFaceDilate();
+        var outlineColor = GetUiTextOutlineColor(text);
+        if (UiStyleManager.SubmitBaseline(
+                text,
+                _loadedFont,
+                width,
+                dilate,
+                outlineColor,
+                null))
             return;
 
-        var instanceId = text.GetInstanceID();
-        var changed = false;
-        if (!UiTextMaterials.TryGetValue(instanceId, out var material) || material == null)
+        UiStyleManager.BeginPresentation(text);
+        try
         {
-            material = new Material(_loadedFont.material)
-            {
-                name = $"{_loadedFont.material.name}_UiOutline_{instanceId}"
-            };
-            UiTextMaterials[instanceId] = material;
-            changed = true;
+            UiStyleManager.SubmitBaseline(
+                text,
+                _loadedFont,
+                width,
+                dilate,
+                outlineColor,
+                null);
+            UiStyleManager.Apply(
+                text,
+                width,
+                dilate,
+                _loadedFont,
+                Plugin.Translations?.IsKnownUiTextTranslationValue(text.text) == true);
         }
-
-        var outlineColor = GetUiTextOutlineColor(text);
-        if (material.HasProperty("_OutlineColor") && material.GetColor("_OutlineColor") != outlineColor)
+        finally
         {
-            material.SetColor("_OutlineColor", outlineColor);
-            changed = true;
+            UiStyleManager.EndPresentation();
         }
-        var outlineWidth = GetUiTextOutlineWidth();
-        if (material.HasProperty("_OutlineWidth") &&
-            !Mathf.Approximately(material.GetFloat("_OutlineWidth"), outlineWidth))
-        {
-            material.SetFloat("_OutlineWidth", outlineWidth);
-            changed = true;
-        }
-        var faceDilate = GetUiTextFaceDilate();
-        if (material.HasProperty("_FaceDilate") &&
-            !Mathf.Approximately(material.GetFloat("_FaceDilate"), faceDilate))
-        {
-            material.SetFloat("_FaceDilate", faceDilate);
-            changed = true;
-        }
-        if (!material.HasShaderKeyword("OUTLINE_ON"))
-        {
-            material.EnableKeyword("OUTLINE_ON");
-            changed = true;
-        }
-        if (text.fontSharedMaterial != material)
-        {
-            text.fontSharedMaterial = material;
-            changed = true;
-        }
-        UiStyleManager.Apply(text, GetUiTextOutlineWidth(), GetUiTextFaceDilate(), _loadedFont,
-            Plugin.Translations?.IsKnownUiTextTranslationValue(text.text) == true);
-        if (changed)
-            text.SetAllDirty();
     }
 
-    private static Color GetUiTextOutlineColor(TMP_Text text)
-    {
-        var path = GetHierarchyPath(text.transform);
-        return path.Contains("/Common_SortFilter", StringComparison.OrdinalIgnoreCase)
+    private static Color GetUiTextOutlineColor(TMP_Text text) =>
+        UiHierarchyClassifier.IsCommonSortFilterText(text)
             ? Color.white
             : UiTextOutlineColor;
-    }
-
-    /// <summary>
-    /// This compact EX-skill description sits over a dark textured panel.
-    /// Its dense Chinese lines become too heavy with the global UI outline,
-    /// so retain alimama and face weight while disabling only the outline.
-    /// </summary>
-    private static bool IsUnitDetailNoOutlineText(TMP_Text text)
-    {
-        if (text?.transform == null)
-            return false;
-
-        var path = GetHierarchyPath(text.transform);
-        return IsUnitDetailCompactDescription(path);
-    }
-
-    private static bool IsUnitDetailCompactDescription(TMP_Text text) =>
-        text?.transform != null && IsUnitDetailCompactDescription(GetHierarchyPath(text.transform));
-
-    public static bool ShouldRefreshUnitDetailDescription(TMP_Text text) =>
-        text != null && IsUnitDetailFontOverride(text) && IsUnitDetailFixedSpacingText(text);
-
-    private static bool IsUnitDetailFixedSpacingText(TMP_Text text)
-    {
-        if (text?.transform == null)
-            return false;
-
-        var path = GetHierarchyPath(text.transform);
-        if (path.Contains("/UnitTribeTextArea/", StringComparison.OrdinalIgnoreCase) ||
-            path.Contains("/UnitClassTextArea/", StringComparison.OrdinalIgnoreCase))
-            return true;
-        return IsUnitDetailCompactDescription(path) ||
-               (path.Contains("/UICanvasTopUnitDetail/", StringComparison.OrdinalIgnoreCase) &&
-                path.EndsWith("/TextArea/Text", StringComparison.OrdinalIgnoreCase)) ||
-               (path.Contains("/Unit_Detail_ExSkill", StringComparison.OrdinalIgnoreCase) &&
-                path.EndsWith(
-                    "/WindowBase/ExSkillChangeView/SkillView1/ExSkillTextArea/TextArea/Text",
-                    StringComparison.OrdinalIgnoreCase)) ||
-               (path.Contains("/Bom_Detail", StringComparison.OrdinalIgnoreCase) &&
-                path.EndsWith(
-                    "/Main/UI/Bom_Detail_StatusView/Skill1Btn/TextArea/Text",
-                    StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static bool IsUnitDetailCompactDescription(string path)
-    {
-        var isExSkillDescription =
-            path.Contains("/Unit_Detail_ExSkill", StringComparison.OrdinalIgnoreCase) &&
-            path.EndsWith("/WindowBase/Rein/Desc", StringComparison.OrdinalIgnoreCase);
-        var isUniqueWeaponAbility =
-            path.Contains("/UniqueWeapon_CreateDetailView", StringComparison.OrdinalIgnoreCase) &&
-            path.EndsWith(
-                "/UniqueWeapon_StatusView/LayoutGroup/Ability/AbilityText",
-                StringComparison.OrdinalIgnoreCase);
-
-        return isExSkillDescription || isUniqueWeaponAbility;
-    }
 
     public static void ApplyHomeDeckSubSkillNamePresentation(TMP_Text text)
     {
         if (_loadedFont == null || text?.transform == null)
             return;
 
-        if (IsHomeDeckExSkillSlotName(text.transform) ||
-            IsQuestDungeonSkillName(text.transform))
+        if (UiHierarchyClassifier.IsHomeDeckExSkillSlotName(text.transform) ||
+            UiHierarchyClassifier.IsQuestDungeonSkillName(text.transform))
         {
-            // This compact slot can show either a Japanese or translated EX
-            // skill name. Quest cards use the same compact presentation for
-            // their featured and unique sub-skill names.
             ApplyForcedTmpTextPresentation(text, useSubSkillPresentation: true);
             return;
         }
 
-        if (!IsHomeDeckSubSkillName(text.transform) || Plugin.Translations == null ||
+        if (!UiHierarchyClassifier.IsHomeDeckSubSkillName(text.transform) ||
+            Plugin.Translations == null ||
             !Plugin.Translations.IsKnownSubSkillTranslationValue(text.text))
             return;
 
@@ -1392,139 +1408,11 @@ public static class TmpFontInstaller
         -1f,
         1f);
 
-    private static void ApplyUiTextSoftOutline(TMP_Text text)
-    {
-        if (text is not TextMeshProUGUI || text.gameObject == null)
-            return;
-
-        var instanceId = text.GetInstanceID();
-        if (!UiTextSoftOutlineTexts.TryGetValue(instanceId, out var outlineText) || outlineText == null)
-        {
-            var outlineObject = UnityEngine.Object.Instantiate(text.gameObject, text.transform.parent);
-            outlineObject.name = $"{text.gameObject.name}__MMTDSoftOutline";
-            outlineObject.transform.SetSiblingIndex(text.transform.GetSiblingIndex());
-            outlineText = outlineObject.GetComponent<TextMeshProUGUI>();
-            if (outlineText == null)
-            {
-                UnityEngine.Object.Destroy(outlineObject);
-                return;
-            }
-
-            outlineText.raycastTarget = false;
-            UiTextSoftOutlineTexts[instanceId] = outlineText;
-        }
-
-        if (!UiTextSoftOutlineMaterials.TryGetValue(instanceId, out var material) || material == null)
-        {
-            material = new Material(_loadedFont.material)
-            {
-                name = $"{_loadedFont.material.name}_UiSoftOutline_{instanceId}"
-            };
-            UiTextSoftOutlineMaterials[instanceId] = material;
-        }
-
-        // The background layer renders only the soft SDF outline. Its fill is
-        // transparent and the foreground TMP text draws over the inner edge.
-        var changed = false;
-        var transparentFace = new Color(1f, 1f, 1f, 0f);
-        if (material.HasProperty("_FaceColor") && material.GetColor("_FaceColor") != transparentFace)
-        {
-            material.SetColor("_FaceColor", new Color(1f, 1f, 1f, 0f));
-            changed = true;
-        }
-        if (material.HasProperty("_OutlineColor") &&
-            material.GetColor("_OutlineColor") != (Color)UiTextOutlineColor)
-        {
-            material.SetColor("_OutlineColor", UiTextOutlineColor);
-            changed = true;
-        }
-        if (material.HasProperty("_OutlineWidth") &&
-            !Mathf.Approximately(material.GetFloat("_OutlineWidth"), UiTextSoftOutlineWidth))
-        {
-            material.SetFloat("_OutlineWidth", UiTextSoftOutlineWidth);
-            changed = true;
-        }
-        if (material.HasProperty("_OutlineSoftness") &&
-            !Mathf.Approximately(material.GetFloat("_OutlineSoftness"), UiTextSoftOutlineSoftness))
-        {
-            material.SetFloat("_OutlineSoftness", UiTextSoftOutlineSoftness);
-            changed = true;
-        }
-        if (!material.HasShaderKeyword("OUTLINE_ON"))
-        {
-            material.EnableKeyword("OUTLINE_ON");
-            changed = true;
-        }
-        if (material.HasShaderKeyword("UNDERLAY_ON"))
-        {
-            material.DisableKeyword("UNDERLAY_ON");
-            changed = true;
-        }
-
-        if (outlineText.font != text.font)
-        {
-            outlineText.font = text.font;
-            changed = true;
-        }
-        if (outlineText.fontSharedMaterial != material)
-        {
-            outlineText.fontSharedMaterial = material;
-            changed = true;
-        }
-        if (outlineText.color != Color.white)
-        {
-            outlineText.color = Color.white;
-            changed = true;
-        }
-        if (!string.Equals(outlineText.text, text.text, StringComparison.Ordinal))
-        {
-            outlineText.text = text.text;
-            changed = true;
-        }
-        var siblingIndex = text.transform.GetSiblingIndex();
-        if (outlineText.transform.GetSiblingIndex() != siblingIndex)
-        {
-            outlineText.transform.SetSiblingIndex(siblingIndex);
-            changed = true;
-        }
-        if (changed)
-            outlineText.SetAllDirty();
-    }
-
-    private static void ReleaseUiTextSoftOutline(int instanceId)
-    {
-        if (UiTextSoftOutlineMaterials.Remove(instanceId, out var material) && material != null)
-            UnityEngine.Object.Destroy(material);
-        if (UiTextSoftOutlineTexts.Remove(instanceId, out var outlineText) && outlineText != null)
-            UnityEngine.Object.Destroy(outlineText.gameObject);
-    }
-
-    private static void ReleaseUiTextMaterial(int instanceId)
-    {
-        if (UiTextMaterials.Remove(instanceId, out var material) && material != null)
-            UnityEngine.Object.Destroy(material);
-    }
-
     private static void ApplyTranslatedShopAndPopupLayout(TMP_Text text)
     {
-        if (text == null || text.transform == null)
+        if (!UiHierarchyClassifier.IsShopOrPopupLayoutText(text))
             return;
 
-        var path = GetHierarchyPath(text.transform);
-        var isPopupDescription =
-            path.Contains("Common_SimpleDetailPopup", StringComparison.OrdinalIgnoreCase) &&
-            path.EndsWith("/Text_Explanation", StringComparison.OrdinalIgnoreCase);
-        var isShopItemName =
-            path.Contains("Home_Shop", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/Shop_SaleContent", StringComparison.OrdinalIgnoreCase) &&
-            path.EndsWith("/Name", StringComparison.OrdinalIgnoreCase);
-        if (!isPopupDescription && !isShopItemName)
-            return;
-
-        // The item-detail prefab uses spacing tuned for the original Japanese
-        // face. Alimama's Chinese glyph metrics need additional separation in
-        // translated descriptions and wrapped shop item names, but no
-        // sub-skill outline.
         if (!Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing))
         {
             text.lineSpacing = SubSkillMinimumLineSpacing;
@@ -1553,7 +1441,12 @@ public static class TmpFontInstaller
             }
             if (char.IsControl(character) || char.IsWhiteSpace(character))
                 continue;
-            if (!_loadedFont.HasCharacter(character))
+            if (!SupportedCharCache.TryGetValue(character, out var supported))
+            {
+                supported = _loadedFont.HasCharacter(character);
+                SupportedCharCache[character] = supported;
+            }
+            if (!supported)
                 return false;
         }
         return true;
@@ -1588,6 +1481,7 @@ public static class TmpFontInstaller
             TMP_FontAsset firstFont = null;
             LoadedFonts.Clear();
             MissingStyleFonts.Clear();
+            SupportedCharCache.Clear();
             foreach (var asset in _loadedBundle.LoadAllAssets<TMP_FontAsset>())
             {
                 if (asset == null)
@@ -1605,10 +1499,6 @@ public static class TmpFontInstaller
             if (_loadedFont == null)
                 throw new InvalidOperationException("No TMP_FontAsset was found in the configured AssetBundle");
 
-            // The game runs Resources.UnloadUnusedAssets while changing into
-            // an ADV scene. Keep bundle fonts alive before any text component
-            // references them, otherwise the Legacy font compares equal to
-            // null and the obsolete TMP story overlay is selected.
             _loadedFont.hideFlags |= HideFlags.DontUnloadUnusedAsset;
 
             foreach (var asset in _loadedBundle.LoadAllAssets<Font>())
@@ -1692,202 +1582,6 @@ public static class TmpFontInstaller
             text.font = _loadedLegacyFont;
     }
 
-    public static bool IsStoryMessageText(Text text)
-    {
-        var transform = text.transform;
-        if (transform == null)
-            return false;
-        var componentName = transform.name;
-
-        var fullPath = GetHierarchyPath(transform);
-        if (IsCurrentStoryDialogueText(text))
-            return true;
-
-        // Backlog entries are created under a separate runtime container. Avoid
-        // replacing the BackLog button's short "Log" label itself.
-        if (!fullPath.Contains("AdvEngine/", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        var isStoryHistoryText =
-            fullPath.Contains("/BackLog", StringComparison.OrdinalIgnoreCase) ||
-            fullPath.Contains("/Backlog", StringComparison.OrdinalIgnoreCase) ||
-            fullPath.Contains("/FullScreenLog", StringComparison.OrdinalIgnoreCase) ||
-            fullPath.Contains("/History", StringComparison.OrdinalIgnoreCase) ||
-            fullPath.Contains("/Log", StringComparison.OrdinalIgnoreCase);
-        var isStorySelectionText =
-            fullPath.Contains("/Selection/Content/SelectionItem", StringComparison.OrdinalIgnoreCase);
-
-        return (isStoryHistoryText || isStorySelectionText) &&
-               !fullPath.Contains("/BackLogButton/", StringComparison.OrdinalIgnoreCase) &&
-               !fullPath.Contains("/Skip/", StringComparison.OrdinalIgnoreCase) &&
-               !fullPath.Contains("/Auto/", StringComparison.OrdinalIgnoreCase);
-    }
-
-    public static bool IsCurrentStoryDialogueText(Text text)
-    {
-        if (text == null || text.transform == null)
-            return false;
-
-        var componentName = text.transform.name;
-        return (componentName == "MessageText" || componentName == "NameText") &&
-               GetHierarchyPath(text.transform).Contains(
-                   "AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/MessageTexts/",
-                   StringComparison.Ordinal);
-    }
-
-    public static bool IsStorySpeakerNameText(Text text)
-    {
-        if (text == null || text.transform == null)
-            return false;
-
-        var name = text.transform.name;
-        if (!string.Equals(name, "NameText", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(name, "Name", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(name, "CharacterName", StringComparison.OrdinalIgnoreCase))
-            return false;
-
-        var path = GetHierarchyPath(text.transform);
-        return path.Contains("AdvEngine/", StringComparison.OrdinalIgnoreCase) &&
-               (path.Contains("/MessageWindow", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("/BackLog", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("/History", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("/Log", StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static string GetHierarchyPath(Transform transform)
-    {
-        var path = new List<string>();
-        for (; transform != null; transform = transform.parent)
-            path.Add(transform.name);
-        path.Reverse();
-        return string.Join("/", path);
-    }
-
-    public static string GetHierarchyPath(object component) =>
-        component is Component unityComponent && unityComponent.transform != null
-            ? GetHierarchyPath(unityComponent.transform)
-            : string.Empty;
-
-    private static bool IsSubSkillScrollText(Transform transform)
-    {
-        var path = GetHierarchyPath(transform);
-        var nodeName = transform?.name ?? string.Empty;
-        // Menu and quest pages use a compact Subskill(Clone) prefab rather
-        // than the detail-window paths below. Its Name/Text children are still
-        // auxiliary-skill content and must receive the same presentation.
-        var isGenericSubSkillEntry =
-            path.Contains("/Subskill", StringComparison.OrdinalIgnoreCase) &&
-            (string.Equals(nodeName, "Name", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(nodeName, "Text", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(nodeName, "Description", StringComparison.OrdinalIgnoreCase) ||
-             string.Equals(nodeName, "SkillNameText", StringComparison.OrdinalIgnoreCase));
-
-        // Runtime windows are instantiated as Unit_Detail_AttachAbility(Clone),
-        // so matching the exact prefab path silently skipped every card.
-        var isAttachAbilityList =
-            path.Contains("Unit_Detail_AttachAbility", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/WindowBase/ScrollView/", StringComparison.OrdinalIgnoreCase) &&
-            // The list instruction is ordinary UI, not a skill description.
-            // Both setter hooks and the scanner use this classifier: routing
-            // it to subskills prevents the exact UICanvas translation running.
-            !path.EndsWith("/Content/Title/Text", StringComparison.OrdinalIgnoreCase);
-
-        // The unit-detail SkillDialog uses a separate SubSkillTextArea prefab.
-        // It is a sub-skill presentation too, even though it is not under the
-        // AttachAbility WindowBase path used by the overview list.
-        var isUnitDetailSkillDialog =
-            path.Contains("Unit_Detail_Rework", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/SkillDialog/", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/SubSkillTextArea", StringComparison.OrdinalIgnoreCase);
-
-        var isSubSkillCombineText =
-            path.Contains("SubSkillCombine_Popup", StringComparison.OrdinalIgnoreCase) &&
-            (path.EndsWith("/CombineIcon/Name", StringComparison.OrdinalIgnoreCase) ||
-             path.EndsWith("/CombineIcon/Title", StringComparison.OrdinalIgnoreCase) ||
-             (path.Contains("/MaterialIconContent/", StringComparison.OrdinalIgnoreCase) &&
-              path.EndsWith("/GrayoutObj/Title", StringComparison.OrdinalIgnoreCase)));
-
-        var isSubSkillRecipeName =
-            path.Contains("/ScrollView_SubSkillRecipe/", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/SubSkillRecipeBanner", StringComparison.OrdinalIgnoreCase) &&
-            path.EndsWith("/SubSkillName_Text", StringComparison.OrdinalIgnoreCase);
-
-        var isBattleResultAcquiredSkill =
-            path.Contains("/UICanvasBattleResult/", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/Result_Summary_skip", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/AcquiredSkillSkip/", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/Ef_GetSkill", StringComparison.OrdinalIgnoreCase) &&
-            (path.EndsWith("/Skill/Name", StringComparison.OrdinalIgnoreCase) ||
-             path.EndsWith("/Skill/Text", StringComparison.OrdinalIgnoreCase));
-
-        var isEquippedSubSkillAttach =
-            IsEquippedSubSkillAttachPath(path) &&
-            path.Contains("/AbilityRoot/Image", StringComparison.OrdinalIgnoreCase);
-
-        return isGenericSubSkillEntry || isAttachAbilityList || isUnitDetailSkillDialog || isSubSkillCombineText ||
-               isSubSkillRecipeName || isBattleResultAcquiredSkill || isEquippedSubSkillAttach;
-    }
-
-    private static bool IsHomeDeckSubSkillName(Transform transform)
-    {
-        var path = GetHierarchyPath(transform);
-        return IsEquippedSubSkillAttachPath(path) &&
-               path.Contains("/AbilityRoot/Image", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsEquippedSubSkillAttachPath(string path) =>
-        (path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) ||
-         path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase)) &&
-        path.Contains("/AttachAbilityButton", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsHomeDeckExSkillSlotName(Transform transform)
-    {
-        var path = GetHierarchyPath(transform);
-        return path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) &&
-               path.Contains("/ExSkillChangeButton/SkillName/", StringComparison.OrdinalIgnoreCase) &&
-               path.EndsWith("/SkillNameText", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsQuestDungeonSkillName(Transform transform)
-    {
-        var path = GetHierarchyPath(transform);
-        return path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase) &&
-               path.Contains("/Quest_Dungeon", StringComparison.OrdinalIgnoreCase) &&
-               path.Contains("/QuestContentDungeon", StringComparison.OrdinalIgnoreCase) &&
-               (path.EndsWith("/Back/FeaturedSkillName", StringComparison.OrdinalIgnoreCase) ||
-                path.EndsWith("/Back/UniqueSkillName", StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static bool ShouldUseSubSkillPresentation(TMP_Text text)
-    {
-        if (text == null || text.transform == null)
-            return false;
-
-        var path = GetHierarchyPath(text.transform);
-        // Only actual sub-skill browsing and equipped-skill slots need the
-        // readability outline. Shop item cards can share a translation string
-        // with a sub-skill, but must keep their ordinary visual treatment.
-        return IsSubSkillScrollText(text.transform) ||
-               IsQuestDungeonSkillName(text.transform) ||
-               (IsEquippedSubSkillAttachPath(path) ||
-                (path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) &&
-                 path.Contains("ExSkillChangeButton/SkillName/", StringComparison.OrdinalIgnoreCase)));
-    }
-
-    private static TextAnchor ToLegacyAlignment(TextAlignmentOptions alignment) => alignment switch
-    {
-        TextAlignmentOptions.TopLeft => TextAnchor.UpperLeft,
-        TextAlignmentOptions.Top => TextAnchor.UpperCenter,
-        TextAlignmentOptions.TopRight => TextAnchor.UpperRight,
-        TextAlignmentOptions.Left => TextAnchor.MiddleLeft,
-        TextAlignmentOptions.Center => TextAnchor.MiddleCenter,
-        TextAlignmentOptions.Right => TextAnchor.MiddleRight,
-        TextAlignmentOptions.BottomLeft => TextAnchor.LowerLeft,
-        TextAlignmentOptions.Bottom => TextAnchor.LowerCenter,
-        TextAlignmentOptions.BottomRight => TextAnchor.LowerRight,
-        _ => TextAnchor.MiddleLeft
-    };
-
     private static TextAlignmentOptions ToTmpAlignment(TextAnchor alignment) => alignment switch
     {
         TextAnchor.UpperLeft => TextAlignmentOptions.TopLeft,
@@ -1901,5 +1595,4 @@ public static class TmpFontInstaller
         TextAnchor.LowerRight => TextAlignmentOptions.BottomRight,
         _ => TextAlignmentOptions.TopLeft
     };
-
 }

@@ -5,11 +5,11 @@ using System.Linq;
 using System.Net.Http;
 using System.Net;
 using System.Net.Http.Headers;
-using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 #if ANDROID
 using Paths = MonsterMusumeTDMod.Android.AndroidPaths;
 #else
@@ -24,11 +24,15 @@ namespace MonsterMusumeTDMod.Patches;
 /// <summary>Synchronizes repository-managed translation files without blocking game startup.</summary>
 public sealed class TranslationUpdateController : MonoBehaviour
 {
+    private const float AutoStartupSyncDelaySeconds = 3f;
+
     private static TranslationUpdateController _instance;
     private Task<UpdateResult> _updateTask;
     private Task<AssetUpdateResult> _assetUpdateTask;
     private bool _handled;
     private bool _assetHandled;
+    private bool _startupSyncPending;
+    private float _startupSyncAt;
 
 #if ANDROID
     private const string FontAssetName = "alimama-android";
@@ -50,6 +54,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
             Plugin.Log?.LogWarning("F6 translation sync skipped: update controller is not ready");
             return;
         }
+        _instance._startupSyncPending = false;
         _instance.BeginTranslationSync(true);
     }
 
@@ -59,11 +64,18 @@ public sealed class TranslationUpdateController : MonoBehaviour
         if (Plugin.Settings?.EnableTranslationAutoUpdate.Value != true)
             return;
 
-        BeginTranslationSync(false);
+        // Defer automatic background sync slightly so it does not compete with
+        // Unity/IL2CPP cold-start asset initialization on the first frames.
+        _startupSyncPending = true;
+        _startupSyncAt = Time.unscaledTime + AutoStartupSyncDelaySeconds;
     }
 
     private void BeginTranslationSync(bool manual)
     {
+        // Do not replace a completed task before Update() has consumed its
+        // result. This matters when F6 is pressed while the font download is
+        // still finishing; otherwise the old task can be overwritten and its
+        // staged asset result is never applied on the next launch.
         if ((_updateTask != null && (!_updateTask.IsCompleted || !_handled)) ||
             (_assetUpdateTask != null && (!_assetUpdateTask.IsCompleted || !_assetHandled)))
         {
@@ -75,27 +87,41 @@ public sealed class TranslationUpdateController : MonoBehaviour
         var baseUrl = Plugin.Settings.TranslationUpdateBaseUrl.Value?.Trim().TrimEnd('/');
         var assetBaseUrl = Plugin.Settings.TranslationAssetUpdateBaseUrl.Value?.Trim().TrimEnd('/');
         var timeoutSeconds = Math.Clamp(Plugin.Settings.TranslationUpdateTimeoutSeconds.Value, 3, 60);
+        var concurrency = Math.Clamp(Plugin.Settings.TranslationUpdateConcurrentDownloads.Value, 1, 16);
 
         if (string.IsNullOrWhiteSpace(baseUrl))
         {
-            Plugin.Log?.LogWarning($"Translation sync skipped: remote base URL is empty");
+            Plugin.Log?.LogWarning("Translation sync skipped: remote base URL is empty");
             return;
         }
 
         _handled = false;
-        Plugin.Log?.LogInfo("Update connection: system proxy");
-        ShowUpdateNotice("正在检查汉化更新…");
-        ShowUpdateNotice(manual ? "正在检查汉化更新…" : "正在检查汉化更新…");
         Plugin.Log?.LogInfo(manual
             ? "F6 requested translation synchronization in the background"
             : "Checking for translation updates in the background");
-        _updateTask = Task.Run(() => SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds));
+        // Android always follows the device/runtime system proxy.  The desktop
+        // implementation supports an explicit proxy, but exposing a hard-coded
+        // address here breaks users whose LemonLoader process inherits a VPN or
+        // per-device proxy configuration.
+#if ANDROID
+        const string proxyUrl = null;
+        const bool directConnection = false;
+        Plugin.Log?.LogInfo("Update connection: system proxy");
+#else
+        var proxyUrl = Plugin.Settings.TranslationUpdateProxyUrl.Value?.Trim();
+        var directConnection = Plugin.Settings.TranslationUpdateDirectConnection.Value;
+        Plugin.Log?.LogInfo(directConnection
+            ? "Update connection: direct (system proxy disabled)"
+            : string.IsNullOrEmpty(proxyUrl) ? "Update connection: system proxy"
+            : "Update connection: explicit proxy (system proxy discovery disabled)");
+#endif
+        _updateTask = Task.Run(() => SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds, proxyUrl, directConnection, concurrency));
         if (!string.IsNullOrWhiteSpace(assetBaseUrl))
         {
             _assetHandled = false;
             Plugin.Log?.LogInfo("Checking for font asset updates in the background");
             _assetUpdateTask = Task.Run(() => SynchronizeFontAssetAsync(
-                Paths.PluginPath, assetBaseUrl, timeoutSeconds));
+                Paths.PluginPath, assetBaseUrl, timeoutSeconds, proxyUrl, directConnection));
         }
         else
         {
@@ -105,6 +131,13 @@ public sealed class TranslationUpdateController : MonoBehaviour
 
     public void Update()
     {
+        if (_startupSyncPending && Time.unscaledTime >= _startupSyncAt)
+        {
+            _startupSyncPending = false;
+            if (Plugin.Settings?.EnableTranslationAutoUpdate.Value == true)
+                BeginTranslationSync(false);
+        }
+
         HandleAssetUpdateCompletion();
         if (_handled || _updateTask == null || !_updateTask.IsCompleted)
             return;
@@ -133,23 +166,17 @@ public sealed class TranslationUpdateController : MonoBehaviour
             return;
         }
 
-        ShowUpdateNotice("汉化下载完成，正在刷新…");
-
-        ShowUpdateNotice("汉化下载完成，正在刷新…");
-
         try
         {
             Plugin.Translations?.LoadStatic();
             UiStyleManager.Reload();
             UiCanvasTranslationScanner.InvalidateProcessingCache();
-            UiCanvasTranslationScanner.RequestFastScan();
             R18DialogueBackgroundController.InvalidatePresentation();
             var refreshed = Plugin.Translations == null
                 ? 0
                 : TmpFontInstaller.ReloadVisibleUiTranslations(Plugin.Translations);
             var subSkillsRefreshed = TmpFontInstaller.RefreshVisibleSubSkillPresentation();
             var unitDetailRefreshed = TmpFontInstaller.RefreshVisibleUnitDetailPresentation();
-            UiCanvasTranslationScanner.RequestFastScan();
             Plugin.Log?.LogInfo(
                 $"Translation update applied: downloaded={result.Downloaded}, reused={result.Resumed}, deleted={result.Deleted}, " +
                 $"unchanged={result.Unchanged}, commit={result.Commit}; refreshed {refreshed} UI, " +
@@ -213,47 +240,29 @@ public sealed class TranslationUpdateController : MonoBehaviour
         if (!string.IsNullOrEmpty(result.Error))
             Plugin.Log?.LogWarning($"Font asset auto-update failed; existing font remains active: {result.Error}");
         else if (result.Downloaded)
-        {
-            ShowUpdateNotice("字体下载完成，将在下次启动安装");
             Plugin.Log?.LogInfo(
                 $"Font asset update downloaded and verified (commit {result.Commit}); it will be installed on the next game start");
-        }
         else
             Plugin.Log?.LogInfo($"Font asset is up to date (commit {result.Commit})");
     }
 
-    /// <summary>Shows a transient Android message without requiring user input.</summary>
-    private static void ShowUpdateNotice(string message)
-    {
-#if ANDROID
-        try
-        {
-            var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer");
-            var activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity");
-            if (activity == null) return;
-            var toastClass = new AndroidJavaClass("android.widget.Toast");
-            var context = activity.Call<AndroidJavaObject>("getApplicationContext");
-            var toast = toastClass.CallStatic<AndroidJavaObject>(
-                "makeText", context, message, toastClass.GetStatic<int>("LENGTH_SHORT"));
-            toast.Call("show");
-        }
-        catch (Exception ex)
-        {
-            Plugin.Log?.LogInfo($"Could not show update notice: {ex.Message}");
-        }
-#endif
-    }
+    // Keep the original three-argument reflection/API shape for Android test
+    // harnesses and older callers; the overload delegates to the configurable
+    // implementation below and still uses the platform's system proxy.
+    private static Task<AssetUpdateResult> SynchronizeFontAssetAsync(
+        string pluginRoot, string baseUrl, int timeoutSeconds) =>
+        SynchronizeFontAssetAsync(pluginRoot, baseUrl, timeoutSeconds, null, false);
 
     private static async Task<AssetUpdateResult> SynchronizeFontAssetAsync(
         string pluginRoot,
         string baseUrl,
-        int timeoutSeconds)
+        int timeoutSeconds, string proxyUrl = null, bool directConnection = false)
     {
         var diagnostics = new UpdateDiagnostics("Font", timeoutSeconds);
         var stage = "manifest.fetch";
         try
         {
-            using var client = CreateUpdateClient(timeoutSeconds);
+            using var client = CreateUpdateClient(timeoutSeconds, proxyUrl, directConnection);
             var manifestBytes = await FetchManifestAsync(client, baseUrl, diagnostics).ConfigureAwait(false);
             stage = "manifest.parse";
             var manifest = ParseManifest(manifestBytes, "remote asset manifest");
@@ -263,13 +272,22 @@ public sealed class TranslationUpdateController : MonoBehaviour
 
             var targetPath = Path.Combine(pluginRoot, FontAssetName);
             var pendingPath = targetPath + PendingSuffix;
+            var installedManifestPath = Path.Combine(
+                pluginRoot, "MonsterMusumeTDMod", "assets-manifest.json");
             var pendingManifestPath = Path.Combine(
                 pluginRoot, "MonsterMusumeTDMod", "assets-manifest.pending.json");
             var cacheRoot = Path.Combine(pluginRoot, "MonsterMusumeTDMod", ".font-update-cache");
             stage = "local-check";
             diagnostics.Info($"checking installed font: file={FontAssetName}, expected_bytes={expected.Size}");
-            if (File.Exists(targetPath) && new FileInfo(targetPath).Length == expected.Size &&
-                HashMatches(targetPath, expected.Sha256))
+            var installedManifest = TryReadManifest(installedManifestPath);
+            var matchesInstalledManifest =
+                installedManifest != null &&
+                installedManifest.Files.TryGetValue(FontAssetName, out var localFontEntry) &&
+                string.Equals(localFontEntry.Sha256, expected.Sha256, StringComparison.OrdinalIgnoreCase);
+
+            if (File.Exists(targetPath) &&
+                new FileInfo(targetPath).Length == expected.Size &&
+                (matchesInstalledManifest || HashMatches(targetPath, expected.Sha256)))
             {
                 TryDeleteFile(pendingPath);
                 TryDeleteFile(pendingManifestPath);
@@ -282,7 +300,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
             if (!IsValidCachedFile(pendingPath, FontAssetName, expected))
             {
                 diagnostics.Info($"font download: file={FontAssetName}, url={SafeLogUrl(BuildFileUrl(baseUrl, FontAssetName))}, idle_timeout={timeoutSeconds}s, total_timeout={RequestTotalTimeoutSeconds}s");
-                var cachedPath = await DownloadVerifiedAsync(client, BuildFileUrl(baseUrl, FontAssetName),
+                var (cachedPath, _) = await DownloadVerifiedAsync(client, BuildFileUrl(baseUrl, FontAssetName),
                     cacheRoot, FontAssetName, expected, diagnostics).ConfigureAwait(false);
                 stage = "pending-install";
                 var tempPath = pendingPath + ".tmp";
@@ -304,8 +322,28 @@ public sealed class TranslationUpdateController : MonoBehaviour
         }
     }
 
-    private static HttpClient CreateUpdateClient(int timeoutSeconds) =>
-        new HttpClient(new HttpClientHandler { UseProxy = true }, disposeHandler: true)
+    internal static HttpClientHandler CreateUpdateHandler(string proxyUrl, bool directConnection = false)
+    {
+        if (directConnection)
+            return new HttpClientHandler { UseProxy = false };
+        if (string.IsNullOrWhiteSpace(proxyUrl))
+            return new HttpClientHandler { UseProxy = true };
+
+        if (!Uri.TryCreate(proxyUrl.Trim(), UriKind.Absolute, out var uri) ||
+            (uri.Scheme != "http" && uri.Scheme != "https" &&
+             uri.Scheme != "socks4" && uri.Scheme != "socks4a" && uri.Scheme != "socks5") ||
+            string.IsNullOrEmpty(uri.Host))
+            throw new ArgumentException("Invalid update ProxyUrl; use an explicit http/https/socks proxy URL or leave it empty for system proxy settings.");
+
+        return new HttpClientHandler
+        {
+            Proxy = new WebProxy(uri),
+            UseProxy = true
+        };
+    }
+
+    private static HttpClient CreateUpdateClient(int timeoutSeconds, string proxyUrl, bool directConnection) =>
+        new HttpClient(CreateUpdateHandler(proxyUrl, directConnection), disposeHandler: true)
         { Timeout = Timeout.InfiniteTimeSpan };
 
     private static string ManifestCommit(TranslationManifest manifest) =>
@@ -317,13 +355,16 @@ public sealed class TranslationUpdateController : MonoBehaviour
         catch { }
     }
 
+    // Compatibility overload retained for the pre-refactor Android caller.
+    private static Task<UpdateResult> SynchronizeAsync(
+        string translationRoot, string baseUrl, int timeoutSeconds) =>
+        SynchronizeAsync(translationRoot, baseUrl, timeoutSeconds, null, false, 8);
+
     private static async Task<UpdateResult> SynchronizeAsync(
         string translationRoot,
         string baseUrl,
-        int timeoutSeconds)
+        int timeoutSeconds, string proxyUrl = null, bool directConnection = false, int concurrency = 8)
     {
-        // Keep binary download state outside translations so loaders and F8
-        // collectors never mistake cached JSON for installed translations.
         var cacheRoot = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(translationRoot))!,
             ".translation-update-cache");
         var diagnostics = new UpdateDiagnostics("Translation", timeoutSeconds);
@@ -333,7 +374,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
         {
             Directory.CreateDirectory(translationRoot);
 
-            using var client = CreateUpdateClient(timeoutSeconds);
+            using var client = CreateUpdateClient(timeoutSeconds, proxyUrl, directConnection);
             stage = "manifest.fetch";
             var manifestBytes = await FetchManifestAsync(client, baseUrl, diagnostics).ConfigureAwait(false);
             stage = "manifest.parse";
@@ -341,6 +382,15 @@ public sealed class TranslationUpdateController : MonoBehaviour
             diagnostics.Info($"manifest ready: files={remoteManifest.Files.Count}, commit={ManifestCommit(remoteManifest)}");
             var localManifestPath = Path.Combine(translationRoot, "manifest.json");
             var localManifest = TryReadManifest(localManifestPath);
+            var localFilesByNormalizedPath = new Dictionary<string, ManifestFile>(StringComparer.OrdinalIgnoreCase);
+            if (localManifest?.Files != null)
+            {
+                foreach (var localPair in localManifest.Files)
+                {
+                    try { localFilesByNormalizedPath[NormalizeRelativePath(localPair.Key)] = localPair.Value; }
+                    catch { }
+                }
+            }
 
             var downloads = new List<(string RelativePath, ManifestFile File)>();
             var unchanged = 0;
@@ -352,62 +402,63 @@ public sealed class TranslationUpdateController : MonoBehaviour
                 var relativePath = NormalizeRelativePath(pair.Key);
                 currentFile = relativePath;
                 var localPath = ResolveManagedPath(translationRoot, relativePath);
-                if (File.Exists(localPath) && HashMatches(localPath, pair.Value.Sha256))
+                if (IsLocalFileUpToDate(localPath, relativePath, pair.Value, localFilesByNormalizedPath))
                     unchanged++;
                 else
                     downloads.Add((relativePath, pair.Value));
                 diagnostics.Progress($"local-check: {++checkedFiles}/{remoteManifest.Files.Count}, unchanged={unchanged}, needs_update={downloads.Count}");
             }
 
-            using var gate = new SemaphoreSlim(4, 4);
+            concurrency = Math.Clamp(concurrency, 1, 16);
+            using var gate = new SemaphoreSlim(concurrency, concurrency);
             currentFile = null;
             var resumed = 0;
             var downloaded = 0;
             var groups = downloads.GroupBy(item => CacheKey(item.File)).ToArray();
             var verified = 0;
-            diagnostics.Info($"download plan: files={downloads.Count}, unique_contents={groups.Length}, concurrency=4, idle_timeout={timeoutSeconds}s, total_timeout={RequestTotalTimeoutSeconds}s, cache={cacheRoot}");
-            stage = "download-batch";
-            var downloadTasks = groups.Select(async group =>
+            if (groups.Length > 0)
             {
-                await gate.WaitAsync().ConfigureAwait(false);
-                try
+                diagnostics.Info($"download plan: files={downloads.Count}, unique_contents={groups.Length}, concurrency={concurrency}, idle_timeout={timeoutSeconds}s, total_timeout={RequestTotalTimeoutSeconds}s, cache={cacheRoot}");
+                stage = "download-batch";
+                var downloadTasks = groups.Select(async group =>
                 {
-                    var item = group.First();
-                    var cachedPath = Path.Combine(cacheRoot, CacheKey(item.File) + ".bin");
-                    var reused = IsValidCachedFile(cachedPath, item.RelativePath, item.File);
-                    await DownloadVerifiedAsync(client, BuildFileUrl(baseUrl, item.RelativePath),
-                        cacheRoot, item.RelativePath, item.File, diagnostics).ConfigureAwait(false);
-                    if (reused) Interlocked.Increment(ref resumed);
-                    else Interlocked.Increment(ref downloaded);
-                    foreach (var entry in group)
-                        ValidateCachedFile(cachedPath, entry.RelativePath, entry.File);
-                    var finished = Interlocked.Increment(ref verified);
-                    diagnostics.Progress($"download: verified={finished}/{groups.Length}, downloaded={Volatile.Read(ref downloaded)}, reused={Volatile.Read(ref resumed)}",
-                        force: finished == groups.Length);
-                }
-                finally
-                {
-                    gate.Release();
-                }
-            });
-            await Task.WhenAll(downloadTasks).ConfigureAwait(false);
+                    await gate.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        var item = group.First();
+                        var (_, reused) = await DownloadVerifiedAsync(client, BuildFileUrl(baseUrl, item.RelativePath),
+                            cacheRoot, item.RelativePath, item.File, diagnostics).ConfigureAwait(false);
+                        if (reused) Interlocked.Increment(ref resumed);
+                        else Interlocked.Increment(ref downloaded);
+                        var finished = Interlocked.Increment(ref verified);
+                        diagnostics.Progress($"download: verified={finished}/{groups.Length}, downloaded={Volatile.Read(ref downloaded)}, reused={Volatile.Read(ref resumed)}",
+                            force: finished == groups.Length);
+                    }
+                    finally
+                    {
+                        gate.Release();
+                    }
+                });
+                await Task.WhenAll(downloadTasks).ConfigureAwait(false);
+            }
 
             var deleted = 0;
             var installed = 0;
             stage = "install";
-            diagnostics.Info($"installing verified files: total={downloads.Count}");
-            foreach (var item in downloads)
+            if (downloads.Count > 0)
             {
-                currentFile = item.RelativePath;
-                var stagedPath = Path.Combine(cacheRoot, CacheKey(item.File) + ".bin");
-                var localPath = ResolveManagedPath(translationRoot, item.RelativePath);
-                Directory.CreateDirectory(Path.GetDirectoryName(localPath)!);
-                // Preserve the verified cache even if the process exits during
-                // installation. Move a sibling copy to avoid truncating live JSON.
-                var installPath = localPath + ".update-install";
-                File.Copy(stagedPath, installPath, true);
-                File.Move(installPath, localPath, true);
-                diagnostics.Progress($"install: {++installed}/{downloads.Count}");
+                diagnostics.Info($"installing verified files: total={downloads.Count}");
+                foreach (var item in downloads)
+                {
+                    currentFile = item.RelativePath;
+                    var stagedPath = Path.Combine(cacheRoot, CacheKey(item.File) + ".bin");
+                    var localPath = ResolveManagedPath(translationRoot, item.RelativePath);
+                    Directory.CreateDirectory(Path.GetDirectoryName(localPath)!);
+                    var installPath = localPath + ".update-install";
+                    File.Copy(stagedPath, installPath, true);
+                    File.Move(installPath, localPath, true);
+                    diagnostics.Progress($"install: {++installed}/{downloads.Count}");
+                }
             }
 
             stage = "delete-obsolete";
@@ -439,8 +490,6 @@ public sealed class TranslationUpdateController : MonoBehaviour
             currentFile = "manifest.json";
             await File.WriteAllBytesAsync(manifestTempPath, manifestBytes).ConfigureAwait(false);
             File.Move(manifestTempPath, localManifestPath, true);
-            // Once installed, the live files themselves preserve progress.
-            // Release redundant download copies only after manifest commit.
             PruneDownloadCache(cacheRoot, Array.Empty<string>());
             diagnostics.Info($"complete: installed={installed}, downloaded={downloaded}, reused={resumed}, deleted={deleted}, unchanged={unchanged}, commit={ManifestCommit(remoteManifest)}");
 
@@ -462,6 +511,30 @@ public sealed class TranslationUpdateController : MonoBehaviour
                 $"; failed_files={diagnostics.FailedFiles}; download cache retained at {cacheRoot}"
             };
         }
+    }
+
+    private static bool IsLocalFileUpToDate(
+        string localPath,
+        string relativePath,
+        ManifestFile remoteFile,
+        IReadOnlyDictionary<string, ManifestFile> localManifestFiles)
+    {
+        var fileInfo = new FileInfo(localPath);
+        if (!fileInfo.Exists)
+            return false;
+        if (remoteFile.Size >= 0 && fileInfo.Length != remoteFile.Size)
+            return false;
+
+        // If local manifest.json already verified this exact SHA-256 and file size matches,
+        // skip reopening and hashing thousands of scenario JSON files during startup.
+        if (remoteFile.Size >= 0 &&
+            localManifestFiles.TryGetValue(relativePath, out var localRecorded) &&
+            string.Equals(localRecorded.Sha256, remoteFile.Sha256, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return HashMatches(localPath, remoteFile.Sha256);
     }
 
     private static async Task<byte[]> FetchManifestAsync(HttpClient client, string baseUrl, UpdateDiagnostics diagnostics)
@@ -534,7 +607,6 @@ public sealed class TranslationUpdateController : MonoBehaviour
     private static string SafeLogUrl(string url)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return "<invalid URL>";
-        // Do not expose credentials, tokens in query strings, or fragments.
         var safe = new UriBuilder(uri) { UserName = "", Password = "", Query = "", Fragment = "" };
         return safe.Uri.AbsoluteUri;
     }
@@ -607,12 +679,20 @@ public sealed class TranslationUpdateController : MonoBehaviour
 
     private static void ValidateCachedFile(string path, string relativePath, ManifestFile expected)
     {
-        if (expected.Size >= 0 && new FileInfo(path).Length != expected.Size)
+        var fileInfo = new FileInfo(path);
+        if (!fileInfo.Exists)
+            throw new InvalidDataException($"Cached file missing for {relativePath}");
+        if (expected.Size >= 0 && fileInfo.Length != expected.Size)
             throw new InvalidDataException($"Size check failed for {relativePath}");
+
+        if (relativePath.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+        {
+            ValidateDownloadedFile(relativePath, expected, File.ReadAllBytes(path));
+            return;
+        }
+
         if (!HashMatches(path, expected.Sha256))
             throw new InvalidDataException($"SHA-256 check failed for {relativePath}");
-        if (relativePath.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
-            ValidateDownloadedFile(relativePath, expected, File.ReadAllBytes(path));
     }
 
     private static bool IsValidCachedFile(string path, string relativePath, ManifestFile expected)
@@ -623,7 +703,7 @@ public sealed class TranslationUpdateController : MonoBehaviour
         catch (IOException) { return false; }
     }
 
-    private static async Task<string> DownloadVerifiedAsync(HttpClient client, string url, string cacheRoot,
+    private static async Task<(string Path, bool Reused)> DownloadVerifiedAsync(HttpClient client, string url, string cacheRoot,
         string relativePath, ManifestFile expected, UpdateDiagnostics diagnostics)
     {
         var stage = "cache-check";
@@ -634,12 +714,12 @@ public sealed class TranslationUpdateController : MonoBehaviour
             Directory.CreateDirectory(cacheRoot);
             var completedPath = Path.Combine(cacheRoot, CacheKey(expected) + ".bin");
             var partialPath = Path.Combine(cacheRoot, CacheKey(expected) + ".part");
-            if (IsValidCachedFile(completedPath, relativePath, expected)) return completedPath;
-            // A shutdown may have happened after the last byte but before promotion.
+            if (IsValidCachedFile(completedPath, relativePath, expected))
+                return (completedPath, true);
             if (IsValidCachedFile(partialPath, relativePath, expected))
             {
                 File.Move(partialPath, completedPath, true);
-                return completedPath;
+                return (completedPath, true);
             }
             var offset = File.Exists(partialPath) ? new FileInfo(partialPath).Length : 0;
             if (expected.Size >= 0 && offset >= expected.Size)
@@ -685,14 +765,12 @@ public sealed class TranslationUpdateController : MonoBehaviour
             try { ValidateCachedFile(partialPath, relativePath, expected); }
             catch (InvalidDataException)
             {
-                // A corrupt prefix cannot be repaired by appending. Retry cleanly
-                // on the next sync, without discarding other verified downloads.
                 TryDeleteFile(partialPath);
                 throw;
             }
             stage = "cache-save";
             File.Move(partialPath, completedPath, true);
-            return completedPath;
+            return (completedPath, false);
         }
         catch (Exception ex)
         {

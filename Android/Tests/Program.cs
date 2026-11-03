@@ -64,6 +64,27 @@ try
         "Translation-only styles preserve untranslated baseline");
     Check(UiStylePolicy.PathContains(UiStylePolicy.NormalizePath("Canvas/Card(Clone)/Text"), "Card/Text"),
         "Style paths match recycled clone slots");
+    var canvas = new UnityEngine.Transform { name = "UICanvas" };
+    var card = new UnityEngine.Transform { name = "Card(Clone)", parent = canvas };
+    UnityEngine.Time.frameCount = 1;
+    Check(UiHierarchyClassifier.GetHierarchyPath(card) == "UICanvas/Card(Clone)" &&
+          UiHierarchyClassifier.IsUnderUiCanvas(card),
+        "Hierarchy classifier caches paths and recognizes UI canvas roots");
+    Check(UiHierarchyClassifier.GetNormalizedHierarchyPath(card) == "UICanvas/Card",
+        "Hierarchy classifier normalizes recycled clone names");
+    card.parent = new UnityEngine.Transform { name = "DetachedRoot" };
+    UiHierarchyClassifier.InvalidateTransform(card);
+    Check(UiHierarchyClassifier.GetHierarchyPath(card) == "DetachedRoot/Card(Clone)" &&
+          !UiHierarchyClassifier.IsUnderUiCanvas(card),
+        "Hierarchy invalidation refreshes reparented UI entries");
+    var internalLayer = new UnityEngine.GameObject { name = "Underlay" };
+    var internalComponent = new UnityEngine.UI.Image { transform = internalLayer.transform };
+    UiHierarchyClassifier.RegisterInternalLayer(internalLayer, internalComponent);
+    Check(UiHierarchyClassifier.IsUiTextSoftOutlineLayer(internalComponent),
+        "Internal outline layers are identified by instance IDs");
+    UiHierarchyClassifier.UnregisterInternalLayer(internalLayer, internalComponent);
+    Check(!UiHierarchyClassifier.IsUiTextSoftOutlineLayer(internalComponent),
+        "Internal outline layer registrations can be released");
     var gray = UiStylePolicy.InheritButtonGray(new UnityEngine.Color(0.5f, 0.5f, 0.5f, 1f),
         new UnityEngine.Color(0.4f, 0.4f, 0.4f, 0f));
     Check(gray.r == 1f && gray.a == 1f, "Already dimmed labels are not darkened twice");
@@ -130,20 +151,16 @@ try
     Check(!translations.TryTranslateUiText("\u653b\u648312.5%", out _), "Master switch disables translation");
     config.Enabled.Value = true;
 
-    var lru = new BoundedLruCache<string, bool>(2);
-    lru.Set("hot", false);
-    lru.Set("cold", true);
-    Check(lru.TryGetValue("hot", out var negative) && !negative, "Negative cache hits are retained");
-    lru.Set("new", true);
-    Check(lru.Count == 2 && !lru.TryGetValue("cold", out _) && lru.TryGetValue("hot", out _), "Eviction preserves hot entries");
-    lru.Set("hot", true);
-    Check(lru.Count == 2 && lru.TryGetValue("hot", out var replaced) && replaced, "Cached values can be replaced");
-    lru.Clear();
-    Check(lru.Count == 0 && !lru.TryGetValue("hot", out _), "Cache clear removes results");
     Check(translations.IsKnownUiTextTranslationValue("Attack 12.5%") && translations.IsKnownUiTextTranslationValue("Attack 12.5%"), "Repeated UI template recognition");
     Check(translations.IsKnownSubSkillTranslationValue("Attack +25%") && translations.IsKnownSubSkillTranslationValue("Attack +25%"), "Repeated subskill template recognition");
     Check(!translations.IsKnownTranslationValue("new target") && !translations.IsKnownUiTextTranslationValue("new target") && !translations.IsKnownSubSkillTranslationValue("new target"), "Unknown values are cached by category");
     Check(!translations.TryTranslateSubSkill("missing", out _) && !translations.TryTranslateSubSkill("missing", out _), "Repeated subskill misses");
+    var handlerFactory = typeof(TranslationUpdateController).GetMethod(
+        "CreateUpdateHandler", BindingFlags.Static | BindingFlags.NonPublic,
+        binder: null, new[] { typeof(string), typeof(bool) }, modifiers: null)!;
+    using (var systemProxyHandler = (HttpClientHandler)handlerFactory.Invoke(null, new object[] { null, false })!)
+        Check(systemProxyHandler.UseProxy && systemProxyHandler.Proxy == null,
+            "Android updater leaves proxy selection to the system runtime");
     Write(Path.Combine(translationRoot, "subskills", "zh_Hans.json"), new Dictionary<string,string> { ["missing"] = "new target" });
     Write(Path.Combine(translationRoot, "UICanvas", "zh_Hans.json"), new Dictionary<string,string> { ["missing"] = "new target" });
     translations.LoadStatic();

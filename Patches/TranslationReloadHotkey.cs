@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace MonsterMusumeTDMod.Patches;
 
-/// <summary>Reloads translation tables and refreshes active manual UI text on F6.</summary>
+/// <summary>Reloads translation tables and refreshes active manual UI text on F6, or toggles translation on F7.</summary>
 public sealed class TranslationReloadHotkey : MonoBehaviour
 {
     public TranslationReloadHotkey(IntPtr pointer)
@@ -28,14 +28,17 @@ public sealed class TranslationReloadHotkey : MonoBehaviour
                 Plugin.Translations.LoadStatic();
                 UiStyleManager.Reload();
                 var enabledRefreshed = TmpFontInstaller.ReloadVisibleUiTranslations(Plugin.Translations);
+                var enabledSubSkillsRefreshed = TmpFontInstaller.RefreshVisibleSubSkillPresentation();
                 var enabledUnitDetailRefreshed = TmpFontInstaller.RefreshVisibleUnitDetailPresentation();
                 Plugin.Log?.LogInfo(
-                    $"Translation enabled with F7; refreshed {enabledRefreshed} active UI text(s) " +
-                    $"and {enabledUnitDetailRefreshed} unit-detail text(s)");
+                    $"Translation enabled with F7; refreshed {enabledRefreshed} active UI text(s), " +
+                    $"{enabledSubSkillsRefreshed} sub-skill text(s), and {enabledUnitDetailRefreshed} unit-detail text(s)");
             }
             else
             {
-                Plugin.Log?.LogInfo("Translation disabled with F7; new and rebound text will remain in the original language");
+                var restored = TmpFontInstaller.RestoreAllVisibleTranslations();
+                Plugin.Log?.LogInfo(
+                    $"Translation disabled with F7; restored {restored} active text(s) to original language and font");
             }
 
             return;
@@ -44,11 +47,13 @@ public sealed class TranslationReloadHotkey : MonoBehaviour
         if (!Input.GetKeyDown(KeyCode.F6) || Plugin.Translations == null)
             return;
 
-        if (Plugin.Settings.ManualSyncWithF6.Value)
+        // Reload config first so any manual edits to ManualSyncWithF6 or UI outline settings take effect immediately.
+        Plugin.Settings?.Reload();
+        if (Plugin.Settings?.ManualSyncWithF6.Value == true)
             TranslationUpdateController.RequestManualSync();
         else
             Plugin.Log?.LogInfo("F6 manual translation sync is disabled; reloading local files only");
-        Plugin.Settings?.Reload();
+
         Plugin.Translations.LoadStatic();
         UiStyleManager.Reload();
         UiCanvasTranslationScanner.InvalidateProcessingCache();

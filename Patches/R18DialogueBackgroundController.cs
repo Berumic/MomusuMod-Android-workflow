@@ -14,12 +14,14 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
     private const float BackgroundDiscoverySeconds = 1f;
     private const float PresentationDiscoverySeconds = 0.25f;
     private const int PresentationStablePassesRequired = 2;
+
     private static readonly Color32 DarkOutlineColor = new(0x54, 0x4A, 0x4A, 0xFF);
     private readonly Dictionary<int, (Graphic Graphic, Color Color, bool Enabled)> _originalColors = new();
     private readonly Dictionary<int, OutlineState> _buttonOutlines = new();
     private readonly Dictionary<int, OutlineState> _storyOutlines = new();
     private readonly Dictionary<int, ShadowState> _storyShadows = new();
-    private float _nextScanTime;
+
+    private float _nextScanTime = 1.2f;
     private float _nextBackgroundDiscoveryTime;
     private float _nextPresentationDiscoveryTime;
     private bool _isTransparent;
@@ -27,6 +29,7 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
     private int _presentationStablePasses;
     private bool _lastR18Scene;
     private bool _hasR18State;
+
     private static float _nextR18StateProbeTime;
     private static string _cachedScenarioId;
     private static bool _cachedR18State;
@@ -118,9 +121,20 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
         var changed = 0;
         // Query concrete IL2CPP types. Querying Graphic itself does not
         // reliably include derived UI components in this game build.
-        foreach (var image in Resources.FindObjectsOfTypeAll<Image>())
+#if ANDROID
+        var images = Resources.FindObjectsOfTypeAll<Image>();
+        var rawImages = Resources.FindObjectsOfTypeAll<RawImage>();
+#else
+        var images = UnityEngine.Object.FindObjectsByType<Image>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+        var rawImages = UnityEngine.Object.FindObjectsByType<RawImage>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
+        foreach (var image in images)
             changed += HideBackground(image) ? 1 : 0;
-        foreach (var rawImage in Resources.FindObjectsOfTypeAll<RawImage>())
+        foreach (var rawImage in rawImages)
             changed += HideBackground(rawImage) ? 1 : 0;
 
         if (changed > 0)
@@ -131,7 +145,7 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
     private bool HideBackground(Graphic graphic)
     {
         if (graphic == null || graphic.gameObject == null || !graphic.gameObject.activeInHierarchy ||
-            !IsDialogueBackground(graphic))
+            !UiHierarchyClassifier.IsDialogueBackground(graphic))
             return false;
 
         var id = graphic.GetInstanceID();
@@ -145,7 +159,7 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
         // Unlike Auto/Skip, BackLogButton uses its own Image as the Button
         // target graphic. Its transition can write the colour back every
         // frame, so alpha alone is not sufficient to keep its background off.
-        if (IsBackLogButtonBackground(graphic) && graphic.enabled)
+        if (UiHierarchyClassifier.IsBackLogButtonBackground(graphic) && graphic.enabled)
             graphic.enabled = false;
 
         if (!Mathf.Approximately(graphic.color.a, 0f))
@@ -181,7 +195,7 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
             var graphic = entry.Graphic;
             if (graphic == null)
                 continue;
-            if (IsBackLogButtonBackground(graphic) && graphic.enabled)
+            if (UiHierarchyClassifier.IsBackLogButtonBackground(graphic) && graphic.enabled)
                 graphic.enabled = false;
             if (!Mathf.Approximately(graphic.color.a, 0f))
             {
@@ -201,10 +215,17 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
         }
 
         var foundTarget = false;
-        foreach (var text in Resources.FindObjectsOfTypeAll<Text>())
+#if ANDROID
+        var texts = Resources.FindObjectsOfTypeAll<Text>();
+#else
+        var texts = UnityEngine.Object.FindObjectsByType<Text>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
+        foreach (var text in texts)
         {
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
-                !IsDialogueControlLabel(text))
+                !UiHierarchyClassifier.IsDialogueControlLabel(text))
                 continue;
 
             var id = text.GetInstanceID();
@@ -236,9 +257,7 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
     private void RestoreButtonOutlines()
     {
         foreach (var entry in _buttonOutlines.Values)
-        {
             entry.Restore();
-        }
 
         _buttonOutlines.Clear();
     }
@@ -253,10 +272,17 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
 
         var foundMessageText = false;
         var foundNameText = false;
-        foreach (var text in Resources.FindObjectsOfTypeAll<Text>())
+#if ANDROID
+        var texts = Resources.FindObjectsOfTypeAll<Text>();
+#else
+        var texts = UnityEngine.Object.FindObjectsByType<Text>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None);
+#endif
+        foreach (var text in texts)
         {
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
-                !TryGetStoryOutlineColor(text, out var outlineColor))
+                !UiHierarchyClassifier.TryGetStoryOutlineColor(text, DarkOutlineColor, out var outlineColor))
                 continue;
 
             var id = text.GetInstanceID();
@@ -316,86 +342,6 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
 
         _storyOutlines.Clear();
         _storyShadows.Clear();
-    }
-
-    private static bool IsDialogueBackground(Graphic graphic)
-    {
-        if (graphic is not Image && graphic is not RawImage)
-            return false;
-
-        var names = new List<string>();
-        for (var current = graphic.transform; current != null; current = current.parent)
-            names.Add(current.name);
-        names.Reverse();
-        var path = string.Join("/", names);
-
-        if (!path.Contains("AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/", StringComparison.Ordinal))
-            return false;
-
-        // The dialogue renderer itself is Text/UguiNovelText, never an
-        // Image or RawImage. Therefore every image beneath RootChildren is
-        // window chrome, a name plate, or a control-button background.
-        return true;
-    }
-
-    private static bool IsDialogueControlLabel(Text text)
-    {
-        var names = new List<string>();
-        for (var current = text.transform; current != null; current = current.parent)
-            names.Add(current.name);
-        names.Reverse();
-        var path = string.Join("/", names);
-        return path.Contains("AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/", StringComparison.Ordinal) &&
-               IsDialogueControlPath(path);
-    }
-
-    private static bool TryGetStoryOutlineColor(Text text, out Color outlineColor)
-    {
-        var names = new List<string>();
-        for (var current = text.transform; current != null; current = current.parent)
-            names.Add(current.name);
-        names.Reverse();
-        var path = string.Join("/", names);
-
-        if (!path.Contains("AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/MessageTexts/", StringComparison.Ordinal))
-        {
-            outlineColor = default;
-            return false;
-        }
-
-        if (string.Equals(text.transform.name, "MessageText", StringComparison.OrdinalIgnoreCase))
-        {
-            outlineColor = Color.white;
-            return true;
-        }
-
-        if (string.Equals(text.transform.name, "NameText", StringComparison.OrdinalIgnoreCase))
-        {
-            outlineColor = DarkOutlineColor;
-            return true;
-        }
-
-        outlineColor = default;
-        return false;
-    }
-
-    private static bool IsDialogueControlPath(string path) =>
-        path.Contains("/Auto/", StringComparison.OrdinalIgnoreCase) ||
-        path.Contains("/Skip/", StringComparison.OrdinalIgnoreCase) ||
-        path.Contains("/Log/", StringComparison.OrdinalIgnoreCase) ||
-        path.Contains("/BackLogButton/", StringComparison.OrdinalIgnoreCase) ||
-        path.Contains("/LogButton/", StringComparison.OrdinalIgnoreCase) ||
-        path.Contains("/BackLog/", StringComparison.OrdinalIgnoreCase) ||
-        path.Contains("/Backlog/", StringComparison.OrdinalIgnoreCase);
-
-    private static bool IsBackLogButtonBackground(Graphic graphic)
-    {
-        var names = new List<string>();
-        for (var current = graphic.transform; current != null; current = current.parent)
-            names.Add(current.name);
-        names.Reverse();
-        var path = string.Join("/", names);
-        return path.EndsWith("/BackLogButton", StringComparison.OrdinalIgnoreCase);
     }
 
     private readonly struct OutlineState
@@ -475,7 +421,7 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
             return _cachedR18State;
 
         _cachedScenarioId = scenarioId;
-        _cachedR18State = HasActiveR18Character();
+        _cachedR18State = MosaicSuppressor.HasActiveR18Character();
         _nextR18StateProbeTime = now + R18StateCacheSeconds;
         return _cachedR18State;
     }
@@ -484,25 +430,5 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
     {
         _nextR18StateProbeTime = 0f;
         _forcePresentationRefresh = true;
-    }
-
-    private static bool HasActiveR18Character()
-    {
-        foreach (var mosaic in Resources.FindObjectsOfTypeAll<SpineMosaic>())
-        {
-            if (mosaic == null || mosaic.gameObject == null || !mosaic.gameObject.activeInHierarchy)
-                continue;
-
-            var names = new List<string>();
-            for (var current = mosaic.transform; current != null; current = current.parent)
-                names.Add(current.name);
-            names.Reverse();
-            var path = string.Join("/", names);
-            if (path.Contains("/layer_R18/", StringComparison.OrdinalIgnoreCase) ||
-                path.Contains("/r18_scenes/", StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return false;
     }
 }

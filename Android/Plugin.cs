@@ -7,7 +7,7 @@ using MonsterMusumeTDMod.Patches;
 using MonsterMusumeTDMod.Services;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.135", "MonsterMusumeTDMod")]
+[assembly: MelonInfo(typeof(MonsterMusumeTDMod.Core.Plugin), "MonsterMusumeTDMod.Android", "0.1.136", "MonsterMusumeTDMod")]
 
 namespace MonsterMusumeTDMod.Core;
 
@@ -99,6 +99,7 @@ public sealed class Plugin : MelonMod
     public override void OnDeinitializeMelon()
     {
         PatchManager.Uninstall();
+        TmpFontInstaller.Unload();
         if (_host != null)
             UnityEngine.Object.Destroy(_host);
     }
