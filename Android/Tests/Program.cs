@@ -223,10 +223,31 @@ try
     config.TranslateScenarios.Value = false;
     Check(!translations.TryTranslateStoryBeforeParse(sharedStory, "sceneA", out _), "Scenario toggle disables preparse translation");
     config.TranslateScenarios.Value = true;
-    Write(Path.Combine(translationRoot, "scenarios", "sceneB", "zh_Hans.json"), new Dictionary<string,string> { [sharedStory] = sceneATarget });
+    Write(Path.Combine(translationRoot, "scenarios", "sceneB", "zh_Hans.json"), new Dictionary<string,string> {
+        [sharedStory] = sceneATarget,
+        ["\u3048\u3063\uff1f"] = "\u54a6\uff1f",
+        ["\u3046\u3093\u3002"] = "\u3046\u3093\u3002"
+    });
+    Write(Path.Combine(translationRoot, "scenarios", "nested", "sceneA", "zh_Hans.json"), new Dictionary<string,string> {
+        [sharedStory] = sceneATarget,
+        ["line\nnext<interval=1>end"] = "translated\nlong next<interval=2>end",
+        ["unique"] = "unique translated",
+        ["\u3048\u3063\uff1f"] = "\u8bf6\uff1f",
+        ["\u3046\u3093\u3002"] = "\u55ef\u3002"
+    });
+    Write(Path.Combine(translationRoot, "scenarios", "sceneC", "zh_Hans.json"), new Dictionary<string,string> {
+        ["\u3048\u3063\uff1f"] = "\u8bf6\uff1f",
+        ["\u3046\u3093\u3002"] = ""
+    });
     translations.LoadStatic();
     Check(translations.TryTranslateStoryBeforeParse(sharedStory, "", out result) && result == sceneATarget,
         "Translation reload rebuilds conflict indexes");
+    Check(translations.TryTranslateStoryBeforeParse("\u3048\u3063\uff1f", "sceneB", out result) && result == "\u54a6\uff1f",
+        "Scene-specific short sentence translation wins when scene is known");
+    Check(translations.TryTranslateStoryBeforeParse("\u3048\u3063\uff1f", "", out result) && result == "\u8bf6\uff1f",
+        "Short sentence without timing tags falls back to dominant translation when scene is unknown");
+    Check(translations.TryTranslateStoryExact("\u3046\u3093\u3002", "sceneC", null, out result) && result == "\u55ef\u3002",
+        "Untranslated self-mapped row in another scene never blocks promoted short sentence translation");
 
     using var server = new FixtureServer();
     var updateRoot = Path.Combine(root, "updates");

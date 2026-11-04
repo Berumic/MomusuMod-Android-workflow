@@ -45,6 +45,12 @@ public static class UiHierarchyClassifier
     // IsUiTextSoftOutlineLayer never calls gameObject.name across IL2CPP.
     private static readonly HashSet<int> InternalLayerIds = new();
 
+    // Active UICanvas / ExtraCanvas root Transforms in the scene so periodic UI discovery
+    // only traverses live scene UI hierarchies instead of calling Resources.FindObjectsOfTypeAll<TMP_Text>().
+    private static readonly Dictionary<int, Transform> KnownUiCanvasRoots = new();
+    private static readonly List<int> StaleCanvasIds = new();
+    private static float _nextCanvasRootProbeTime;
+
     private readonly struct CachedHierarchyPath
     {
         public CachedHierarchyPath(
@@ -94,6 +100,63 @@ public static class UiHierarchyClassifier
             InternalLayerIds.Remove(layerComponent.GetInstanceID());
             if (layerComponent.transform != null)
                 InternalLayerIds.Remove(layerComponent.transform.GetInstanceID());
+        }
+    }
+
+    private static void RegisterUiCanvasRoot(Transform canvasTransform)
+    {
+        if (canvasTransform == null)
+            return;
+        KnownUiCanvasRoots[canvasTransform.GetInstanceID()] = canvasTransform;
+    }
+
+    public static void CollectUiCanvasTexts(List<TMP_Text> buffer)
+    {
+        if (buffer == null)
+            return;
+
+        buffer.Clear();
+        StaleCanvasIds.Clear();
+        foreach (var pair in KnownUiCanvasRoots)
+        {
+            var root = pair.Value;
+            if (root == null || root.gameObject == null || !root.gameObject.activeInHierarchy)
+                StaleCanvasIds.Add(pair.Key);
+        }
+        for (var i = 0; i < StaleCanvasIds.Count; i++)
+            KnownUiCanvasRoots.Remove(StaleCanvasIds[i]);
+
+        var now = Time.unscaledTime;
+        if (KnownUiCanvasRoots.Count == 0 || now >= _nextCanvasRootProbeTime)
+        {
+            _nextCanvasRootProbeTime = now + 10f;
+            foreach (var canvas in Resources.FindObjectsOfTypeAll<Canvas>())
+            {
+                if (canvas == null || canvas.gameObject == null || !canvas.gameObject.activeInHierarchy)
+                    continue;
+                var name = canvas.name;
+                if (!string.IsNullOrEmpty(name) &&
+                    (name.StartsWith("UICanvas", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(name, "ExtraCanvas", StringComparison.OrdinalIgnoreCase)))
+                {
+                    RegisterUiCanvasRoot(canvas.transform);
+                }
+            }
+        }
+
+        foreach (var root in KnownUiCanvasRoots.Values)
+        {
+            if (root == null || root.gameObject == null || !root.gameObject.activeInHierarchy)
+                continue;
+            var texts = root.GetComponentsInChildren<TMP_Text>(true);
+            if (texts == null)
+                continue;
+            for (var i = 0; i < texts.Length; i++)
+            {
+                var text = texts[i];
+                if (text != null)
+                    buffer.Add(text);
+            }
         }
     }
 
@@ -397,6 +460,7 @@ public static class UiHierarchyClassifier
     {
         _primaryCache.Clear();
         _secondaryCache.Clear();
+        _nextCanvasRootProbeTime = 0f;
     }
 
     private static string BuildHierarchyPath(Transform transform, int maxNodes, out string leafName)
@@ -413,6 +477,11 @@ public static class UiHierarchyClassifier
                 if (stack.Count == 0)
                     leafName = currentName;
                 stack.Add(currentName);
+                if (currentName.StartsWith("UICanvas", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(currentName, "ExtraCanvas", StringComparison.OrdinalIgnoreCase))
+                {
+                    RegisterUiCanvasRoot(current);
+                }
             }
 
             stack.Reverse();

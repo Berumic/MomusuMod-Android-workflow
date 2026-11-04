@@ -9,16 +9,26 @@ namespace UnityEngine
     public class Component : Object
     {
         public Transform transform { get; set; }
+        public GameObject gameObject { get; set; }
+        public string name { get; set; } = string.Empty;
+        public T[] GetComponentsInChildren<T>(bool includeInactive = false) => System.Array.Empty<T>();
     }
     public class Transform : Component
     {
-        public string name { get; set; } = string.Empty;
         public Transform parent { get; set; }
     }
     public class GameObject : Object
     {
         public Transform transform { get; } = new();
         public string name { get => transform.name; set => transform.name = value; }
+        public bool activeInHierarchy { get; set; } = true;
+    }
+    public class Canvas : Component
+    {
+    }
+    public static class Resources
+    {
+        public static T[] FindObjectsOfTypeAll<T>() => System.Array.Empty<T>();
     }
     public static class Time
     {

@@ -40,6 +40,8 @@ internal static class UiStyleManager
     [ThreadStatic]
     private static bool _applying;
     private static TMP_Text _batchText;
+    private static TMP_Text _activePresentationText;
+    private static string _pendingTextOverride;
     private static bool _batchRequested;
     private static bool _batchTranslated;
     private static float _batchWidth;
@@ -218,9 +220,11 @@ internal static class UiStyleManager
         return true;
     }
 
-    internal static void BeginPresentation(TMP_Text text)
+    internal static void BeginPresentation(TMP_Text text, string pendingText = null)
     {
         _batchText = text;
+        _activePresentationText = text;
+        _pendingTextOverride = pendingText;
         _batchRequested = false;
         _batchTranslated = false;
         _batchBaseline = null;
@@ -236,7 +240,14 @@ internal static class UiStyleManager
             if (_batchRequested && text != null)
                 Apply(text, _batchWidth, _batchDilate, _batchFont, _batchTranslated);
         }
-        finally { _batchRequested = false; _resolvedBaseline = null; _batchBaseline = null; }
+        finally
+        {
+            _batchRequested = false;
+            _resolvedBaseline = null;
+            _batchBaseline = null;
+            _activePresentationText = null;
+            _pendingTextOverride = null;
+        }
     }
 
     internal static bool IsApplying => _applying;
@@ -293,8 +304,15 @@ internal static class UiStyleManager
         float fallbackOutlineWidth,
         float fallbackFaceDilate,
         TMP_FontAsset alimamaFont,
-        bool isTranslated)
+        bool isTranslated,
+        string pendingText = null)
     {
+        if (!string.IsNullOrEmpty(pendingText))
+        {
+            _activePresentationText = text;
+            _pendingTextOverride = pendingText;
+        }
+
         if (_batchText != null && text == _batchText)
         {
             _batchRequested = true;
@@ -320,6 +338,11 @@ internal static class UiStyleManager
         finally
         {
             _applying = false;
+            if (_batchText == null)
+            {
+                _activePresentationText = null;
+                _pendingTextOverride = null;
+            }
         }
     }
 
@@ -373,6 +396,7 @@ internal static class UiStyleManager
         var selectedFont = TmpFontInstaller.ResolveStyleFont(font, alimamaFont, isTranslated);
         if (selectedFont != null && text.font != selectedFont)
         {
+            TmpFontInstaller.CaptureOriginalPresentation(text);
             var originalColor = text.color;
             var originalGradientEnabled = text.enableVertexGradient;
             var originalGradient = text.colorGradient;
@@ -618,7 +642,7 @@ internal static class UiStyleManager
         float underlayDilate,
         float underlaySoftness)
     {
-        if (text is not TextMeshProUGUI || text.gameObject == null || text.transform?.parent == null)
+        if (text == null || text.gameObject == null || text.rectTransform == null || text.transform?.parent == null)
             return;
 
         var tintedUnderlayColor = new Color(
@@ -764,13 +788,20 @@ internal static class UiStyleManager
         var sourceRect = source.rectTransform;
         var anchoredPos = sourceRect != null ? sourceRect.anchoredPosition : Vector2.zero;
         var sizeDelta = sourceRect != null ? sourceRect.sizeDelta : Vector2.zero;
-        var currentText = source.text ?? string.Empty;
+        var currentText = (_pendingTextOverride != null && source == _activePresentationText)
+            ? _pendingTextOverride
+            : (source.text ?? string.Empty);
         var currentAlpha = source.color.a;
         var currentFontSize = source.fontSize;
+        var targetFont = state.Font ?? source.font;
 
         if (!force &&
             !state.Dirty &&
             state.LastActive == shouldBeActive &&
+            (!shouldBeActive ||
+             (underlayObject.activeSelf &&
+              underlayText.font == targetFont &&
+              underlayText.fontSharedMaterial == state.Material)) &&
             Mathf.Approximately(state.LastAlpha, currentAlpha) &&
             Mathf.Approximately(state.LastFontSize, currentFontSize) &&
             state.LastAnchoredPosition == anchoredPos &&
@@ -780,93 +811,108 @@ internal static class UiStyleManager
             return;
         }
 
-        state.Dirty = false;
-        state.LastActive = shouldBeActive;
-        state.LastAlpha = currentAlpha;
-        state.LastFontSize = currentFontSize;
-        state.LastAnchoredPosition = anchoredPos;
-        state.LastSizeDelta = sizeDelta;
-        state.LastSourceText = currentText;
-
-        var underlayTransform = underlayObject.transform;
-        if (underlayTransform.parent != parent)
-            underlayTransform.SetParent(parent, worldPositionStays: false);
-
-        var mainSiblingIndex = source.transform.GetSiblingIndex();
-        var underlaySiblingIndex = underlayTransform.GetSiblingIndex();
-        var desiredIndex = underlaySiblingIndex < mainSiblingIndex ? mainSiblingIndex - 1 : mainSiblingIndex;
-        if (desiredIndex >= 0 && underlaySiblingIndex != desiredIndex)
-            underlayTransform.SetSiblingIndex(desiredIndex);
-
-        var underlayRect = state.UnderlayRect;
-        if (sourceRect != null && underlayRect != null)
+        var previousApplying = _applying;
+        _applying = true;
+        try
         {
-            underlayRect.anchorMin = sourceRect.anchorMin;
-            underlayRect.anchorMax = sourceRect.anchorMax;
-            underlayRect.pivot = sourceRect.pivot;
-            underlayRect.sizeDelta = sizeDelta;
-            underlayRect.localScale = sourceRect.localScale;
-            underlayRect.localRotation = sourceRect.localRotation;
+            state.Dirty = false;
+            state.LastActive = shouldBeActive;
+            state.LastAlpha = currentAlpha;
+            state.LastFontSize = currentFontSize;
+            state.LastAnchoredPosition = anchoredPos;
+            state.LastSizeDelta = sizeDelta;
+            state.LastSourceText = currentText;
 
-            var offsetScale = Mathf.Max(2f, currentFontSize * 0.16f);
-            var pixelOffset = new Vector2(state.OffsetX * offsetScale, state.OffsetY * offsetScale);
-            underlayRect.anchoredPosition = anchoredPos + pixelOffset;
+            var underlayTransform = underlayObject.transform;
+            if (underlayTransform.parent != parent)
+                underlayTransform.SetParent(parent, worldPositionStays: false);
+
+            var mainSiblingIndex = source.transform.GetSiblingIndex();
+            var underlaySiblingIndex = underlayTransform.GetSiblingIndex();
+            var desiredIndex = underlaySiblingIndex < mainSiblingIndex ? mainSiblingIndex - 1 : mainSiblingIndex;
+            if (desiredIndex >= 0 && underlaySiblingIndex != desiredIndex)
+                underlayTransform.SetSiblingIndex(desiredIndex);
+
+            var underlayRect = state.UnderlayRect;
+            if (sourceRect != null && underlayRect != null)
+            {
+                underlayRect.anchorMin = sourceRect.anchorMin;
+                underlayRect.anchorMax = sourceRect.anchorMax;
+                underlayRect.pivot = sourceRect.pivot;
+                underlayRect.sizeDelta = sizeDelta;
+                underlayRect.localScale = sourceRect.localScale;
+                underlayRect.localRotation = sourceRect.localRotation;
+
+                var offsetScale = Mathf.Max(2f, currentFontSize * 0.16f);
+                var pixelOffset = new Vector2(state.OffsetX * offsetScale, state.OffsetY * offsetScale);
+                underlayRect.anchoredPosition = anchoredPos + pixelOffset;
+            }
+
+            // Activate the GameObject BEFORE assigning fontSharedMaterial so that
+            // TextMeshProUGUI.Awake()/LoadFontAsset() runs first and cannot overwrite
+            // our custom projection material back to the font asset default material.
+            if (underlayObject.activeSelf != shouldBeActive)
+                underlayObject.SetActive(shouldBeActive);
+            if (underlayText.enabled != source.enabled)
+                underlayText.enabled = source.enabled;
+
+            if (targetFont != null && underlayText.font != targetFont)
+                underlayText.font = targetFont;
+            if (state.Material != null && underlayText.fontSharedMaterial != state.Material)
+            {
+                underlayText.fontSharedMaterial = state.Material;
+                underlayText.UpdateMeshPadding();
+            }
+
+            var alphaColor = new Color(1f, 1f, 1f, currentAlpha);
+            if (underlayText.color != alphaColor)
+                underlayText.color = alphaColor;
+            if (underlayText.enableVertexGradient)
+                underlayText.enableVertexGradient = false;
+            if (underlayText.raycastTarget)
+                underlayText.raycastTarget = false;
+            if (underlayText.maskable != source.maskable)
+                underlayText.maskable = source.maskable;
+            if (underlayText.richText != source.richText)
+                underlayText.richText = source.richText;
+            if (underlayText.enableAutoSizing != source.enableAutoSizing)
+                underlayText.enableAutoSizing = source.enableAutoSizing;
+            if (!Mathf.Approximately(underlayText.fontSize, currentFontSize))
+                underlayText.fontSize = currentFontSize;
+            if (!Mathf.Approximately(underlayText.fontSizeMin, source.fontSizeMin))
+                underlayText.fontSizeMin = source.fontSizeMin;
+            if (!Mathf.Approximately(underlayText.fontSizeMax, source.fontSizeMax))
+                underlayText.fontSizeMax = source.fontSizeMax;
+            if (underlayText.alignment != source.alignment)
+                underlayText.alignment = source.alignment;
+            if (underlayText.enableWordWrapping != source.enableWordWrapping)
+                underlayText.enableWordWrapping = source.enableWordWrapping;
+            if (underlayText.overflowMode != source.overflowMode)
+                underlayText.overflowMode = source.overflowMode;
+            if (!Mathf.Approximately(underlayText.lineSpacing, source.lineSpacing))
+                underlayText.lineSpacing = source.lineSpacing;
+            if (!Mathf.Approximately(underlayText.characterSpacing, source.characterSpacing))
+                underlayText.characterSpacing = source.characterSpacing;
+            if (!Mathf.Approximately(underlayText.paragraphSpacing, source.paragraphSpacing))
+                underlayText.paragraphSpacing = source.paragraphSpacing;
+            if (underlayText.margin != source.margin)
+                underlayText.margin = source.margin;
+
+            var sanitizedText = currentText.IndexOf("<color", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                currentText.IndexOf("</color", StringComparison.OrdinalIgnoreCase) >= 0
+                ? ColorTagRegex.Replace(currentText, string.Empty)
+                : currentText;
+            if (!string.Equals(underlayText.text, sanitizedText, StringComparison.Ordinal))
+                underlayText.text = sanitizedText;
+
+            if (state.Material != null && underlayText.fontSharedMaterial != state.Material)
+                underlayText.fontSharedMaterial = state.Material;
+            underlayText.SetAllDirty();
         }
-
-        var targetFont = state.Font ?? source.font;
-        if (targetFont != null && underlayText.font != targetFont)
-            underlayText.font = targetFont;
-        if (state.Material != null && underlayText.fontSharedMaterial != state.Material)
+        finally
         {
-            underlayText.fontSharedMaterial = state.Material;
-            underlayText.UpdateMeshPadding();
+            _applying = previousApplying;
         }
-
-        var alphaColor = new Color(1f, 1f, 1f, currentAlpha);
-        if (underlayText.color != alphaColor)
-            underlayText.color = alphaColor;
-        if (underlayText.enableVertexGradient)
-            underlayText.enableVertexGradient = false;
-        if (underlayText.raycastTarget)
-            underlayText.raycastTarget = false;
-        if (underlayText.maskable != source.maskable)
-            underlayText.maskable = source.maskable;
-        if (underlayText.richText != source.richText)
-            underlayText.richText = source.richText;
-        if (underlayText.enableAutoSizing != source.enableAutoSizing)
-            underlayText.enableAutoSizing = source.enableAutoSizing;
-        if (!Mathf.Approximately(underlayText.fontSize, currentFontSize))
-            underlayText.fontSize = currentFontSize;
-        if (!Mathf.Approximately(underlayText.fontSizeMin, source.fontSizeMin))
-            underlayText.fontSizeMin = source.fontSizeMin;
-        if (!Mathf.Approximately(underlayText.fontSizeMax, source.fontSizeMax))
-            underlayText.fontSizeMax = source.fontSizeMax;
-        if (underlayText.alignment != source.alignment)
-            underlayText.alignment = source.alignment;
-        if (underlayText.enableWordWrapping != source.enableWordWrapping)
-            underlayText.enableWordWrapping = source.enableWordWrapping;
-        if (underlayText.overflowMode != source.overflowMode)
-            underlayText.overflowMode = source.overflowMode;
-        if (!Mathf.Approximately(underlayText.lineSpacing, source.lineSpacing))
-            underlayText.lineSpacing = source.lineSpacing;
-        if (!Mathf.Approximately(underlayText.characterSpacing, source.characterSpacing))
-            underlayText.characterSpacing = source.characterSpacing;
-        if (!Mathf.Approximately(underlayText.paragraphSpacing, source.paragraphSpacing))
-            underlayText.paragraphSpacing = source.paragraphSpacing;
-        if (underlayText.margin != source.margin)
-            underlayText.margin = source.margin;
-
-        var sanitizedText = currentText.IndexOf("<color", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                            currentText.IndexOf("</color", StringComparison.OrdinalIgnoreCase) >= 0
-            ? ColorTagRegex.Replace(currentText, string.Empty)
-            : currentText;
-        if (!string.Equals(underlayText.text, sanitizedText, StringComparison.Ordinal))
-            underlayText.text = sanitizedText;
-
-        if (underlayObject.activeSelf != shouldBeActive)
-            underlayObject.SetActive(shouldBeActive);
-        if (underlayText.enabled != source.enabled)
-            underlayText.enabled = source.enabled;
     }
 
     internal static bool HasUnderlay(int instanceId) => UnderlayLayers.ContainsKey(instanceId);
@@ -885,6 +931,13 @@ internal static class UiStyleManager
             selectable.gameObject == null || !selectable.gameObject.activeInHierarchy)
             return;
 
+        var texts = GetOrCollectSelectableTexts(selectable);
+        if (texts.Length > 0)
+            MonsterMusumeTDMod.Patches.UiCanvasTranslationScanner.NotifySelectableTransition(texts);
+    }
+
+    private static TMP_Text[] GetOrCollectSelectableTexts(Selectable selectable)
+    {
         var selectableId = selectable.GetInstanceID();
         var transform = selectable.transform;
         var childCount = transform != null ? transform.childCount : 0;
@@ -901,9 +954,7 @@ internal static class UiStyleManager
             cached = (childCount, managedArray);
             SelectableTextsCache[selectableId] = cached;
         }
-
-        if (cached.Texts.Length > 0)
-            MonsterMusumeTDMod.Patches.UiCanvasTranslationScanner.NotifySelectableTransition(cached.Texts);
+        return cached.Texts;
     }
 
     internal static void ReleasePresentation(TMP_Text text)
