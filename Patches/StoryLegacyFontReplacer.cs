@@ -12,13 +12,36 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
     private const float ActiveDiscoveryIntervalSeconds = 0.5f;
     private const float IdleDiscoveryIntervalSeconds = 1.5f;
 
+    private static StoryLegacyFontReplacer _instance;
     private float _nextScanTime = 1.0f;
     private float _nextDiscoveryTime = 1.0f;
     private readonly List<Text> _storyTexts = new();
+    private readonly HashSet<int> _storyTextIds = new();
 
     public StoryLegacyFontReplacer(IntPtr pointer)
         : base(pointer)
     {
+    }
+
+    public void Awake()
+    {
+        _instance = this;
+    }
+
+    public void OnDestroy()
+    {
+        if (_instance == this)
+            _instance = null;
+    }
+
+    internal static void NotifyStoryTextActive(Text text)
+    {
+        var instance = _instance;
+        if (instance == null || text == null)
+            return;
+        var id = text.GetInstanceID();
+        if (instance._storyTextIds.Add(id))
+            instance._storyTexts.Add(text);
     }
 
     public void Update()
@@ -26,16 +49,21 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
         if (Time.unscaledTime < _nextScanTime)
             return;
 
+        var isStoryActive = _storyTexts.Count > 0 ||
+                            !string.IsNullOrEmpty(StorySceneContext.EffectivePlaybackId) ||
+                            !string.IsNullOrEmpty(ScenarioContext.CurrentId) ||
+                            !string.IsNullOrEmpty(ScenarioContext.CurrentResourceId);
+        if (!isStoryActive)
+        {
+            _nextScanTime = Time.unscaledTime + IdleDiscoveryIntervalSeconds;
+            return;
+        }
+
         _nextScanTime = Time.unscaledTime + ScanIntervalSeconds;
         if (Time.unscaledTime >= _nextDiscoveryTime)
         {
             RefreshStoryTextTargets();
-            var isStoryActive = _storyTexts.Count > 0 ||
-                                !string.IsNullOrEmpty(StorySceneContext.PlaybackId) ||
-                                !string.IsNullOrEmpty(ScenarioContext.CurrentId);
-            _nextDiscoveryTime = Time.unscaledTime + (isStoryActive
-                ? ActiveDiscoveryIntervalSeconds
-                : IdleDiscoveryIntervalSeconds);
+            _nextDiscoveryTime = Time.unscaledTime + ActiveDiscoveryIntervalSeconds;
         }
 
         if (_storyTexts.Count == 0)
@@ -48,6 +76,8 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
                 !UiHierarchyClassifier.IsStoryMessageText(text))
             {
+                if (text != null)
+                    _storyTextIds.Remove(text.GetInstanceID());
                 _storyTexts.RemoveAt(index);
                 continue;
             }
@@ -60,6 +90,7 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
     private void RefreshStoryTextTargets()
     {
         _storyTexts.Clear();
+        _storyTextIds.Clear();
 #if ANDROID
         var texts = Resources.FindObjectsOfTypeAll<Text>();
 #else
@@ -71,7 +102,10 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
         {
             if (text != null && text.gameObject != null && text.gameObject.activeInHierarchy &&
                 UiHierarchyClassifier.IsStoryMessageText(text))
-                _storyTexts.Add(text);
+            {
+                if (_storyTextIds.Add(text.GetInstanceID()))
+                    _storyTexts.Add(text);
+            }
         }
     }
 }

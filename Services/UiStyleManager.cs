@@ -18,6 +18,7 @@ namespace MonsterMusumeTDMod.Services;
 internal static class UiStyleManager
 {
     private static readonly List<StyleRule> Rules = new();
+    private static readonly Dictionary<string, StyleRule> ResolvedRulesByPath = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Regex ColorTagRegex = new(@"</?color(?:=[^>]*)?>", RegexOptions.IgnoreCase);
 
     // Shared material pool keyed by visual style parameters so all scroll-list
@@ -273,6 +274,7 @@ internal static class UiStyleManager
         InstanceStyleKeys.Clear();
         MaterialBaseFaceColors.Clear();
         SelectableTextsCache.Clear();
+        ResolvedRulesByPath.Clear();
         Rules.Clear();
         _defaults = new StyleValues();
         if (string.IsNullOrEmpty(_stylePath) || !File.Exists(_stylePath))
@@ -357,14 +359,19 @@ internal static class UiStyleManager
             return false;
 
         var path = UiHierarchyClassifier.GetNormalizedHierarchyPath(text.transform);
-        StyleRule matched = null;
-        foreach (var rule in Rules)
+        if (!ResolvedRulesByPath.TryGetValue(path, out var matched))
         {
-            if (UiStylePolicy.PathContains(path, rule.Path))
+            foreach (var rule in Rules)
             {
-                matched = rule;
-                break;
+                if (UiStylePolicy.PathContains(path, rule.Path))
+                {
+                    matched = rule;
+                    break;
+                }
             }
+            if (ResolvedRulesByPath.Count >= 2048)
+                ResolvedRulesByPath.Clear();
+            ResolvedRulesByPath[path] = matched;
         }
         var values = UiStylePolicy.Resolve(matched?.Values, _defaults, _resolvedBaseline, isTranslated);
         if (values == null)
@@ -927,13 +934,12 @@ internal static class UiStyleManager
 
     internal static void NotifySelectableStateChanged(object instance)
     {
-        if (_applying || instance is not Selectable selectable || selectable == null ||
+        if (_applying || UnderlayLayers.Count == 0 ||
+            instance is not Selectable selectable || selectable == null ||
             selectable.gameObject == null || !selectable.gameObject.activeInHierarchy)
             return;
 
-        var texts = GetOrCollectSelectableTexts(selectable);
-        if (texts.Length > 0)
-            MonsterMusumeTDMod.Patches.UiCanvasTranslationScanner.NotifySelectableTransition(texts);
+        SyncAllUnderlayLayers();
     }
 
     private static TMP_Text[] GetOrCollectSelectableTexts(Selectable selectable)

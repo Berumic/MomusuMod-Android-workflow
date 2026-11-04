@@ -8,6 +8,8 @@ namespace MonsterMusumeTDMod.Services;
 public static class StorySceneContext
 {
     private static readonly Dictionary<string, string> Labels = new(StringComparer.Ordinal);
+    private static readonly object CandidateLock = new();
+    private static HashSet<string> _candidateScenes;
     [ThreadStatic] private static Scope _scope;
     [ThreadStatic] private static string _pendingParsedText;
     [ThreadStatic] private static string _pendingParsedScene;
@@ -26,7 +28,23 @@ public static class StorySceneContext
     }
 
     public static string ParsingId => _scope == null ? PlaybackId : _scope.Scene;
-    public static string CurrentScopeInferredScene => _scope?.InferredScene ?? string.Empty;
+
+    public static string CurrentScopeInferredScene
+    {
+        get
+        {
+            for (var current = _scope; current != null; current = current.Previous)
+            {
+                if (!string.IsNullOrEmpty(current.Scene))
+                    return current.Scene;
+                if (!current.AllowInference)
+                    return string.Empty;
+                if (!string.IsNullOrEmpty(current.InferredScene))
+                    return current.InferredScene;
+            }
+            return InferredPlaybackId;
+        }
+    }
 
     public static IDisposable EnterParsing(string scene) => new Scope(scene, allowInference: false);
 
@@ -52,24 +70,32 @@ public static class StorySceneContext
         _pendingParsedScene = scene;
     }
 
+    public static bool AllowsInference => _scope == null || _scope.AllowInference;
+
     public static string GetParsingScene(string source)
     {
         if (_scope != null)
         {
-            if (!string.IsNullOrEmpty(_scope.Scene))
+            if (!_scope.AllowInference)
                 return _scope.Scene;
 
-            if (_scope.AllowInference)
+            if (!string.IsNullOrEmpty(_pendingParsedScene) &&
+                string.Equals(_pendingParsedText, source, StringComparison.Ordinal))
             {
-                if (!string.IsNullOrEmpty(_pendingParsedScene) &&
-                    string.Equals(_pendingParsedText, source, StringComparison.Ordinal))
-                {
-                    return _pendingParsedScene;
-                }
-                if (!string.IsNullOrEmpty(_scope.InferredScene))
-                    return _scope.InferredScene;
+                return _pendingParsedScene;
             }
-            return string.Empty;
+
+            for (var current = _scope; current != null; current = current.Previous)
+            {
+                if (!string.IsNullOrEmpty(current.Scene))
+                    return current.Scene;
+                if (!current.AllowInference)
+                    return string.Empty;
+                if (!string.IsNullOrEmpty(current.InferredScene))
+                    return current.InferredScene;
+            }
+
+            return EffectivePlaybackId;
         }
 
         if (!string.IsNullOrEmpty(_pendingParsedScene) &&
@@ -93,14 +119,56 @@ public static class StorySceneContext
         {
             for (var current = _scope; current != null; current = current.Previous)
             {
-                if (current.AllowInference && string.IsNullOrEmpty(current.InferredScene))
+                if (current.AllowInference)
                     current.InferredScene = scene;
             }
         }
-        else if (string.IsNullOrEmpty(PlaybackId))
+
+        if (_scope == null || _scope.AllowInference)
         {
             Volatile.Write(ref _inferredPlaybackId, scene);
+            lock (CandidateLock)
+            {
+                _candidateScenes = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { scene };
+            }
         }
+    }
+
+    public static IReadOnlyCollection<string> NarrowCandidateScenes(IReadOnlyCollection<string> sourceScenes)
+    {
+        if (sourceScenes == null || sourceScenes.Count == 0 || !AllowsInference)
+            return Array.Empty<string>();
+
+        string resolvedUnique = null;
+        HashSet<string> snapshot;
+        lock (CandidateLock)
+        {
+            if (_candidateScenes == null || _candidateScenes.Count == 0)
+            {
+                _candidateScenes = new HashSet<string>(sourceScenes, StringComparer.OrdinalIgnoreCase);
+            }
+            else
+            {
+                var intersection = new HashSet<string>(_candidateScenes, StringComparer.OrdinalIgnoreCase);
+                intersection.IntersectWith(sourceScenes);
+                _candidateScenes = intersection.Count > 0
+                    ? intersection
+                    : new HashSet<string>(sourceScenes, StringComparer.OrdinalIgnoreCase);
+            }
+
+            if (_candidateScenes.Count == 1)
+            {
+                foreach (var single in _candidateScenes)
+                    resolvedUnique = single;
+            }
+
+            snapshot = new HashSet<string>(_candidateScenes, StringComparer.OrdinalIgnoreCase);
+        }
+
+        if (!string.IsNullOrEmpty(resolvedUnique))
+            NotifyUniqueSceneMatched(resolvedUnique);
+
+        return snapshot;
     }
 
     public static void RegisterLabel(string label, string scene)
@@ -136,12 +204,22 @@ public static class StorySceneContext
     {
         Volatile.Write(ref _playbackId, scene ?? string.Empty);
         if (!string.IsNullOrEmpty(scene))
+        {
             Volatile.Write(ref _inferredPlaybackId, scene);
+            lock (CandidateLock)
+            {
+                _candidateScenes = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { scene };
+            }
+        }
     }
 
     public static void ClearInferredPlayback()
     {
         Volatile.Write(ref _inferredPlaybackId, string.Empty);
+        lock (CandidateLock)
+        {
+            _candidateScenes = null;
+        }
     }
 
     public static void ClearPlayback()
@@ -150,6 +228,10 @@ public static class StorySceneContext
         Volatile.Write(ref _inferredPlaybackId, string.Empty);
         _pendingParsedText = null;
         _pendingParsedScene = null;
+        lock (CandidateLock)
+        {
+            _candidateScenes = null;
+        }
     }
 
     private sealed class Scope : IDisposable

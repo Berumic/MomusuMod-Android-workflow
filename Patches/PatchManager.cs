@@ -63,30 +63,18 @@ public static class PatchManager
             nameof(Hooks.ApplySubSkillCardFont)
         );
         PatchFontSetters("TMPro.TMP_Text");
-        PatchFontSetters("TMPro.TextMeshProUGUI");
         PatchFontSetters("UnityEngine.UI.Text");
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "set_fontSharedMaterial", "set_fontMaterial" });
-        PatchTmpRefreshTriggers("TMPro.TextMeshProUGUI", new[] { "set_fontSharedMaterial", "set_fontMaterial" });
-        // TextMeshProUGUI declares protected override void OnEnable(); TMP_Text does not.
-        // Patch both so whichever type declares OnEnable in this build fires the activation hook.
+        // TextMeshProUGUI.OnEnable calls base.OnEnable (TMP_Text.OnEnable).
+        // Patching TMP_Text.OnEnable alone covers all concrete subclasses
+        // without firing duplicate activation events on every TextMeshProUGUI.
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "OnEnable" }, requestFastScan: true);
-        PatchTmpRefreshTriggers("TMPro.TextMeshProUGUI", new[] { "OnEnable" }, requestFastScan: true);
-        // A pooled UI subtree can be populated before it joins its final
-        // Canvas. Invalidate cached hierarchy paths and apply path styles
-        // as soon as the hierarchy becomes valid.
-        PatchContextPostfixMethods(
-            "TMPro.TMP_Text",
-            new[] { "OnTransformParentChanged", "OnCanvasHierarchyChanged" },
-            nameof(Hooks.OnHierarchyChanged));
+        // Only patch OnTransformParentChanged (not OnCanvasHierarchyChanged, which Unity fires
+        // on every child whenever any ancestor container is enabled or disabled).
         PatchContextPostfixMethods(
             "TMPro.TextMeshProUGUI",
-            new[] { "OnTransformParentChanged", "OnCanvasHierarchyChanged" },
+            new[] { "OnTransformParentChanged" },
             nameof(Hooks.OnHierarchyChanged));
-        // Button state transitions change the label's tint or active On/Off child.
-        PatchContextPostfixMethods(
-            "UnityEngine.UI.Selectable",
-            new[] { "DoStateTransition", "OnPointerDown", "OnPointerUp", "OnSelect", "OnDeselect", "OnEnable" },
-            nameof(Hooks.ApplyButtonState));
         // UTAGE 类型名和方法签名会随游戏版本变化；这些探针失败时只跳过，不阻止 TMP 补丁加载。
         foreach (var typeName in new[]
         {
@@ -522,6 +510,7 @@ public static class PatchManager
             }
             catch (Exception exception) { Plugin.Log.LogDebug($"Story command context: {exception.Message}"); }
             if (scene.Length == 0) scene = StorySceneContext.ParsingId;
+            if (scene.Length == 0) scene = StorySceneContext.CurrentScopeInferredScene;
             __state = StorySceneContext.EnterScriptParsing(scene);
         }
 
@@ -551,7 +540,11 @@ public static class PatchManager
             Plugin.Log.LogInfo($"Story playback context: label={__0}, scene={scene}");
         }
 
-        public static void EndStoryScene() => StorySceneContext.ClearPlayback();
+        public static void EndStoryScene()
+        {
+            StorySceneContext.ClearPlayback();
+            ScenarioContext.ClearResourceContext();
+        }
 
         public static void ObserveContext(object __instance) => ScenarioContext.Observe(__instance);
 
@@ -562,14 +555,6 @@ public static class PatchManager
             if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
             if (__instance is UnityEngine.Component component && component != null && component.transform != null)
                 UiHierarchyClassifier.InvalidateTransform(component.transform);
-            if (!DeferringTmpPresentation && __instance is TMPro.TMP_Text tmpText && tmpText != null)
-            {
-                if (UiHierarchyClassifier.IsUnderUiCanvas(tmpText))
-                {
-                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
-                    return;
-                }
-            }
             UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
@@ -583,16 +568,11 @@ public static class PatchManager
             if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
             if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
             {
+                var instanceId = tmpText.GetInstanceID();
+                if (!TmpFontInstaller.IsTrackedTranslatedComponent(instanceId))
+                    return;
                 UiStyleManager.InvalidateInstanceStyle(tmpText);
-                if (!DeferringTmpPresentation)
-                {
-                    TmpFontInstaller.ApplyToCurrentText(tmpText);
-                    TmpFontInstaller.ApplyConfiguredUiStyle(tmpText);
-                }
-                else
-                {
-                    UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
-                }
+                UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
                 return;
             }
             TmpFontInstaller.ApplyToCurrentText(__instance);
@@ -606,16 +586,11 @@ public static class PatchManager
             if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
             if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
             {
+                var instanceId = tmpText.GetInstanceID();
+                if (!TmpFontInstaller.IsTrackedTranslatedComponent(instanceId))
+                    return;
                 UiStyleManager.InvalidateInstanceStyle(tmpText);
-                if (!DeferringTmpPresentation)
-                {
-                    TmpFontInstaller.ApplyToCurrentText(tmpText);
-                    TmpFontInstaller.ApplyConfiguredUiStyle(tmpText);
-                }
-                else
-                {
-                    UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
-                }
+                UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
                 return;
             }
             UiCanvasTranslationScanner.QueueImmediateRefresh(__instance);
@@ -626,14 +601,6 @@ public static class PatchManager
             if (UiStyleManager.IsApplying || TmpFontInstaller.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance))
                 return;
             if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
-            if (!DeferringTmpPresentation && __instance is TMPro.TMP_Text tmpText && tmpText != null)
-            {
-                if (UiHierarchyClassifier.IsUnderUiCanvas(tmpText))
-                {
-                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
-                    return;
-                }
-            }
             UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
@@ -644,12 +611,7 @@ public static class PatchManager
             if (string.IsNullOrEmpty(__0) || __0.IndexOf('{') < 0)
                 return;
             if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
-            {
-                if (UiHierarchyClassifier.IsUnderUiCanvas(tmpText))
-                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
-                else
-                    UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
-            }
+                UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
         }
 
         public static void ApplyLegacyFont(object __instance) => TmpFontInstaller.ApplyToLegacyText(__instance);
@@ -677,16 +639,7 @@ public static class PatchManager
             UiStyleManager.PrepareUnderlayForTextChange(__instance);
 
             if (string.IsNullOrEmpty(__0))
-            {
-                if (__instance is UnityEngine.UI.Text clearedStoryText &&
-                    UiHierarchyClassifier.IsStoryMessageText(clearedStoryText) &&
-                    !UiHierarchyClassifier.IsStorySpeakerNameText(clearedStoryText))
-                {
-                    _translations.ResetInferredStoryScenario();
-                    ScenarioContext.ClearResourceContext();
-                }
                 return;
-            }
 
             var instanceId = GetInstanceId(__instance);
             var tmpInstance = __instance as TMPro.TMP_Text;
@@ -719,22 +672,39 @@ public static class PatchManager
             if (__instance is UnityEngine.UI.Text storyText &&
                 UiHierarchyClassifier.IsStoryMessageText(storyText))
             {
+                StoryLegacyFontReplacer.NotifyStoryTextActive(storyText);
                 TranslateStoryString(storyText, ref __0);
                 return;
             }
 
-            var path = UiHierarchyClassifier.GetHierarchyPathAndFlags(__instance, out var flags);
+            var isTmpText = tmpInstance != null;
+            if (isTmpText &&
+                !_translations.CanPossiblyNeedTranslation(__0) &&
+                !_translations.IsKnownTranslationValue(__0) &&
+                !TmpFontInstaller.IsTrackedTranslatedComponent(instanceId))
+            {
+                if (instanceId != 0)
+                {
+                    AppliedTextValues.Remove(instanceId);
+                    if (SlotBindingCache.Count >= MaxAppliedValuesCapacity)
+                        SlotBindingCache.Clear();
+                    SlotBindingCache[instanceId] = (__0, __0, false);
+                    UiCanvasTranslationScanner.CancelPendingRefresh(instanceId);
+                }
+                return;
+            }
+
+            var path = UiHierarchyClassifier.GetHierarchyPathAndFlags(__instance, out var normalizedPath, out var flags);
             var isUnderUiCanvas = (flags & UiPathFlags.UnderUiCanvas) != 0;
             var isSubSkillText = (flags & UiPathFlags.SubSkillScrollText) != 0;
             var isUnitDetailDesc = (flags & UiPathFlags.UnitDetailUiDescription) != 0;
-            var isTmpText = tmpInstance != null;
 
             if (_config.TranslateUiTexts.Value &&
                 (isUnderUiCanvas || isTmpText) &&
                 !isSubSkillText &&
                 _translations.TryTranslateUiText(
                     __0,
-                    path,
+                    normalizedPath,
                     out var uiTextTranslation))
             {
                 var uiSource = __0;
@@ -767,7 +737,7 @@ public static class PatchManager
                 !isUnitDetailDesc &&
                 _translations.TryTranslateSubSkill(
                     __0,
-                    path,
+                    normalizedPath,
                     out var subSkillTranslation))
             {
                 SetTranslatedArgument(__instance, ref __0, subSkillTranslation);
@@ -790,8 +760,11 @@ public static class PatchManager
                     SlotBindingCache.Remove(instanceId);
                 }
             }
-            TmpFontInstaller.RestoreTranslatedUiText(__instance);
-            TmpFontInstaller.RestoreTranslatedSubSkillText(__instance);
+            if (TmpFontInstaller.IsTrackedTranslatedComponent(instanceId))
+            {
+                TmpFontInstaller.RestoreTranslatedUiText(__instance);
+                TmpFontInstaller.RestoreTranslatedSubSkillText(__instance);
+            }
 
             if (isTmpText)
             {

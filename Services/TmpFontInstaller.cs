@@ -107,6 +107,12 @@ public static class TmpFontInstaller
     public static bool IsStorySpeakerNameText(Text text) =>
         UiHierarchyClassifier.IsStorySpeakerNameText(text);
 
+    internal static bool IsTrackedTranslatedComponent(int instanceId) =>
+        instanceId != 0 &&
+        (UiTextInstanceIds.Contains(instanceId) ||
+         SubSkillTextInstanceIds.Contains(instanceId) ||
+         StoryTextInstanceIds.Contains(instanceId));
+
     public static bool IsCurrentlyTranslatedComponent(Component component, string currentText)
     {
         if (component == null || string.IsNullOrEmpty(currentText))
@@ -528,8 +534,13 @@ public static class TmpFontInstaller
 
     internal static void ApplyUntranslatedCanvasPresentation(TMP_Text text, UiPathFlags flags, string pendingText)
     {
-        if (text == null || _loadedFont == null)
+        if (text == null || _loadedFont == null ||
+            (flags & (UiPathFlags.UnitDetailFontOverride |
+                      UiPathFlags.HomeDeckExSkillSlotName |
+                      UiPathFlags.QuestDungeonSkillName)) == 0)
+        {
             return;
+        }
 
         var prevApplying = _applying;
         _applying = true;
@@ -541,13 +552,7 @@ public static class TmpFontInstaller
                 return;
             }
 
-            if ((flags & (UiPathFlags.HomeDeckExSkillSlotName | UiPathFlags.QuestDungeonSkillName)) != 0)
-            {
-                ApplyForcedTmpTextPresentation(text, useSubSkillPresentation: true, pendingText: pendingText);
-                return;
-            }
-
-            ApplyConfiguredUiStyle(text, isTranslatedOverride: false, pendingText: pendingText);
+            ApplyForcedTmpTextPresentation(text, useSubSkillPresentation: true, pendingText: pendingText);
         }
         finally
         {

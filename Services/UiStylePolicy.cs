@@ -51,18 +51,46 @@ internal static class UiStylePolicy
     public static string NormalizePath(string path)
     {
         if (string.IsNullOrWhiteSpace(path)) return string.Empty;
+        if (path.IndexOf("(Clone)", StringComparison.OrdinalIgnoreCase) < 0 &&
+            path.IndexOf('\\') < 0 &&
+            path.IndexOf("//", StringComparison.Ordinal) < 0 &&
+            path[0] != '/' &&
+            path[^1] != '/')
+        {
+            return path;
+        }
         var parts = path.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
         for (var i = 0; i < parts.Length; i++)
             parts[i] = parts[i].Replace("(Clone)", string.Empty, StringComparison.OrdinalIgnoreCase);
         return string.Join('/', parts);
     }
 
-    public static bool PathContains(string fullPath, string rulePath) =>
-        !string.IsNullOrEmpty(rulePath) &&
-        (string.Equals(fullPath, rulePath, StringComparison.OrdinalIgnoreCase) ||
-         fullPath.StartsWith(rulePath + "/", StringComparison.OrdinalIgnoreCase) ||
-         fullPath.EndsWith("/" + rulePath, StringComparison.OrdinalIgnoreCase) ||
-         fullPath.Contains("/" + rulePath + "/", StringComparison.OrdinalIgnoreCase));
+    public static bool PathContains(string fullPath, string rulePath)
+    {
+        if (string.IsNullOrEmpty(fullPath) || string.IsNullOrEmpty(rulePath))
+            return false;
+        if (string.Equals(fullPath, rulePath, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var searchIndex = 0;
+        var limit = fullPath.Length - rulePath.Length;
+        while (searchIndex <= limit)
+        {
+            var idx = fullPath.IndexOf(rulePath, searchIndex, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0)
+                return false;
+
+            var validStart = idx == 0 || fullPath[idx - 1] == '/';
+            var endIdx = idx + rulePath.Length;
+            var validEnd = endIdx == fullPath.Length || fullPath[endIdx] == '/';
+            if (validStart && validEnd)
+                return true;
+
+            searchIndex = idx + 1;
+        }
+
+        return false;
+    }
 
     public static StyleValues Resolve(StyleValues rule, StyleValues defaults, StyleValues baseline, bool translated)
     {

@@ -148,7 +148,7 @@ public static class UiHierarchyClassifier
         {
             if (root == null || root.gameObject == null || !root.gameObject.activeInHierarchy)
                 continue;
-            var texts = root.GetComponentsInChildren<TMP_Text>(true);
+            var texts = root.GetComponentsInChildren<TMP_Text>(false);
             if (texts == null)
                 continue;
             for (var i = 0; i < texts.Length; i++)
@@ -233,40 +233,108 @@ public static class UiHierarchyClassifier
         return entry.FullPath ?? string.Empty;
     }
 
-    private static CachedHierarchyPath GetOrCreateCachedPath(Transform transform)
+    public static string GetHierarchyPathAndFlags(
+        object component,
+        out string normalizedPath,
+        out UiPathFlags flags)
     {
-        if (transform == null)
-            return default;
-
-        var instanceId = transform.GetInstanceID();
-        var currentFrame = Time.frameCount;
-
-        if (_primaryCache.TryGetValue(instanceId, out var cached))
+        var entry = component switch
         {
-            // Once attached under a Canvas, OnTransformParentChanged / OnCanvasHierarchyChanged
-            // explicitly invalidates the entry if it ever moves. Never serve a cached unparented
-            // result because prefabs are often populated and then parented under UICanvas later
-            // within the exact same frame without firing child OnTransformParentChanged hooks.
+            Transform transform => GetOrCreateCachedPath(transform),
+            Component unityComponent when unityComponent != null => GetOrCreateCachedPath(unityComponent.transform),
+            GameObject gameObject when gameObject != null => GetOrCreateCachedPath(gameObject.transform),
+            _ => default
+        };
+        normalizedPath = entry.NormalizedPath ?? string.Empty;
+        flags = entry.Flags;
+        return entry.FullPath ?? string.Empty;
+    }
+
+    private static bool TryGetValidCachedPath(int instanceId, out CachedHierarchyPath cached)
+    {
+        if (_primaryCache.TryGetValue(instanceId, out cached))
+        {
             if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
-            {
-                return cached;
-            }
+                return true;
         }
         else if (_secondaryCache.TryGetValue(instanceId, out cached))
         {
             if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
             {
                 PromoteOrInsert(instanceId, cached);
-                return cached;
+                return true;
             }
         }
+        cached = default;
+        return false;
+    }
 
-        var fullPath = BuildHierarchyPath(transform, maxNodes: 0, out var leafName);
-        var normalizedPath = UiStylePolicy.NormalizePath(fullPath);
-        var flags = ComputeFlags(fullPath, leafName);
-        cached = new CachedHierarchyPath(fullPath, normalizedPath, flags, currentFrame);
-        PromoteOrInsert(instanceId, cached);
-        return cached;
+    private static string StripCloneSuffix(string name)
+    {
+        if (string.IsNullOrEmpty(name) || name.IndexOf("(Clone)", StringComparison.OrdinalIgnoreCase) < 0)
+            return name ?? string.Empty;
+        return name.Replace("(Clone)", string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static CachedHierarchyPath GetOrCreateCachedPath(Transform transform)
+    {
+        if (transform == null)
+            return default;
+
+        var instanceId = transform.GetInstanceID();
+        if (TryGetValidCachedPath(instanceId, out var cached))
+            return cached;
+
+        try
+        {
+            var chain = new List<(int Id, string Name)>(16);
+            CachedHierarchyPath baseCached = default;
+            var hasBaseCached = false;
+
+            for (var current = transform; current != null; current = current.parent)
+            {
+                var currentId = current.GetInstanceID();
+                if (current != transform && TryGetValidCachedPath(currentId, out var ancestorCached))
+                {
+                    baseCached = ancestorCached;
+                    hasBaseCached = true;
+                    break;
+                }
+
+                var currentName = current.name ?? string.Empty;
+                chain.Add((currentId, currentName));
+                if (currentName.StartsWith("UICanvas", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(currentName, "ExtraCanvas", StringComparison.OrdinalIgnoreCase))
+                {
+                    RegisterUiCanvasRoot(current);
+                }
+            }
+
+            var currentFrame = Time.frameCount;
+            var fullPath = hasBaseCached ? baseCached.FullPath : string.Empty;
+            var normalizedPath = hasBaseCached ? baseCached.NormalizedPath : string.Empty;
+            CachedHierarchyPath result = default;
+
+            for (var i = chain.Count - 1; i >= 0; i--)
+            {
+                var item = chain[i];
+                var normalizedLeaf = StripCloneSuffix(item.Name);
+                fullPath = string.IsNullOrEmpty(fullPath) ? item.Name : string.Concat(fullPath, "/", item.Name);
+                normalizedPath = string.IsNullOrEmpty(normalizedPath)
+                    ? normalizedLeaf
+                    : string.Concat(normalizedPath, "/", normalizedLeaf);
+                var flags = ComputeFlags(fullPath, item.Name);
+                result = new CachedHierarchyPath(fullPath, normalizedPath, flags, currentFrame);
+                if ((flags & UiPathFlags.HasCanvasAncestor) != 0)
+                    PromoteOrInsert(item.Id, result);
+            }
+
+            return result;
+        }
+        catch
+        {
+            return default;
+        }
     }
 
     private static UiPathFlags ComputeFlags(string path, string nodeName)
@@ -282,7 +350,8 @@ public static class UiHierarchyClassifier
             flags |= UiPathFlags.InternalUnderlayLayer;
         }
 
-        if (path.Contains("Canvas", StringComparison.OrdinalIgnoreCase))
+        if (path.Contains("Canvas", StringComparison.OrdinalIgnoreCase) ||
+            path.Contains("AdvEngine", StringComparison.OrdinalIgnoreCase))
             flags |= UiPathFlags.HasCanvasAncestor;
 
         if (path.Contains("UICanvas", StringComparison.OrdinalIgnoreCase) ||
@@ -452,8 +521,11 @@ public static class UiHierarchyClassifier
             return;
 
         var id = transform.GetInstanceID();
-        _primaryCache.Remove(id);
-        _secondaryCache.Remove(id);
+        if (_primaryCache.ContainsKey(id) || _secondaryCache.ContainsKey(id))
+        {
+            _primaryCache.Clear();
+            _secondaryCache.Clear();
+        }
     }
 
     public static void ClearCache()

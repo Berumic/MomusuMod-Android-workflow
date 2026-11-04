@@ -249,6 +249,46 @@ try
     Check(translations.TryTranslateStoryExact("\u3046\u3093\u3002", "sceneC", null, out result) && result == "\u55ef\u3002",
         "Untranslated self-mapped row in another scene never blocks promoted short sentence translation");
 
+    Write(Path.Combine(translationRoot, "scenarios", "10399a0_nml", "zh_Hans.json"), new Dictionary<string,string> {
+        ["アメリやシスイ、ティヴェルだったり、\n運営側の誰かしらがいてもおかしくないのに、\nそれすら見当たらないのは……。"] = "艾米莉、希丝伊、蒂薇儿之类的，\n主办方哪怕有个人在这里也不奇怪，\n可就连这些人也一个都找不到……",
+        ["普通じゃないのは確か……"] = "这确实不正常……",
+        ["え？"] = "诶？",
+        ["ペッシェさん？"] = "佩茜小姐？",
+        ["突然、ペッシェが不自然に口を噤む。"] = "突然，佩茜不自然地噤声了。"
+    });
+    Write(Path.Combine(translationRoot, "scenarios", "other_scene", "zh_Hans.json"), new Dictionary<string,string> {
+        ["え？<interval=0.4>"] = "咦？<interval=0.4>",
+        ["え？"] = "え？",
+        ["普通じゃないのは確か……"] = ""
+    });
+    translations.LoadStatic();
+    StorySceneContext.ClearPlayback();
+    using (StorySceneContext.EnterScriptParsing(""))
+    {
+        using (StorySceneContext.EnterScriptParsing(""))
+        {
+            Check(translations.TryTranslateStoryBeforeParse("アメリやシスイ、ティヴェルだったり、\n運営側の誰かしらがいてもおかしくないのに、\nそれすら見当たらないのは……。", out result) &&
+                  result == "艾米莉、希丝伊、蒂薇儿之类的，\n主办方哪怕有个人在这里也不奇怪，\n可就连这些人也一个都找不到……",
+                "Long unique story sentence translates and infers scene across nested script scopes");
+        }
+        using (StorySceneContext.EnterScriptParsing(""))
+        {
+            Check(translations.TryTranslateStoryBeforeParse("普通じゃないのは確か……。", out result) && result == "这确实不正常……",
+                "Short sentence with trailing period variant translates in nested command scope");
+            Check(translations.TryTranslateStoryBeforeParse("え？<interval=0.4>", out result) && result == "诶？",
+                "Short sentence with runtime interval tag resolves to inferred scene tag-free translation");
+            Check(translations.TryTranslateStoryBeforeParse("「ペッシェさん？」", out result) && result == "「佩茜小姐？」",
+                "Quoted short sentence unwraps and translates in inferred scene");
+            Check(translations.TryTranslateStoryBeforeParse("突然、ペッシェが不自然に口を噤む。", out result) && result == "突然，佩茜不自然地噤声了。",
+                "Subsequent narration sentence translates in inferred scene");
+        }
+    }
+    Check(StorySceneContext.EffectivePlaybackId == "10399a0_nml",
+        "Inferred scene persists into playback context after script scope disposal");
+    Check(translations.ResolveStoryScenarioId("nml_10399_01") == "10399a0_nml",
+        "Resource ID base number resolves character scenario folder");
+    StorySceneContext.ClearPlayback();
+
     using var server = new FixtureServer();
     var updateRoot = Path.Combine(root, "updates");
     Directory.CreateDirectory(updateRoot);
