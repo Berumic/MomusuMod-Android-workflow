@@ -42,8 +42,9 @@ public static class UiHierarchyClassifier
     private static Dictionary<int, CachedHierarchyPath> _secondaryCache = new(GenerationCapacity);
 
     // Track internal underlay/outline GameObject & Component instance IDs so
-    // IsUiTextSoftOutlineLayer never calls gameObject.name across IL2CPP.
+    // IsUiTextSoftOutlineLayer never calls gameObject.name or GetFlags across IL2CPP.
     private static readonly HashSet<int> InternalLayerIds = new();
+    private static readonly HashSet<int> NonInternalLayerIds = new(GenerationCapacity * 2);
 
     // Active UICanvas / ExtraCanvas root Transforms in the scene so periodic UI discovery
     // only traverses live scene UI hierarchies instead of calling Resources.FindObjectsOfTypeAll<TMP_Text>().
@@ -57,33 +58,48 @@ public static class UiHierarchyClassifier
             string fullPath,
             string normalizedPath,
             UiPathFlags flags,
-            int validatedFrame)
+            int validatedFrame,
+            Transform unparentedRoot = null)
         {
             FullPath = fullPath;
             NormalizedPath = normalizedPath;
             Flags = flags;
             ValidatedFrame = validatedFrame;
+            UnparentedRoot = unparentedRoot;
         }
 
         public string FullPath { get; }
         public string NormalizedPath { get; }
         public UiPathFlags Flags { get; }
         public int ValidatedFrame { get; }
+        public Transform UnparentedRoot { get; }
     }
 
     public static void RegisterInternalLayer(GameObject layerObject, Component layerComponent)
     {
         if (layerObject != null)
         {
-            InternalLayerIds.Add(layerObject.GetInstanceID());
+            var goId = layerObject.GetInstanceID();
+            InternalLayerIds.Add(goId);
+            NonInternalLayerIds.Remove(goId);
             if (layerObject.transform != null)
-                InternalLayerIds.Add(layerObject.transform.GetInstanceID());
+            {
+                var trId = layerObject.transform.GetInstanceID();
+                InternalLayerIds.Add(trId);
+                NonInternalLayerIds.Remove(trId);
+            }
         }
         if (layerComponent != null)
         {
-            InternalLayerIds.Add(layerComponent.GetInstanceID());
+            var compId = layerComponent.GetInstanceID();
+            InternalLayerIds.Add(compId);
+            NonInternalLayerIds.Remove(compId);
             if (layerComponent.transform != null)
-                InternalLayerIds.Add(layerComponent.transform.GetInstanceID());
+            {
+                var trId = layerComponent.transform.GetInstanceID();
+                InternalLayerIds.Add(trId);
+                NonInternalLayerIds.Remove(trId);
+            }
         }
     }
 
@@ -162,25 +178,26 @@ public static class UiHierarchyClassifier
 
     public static bool IsUiTextSoftOutlineLayer(object component)
     {
-        if (component is not UnityEngine.Object unityObj || unityObj == null)
+        if (InternalLayerIds.Count == 0 || component is not UnityEngine.Object unityObj || unityObj == null)
             return false;
-        if (InternalLayerIds.Contains(unityObj.GetInstanceID()))
-            return true;
 
-        var transform = component switch
+        var id = unityObj.GetInstanceID();
+        if (InternalLayerIds.Contains(id))
+            return true;
+        if (NonInternalLayerIds.Contains(id))
+            return false;
+
+        var name = unityObj.name;
+        if (!string.IsNullOrEmpty(name) &&
+            name.IndexOf("__MMTDUnderlay", StringComparison.OrdinalIgnoreCase) >= 0)
         {
-            Transform t => t,
-            Component c => c.transform,
-            GameObject go => go.transform,
-            _ => null
-        };
-        if (transform != null &&
-            (InternalLayerIds.Contains(transform.GetInstanceID()) ||
-             (GetFlags(transform) & UiPathFlags.InternalUnderlayLayer) != 0))
-        {
-            InternalLayerIds.Add(unityObj.GetInstanceID());
+            InternalLayerIds.Add(id);
             return true;
         }
+
+        if (NonInternalLayerIds.Count >= GenerationCapacity * 2)
+            NonInternalLayerIds.Clear();
+        NonInternalLayerIds.Add(id);
         return false;
     }
 
@@ -250,20 +267,29 @@ public static class UiHierarchyClassifier
         return entry.FullPath ?? string.Empty;
     }
 
+    private static bool IsValidCachedEntry(in CachedHierarchyPath cached)
+    {
+        if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
+            return true;
+        return cached.UnparentedRoot != null && cached.UnparentedRoot.parent == null;
+    }
+
     private static bool TryGetValidCachedPath(int instanceId, out CachedHierarchyPath cached)
     {
         if (_primaryCache.TryGetValue(instanceId, out cached))
         {
-            if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
+            if (IsValidCachedEntry(in cached))
                 return true;
+            _primaryCache.Remove(instanceId);
         }
         else if (_secondaryCache.TryGetValue(instanceId, out cached))
         {
-            if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
+            if (IsValidCachedEntry(in cached))
             {
                 PromoteOrInsert(instanceId, cached);
                 return true;
             }
+            _secondaryCache.Remove(instanceId);
         }
         cached = default;
         return false;
@@ -287,7 +313,7 @@ public static class UiHierarchyClassifier
 
         try
         {
-            var chain = new List<(int Id, string Name)>(16);
+            var chain = new List<(int Id, string Name, Transform Node)>(16);
             CachedHierarchyPath baseCached = default;
             var hasBaseCached = false;
 
@@ -302,7 +328,7 @@ public static class UiHierarchyClassifier
                 }
 
                 var currentName = current.name ?? string.Empty;
-                chain.Add((currentId, currentName));
+                chain.Add((currentId, currentName, current));
                 if (currentName.StartsWith("UICanvas", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(currentName, "ExtraCanvas", StringComparison.OrdinalIgnoreCase))
                 {
@@ -313,6 +339,9 @@ public static class UiHierarchyClassifier
             var currentFrame = Time.frameCount;
             var fullPath = hasBaseCached ? baseCached.FullPath : string.Empty;
             var normalizedPath = hasBaseCached ? baseCached.NormalizedPath : string.Empty;
+            var topUnparentedRoot = hasBaseCached
+                ? baseCached.UnparentedRoot
+                : (chain.Count > 0 ? chain[^1].Node : null);
             CachedHierarchyPath result = default;
 
             for (var i = chain.Count - 1; i >= 0; i--)
@@ -324,9 +353,9 @@ public static class UiHierarchyClassifier
                     ? normalizedLeaf
                     : string.Concat(normalizedPath, "/", normalizedLeaf);
                 var flags = ComputeFlags(fullPath, item.Name);
-                result = new CachedHierarchyPath(fullPath, normalizedPath, flags, currentFrame);
-                if ((flags & UiPathFlags.HasCanvasAncestor) != 0)
-                    PromoteOrInsert(item.Id, result);
+                var unparentedRoot = (flags & UiPathFlags.HasCanvasAncestor) != 0 ? null : topUnparentedRoot;
+                result = new CachedHierarchyPath(fullPath, normalizedPath, flags, currentFrame, unparentedRoot);
+                PromoteOrInsert(item.Id, result);
             }
 
             return result;
@@ -521,17 +550,15 @@ public static class UiHierarchyClassifier
             return;
 
         var id = transform.GetInstanceID();
-        if (_primaryCache.ContainsKey(id) || _secondaryCache.ContainsKey(id))
-        {
-            _primaryCache.Clear();
-            _secondaryCache.Clear();
-        }
+        _primaryCache.Remove(id);
+        _secondaryCache.Remove(id);
     }
 
     public static void ClearCache()
     {
         _primaryCache.Clear();
         _secondaryCache.Clear();
+        NonInternalLayerIds.Clear();
         _nextCanvasRootProbeTime = 0f;
     }
 

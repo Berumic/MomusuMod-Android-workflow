@@ -28,6 +28,8 @@ public sealed class TranslationManager
     // instead of wiping all cached UI translations at once.
     private Dictionary<(string Source, string Path), (bool Matched, string Value)> _uiResultsPrimary = new(UiResultCapacity);
     private Dictionary<(string Source, string Path), (bool Matched, string Value)> _uiResultsSecondary = new(UiResultCapacity);
+    private Dictionary<string, (bool Matched, string Value)> _uiSourceOnlyPrimary = new(UiResultCapacity, StringComparer.Ordinal);
+    private Dictionary<string, (bool Matched, string Value)> _uiSourceOnlySecondary = new(UiResultCapacity, StringComparer.Ordinal);
     private Dictionary<(string Source, string Path), (bool Matched, string Value)> _subSkillResultsPrimary = new(UiResultCapacity);
     private Dictionary<(string Source, string Path), (bool Matched, string Value)> _subSkillResultsSecondary = new(UiResultCapacity);
 
@@ -104,6 +106,8 @@ public sealed class TranslationManager
         UiHierarchyClassifier.ClearCache();
         _uiResultsPrimary.Clear();
         _uiResultsSecondary.Clear();
+        _uiSourceOnlyPrimary.Clear();
+        _uiSourceOnlySecondary.Clear();
         _subSkillResultsPrimary.Clear();
         _subSkillResultsSecondary.Clear();
         _names.Clear();
@@ -595,13 +599,24 @@ public sealed class TranslationManager
         _uiResultsPrimary[key] = entry;
     }
 
+    private void PromoteOrInsertUiSourceOnlyCache(string source, (bool Matched, string Value) entry)
+    {
+        if (_uiSourceOnlyPrimary.Count >= UiResultCapacity)
+        {
+            _uiSourceOnlySecondary.Clear();
+            (_uiSourceOnlyPrimary, _uiSourceOnlySecondary) = (_uiSourceOnlySecondary, _uiSourceOnlyPrimary);
+        }
+        _uiSourceOnlyPrimary[source] = entry;
+    }
+
     private bool TryTranslateUiTextCore(string source, string scenePath, out string translated)
     {
         translated = source;
         if (!_config.Enabled.Value || string.IsNullOrEmpty(source))
             return false;
 
-        if (TryTranslateSceneTemplate(source, scenePath, _uiSceneTemplates, out translated))
+        if (_uiSceneTemplates.Count > 0 &&
+            TryTranslateSceneTemplate(source, scenePath, _uiSceneTemplates, out translated))
             return true;
 
         if (TryTranslateUiPath(source, scenePath, out translated))
@@ -619,24 +634,63 @@ public sealed class TranslationManager
         if (!ContainsJapanese(source))
             return false;
 
+        var normalizedSource = NormalizeSubSkillKey(source);
+        var hasNormalizedVariant =
+            !ReferenceEquals(normalizedSource, source) &&
+            !string.Equals(normalizedSource, source, StringComparison.Ordinal);
+
+        if (hasNormalizedVariant)
+        {
+            if (_uiSceneTemplates.Count > 0 &&
+                TryTranslateSceneTemplate(normalizedSource, scenePath, _uiSceneTemplates, out translated))
+                return true;
+
+            if (TryTranslateUiPath(normalizedSource, scenePath, out translated))
+                return true;
+        }
+
+        if (source.Length <= 1024)
+        {
+            if (_uiSourceOnlyPrimary.TryGetValue(source, out var sourceCached))
+            {
+                translated = sourceCached.Value;
+                return sourceCached.Matched;
+            }
+            if (_uiSourceOnlySecondary.TryGetValue(source, out sourceCached))
+            {
+                PromoteOrInsertUiSourceOnlyCache(source, sourceCached);
+                translated = sourceCached.Value;
+                return sourceCached.Matched;
+            }
+        }
+
+        var matchedSourceOnly = TryTranslateUiSourceOnlyTemplates(
+            source,
+            normalizedSource,
+            hasNormalizedVariant,
+            out translated);
+        if (source.Length <= 1024)
+            PromoteOrInsertUiSourceOnlyCache(source, (matchedSourceOnly, translated));
+        return matchedSourceOnly;
+    }
+
+    private bool TryTranslateUiSourceOnlyTemplates(
+        string source,
+        string normalizedSource,
+        bool hasNormalizedVariant,
+        out string translated)
+    {
         if (TryTranslateNumberTemplate(source, _uiNumberTemplates, out translated))
             return true;
 
         if (TryTranslateExTemplate(source, _uiExTemplates, TryTranslateCapturedUiText, out translated))
             return true;
 
-        var normalizedSource = NormalizeSubSkillKey(source);
-        if (ReferenceEquals(normalizedSource, source) ||
-            string.Equals(normalizedSource, source, StringComparison.Ordinal))
+        if (!hasNormalizedVariant)
         {
             translated = source;
             return false;
         }
-        if (TryTranslateSceneTemplate(normalizedSource, scenePath, _uiSceneTemplates, out translated))
-            return true;
-
-        if (TryTranslateUiPath(normalizedSource, scenePath, out translated))
-            return true;
 
         if (_uiTexts.TryGetValue(normalizedSource, out translated) && !string.IsNullOrEmpty(translated))
             return true;
@@ -676,17 +730,26 @@ public sealed class TranslationManager
         // Many toggle/tab buttons store their translation table under .../Off/Text or .../On/Text
         // depending on which state was active when F8 captured the snapshot. Fall back to the
         // opposite On/Off state path so button state switches always resolve the same table.
-        if (normalizedPath.Contains("/On/", StringComparison.OrdinalIgnoreCase))
+        ReadOnlySpan<(string A, string B)> statePairs = stackalloc (string, string)[]
         {
-            var swapped = SwapPathSegment(normalizedPath, "/On/", "/Off/");
-            if (TryTranslateUiPathNormalized(source, swapped, out translated))
-                return true;
-        }
-        else if (normalizedPath.Contains("/Off/", StringComparison.OrdinalIgnoreCase))
+            ("/On/", "/Off/"),
+            ("/Active/", "/Inactive/"),
+            ("/Select/", "/Unselect/"),
+            ("/Selected/", "/Unselected/"),
+            ("/Enable/", "/Disable/")
+        };
+        foreach (var (segA, segB) in statePairs)
         {
-            var swapped = SwapPathSegment(normalizedPath, "/Off/", "/On/");
-            if (TryTranslateUiPathNormalized(source, swapped, out translated))
-                return true;
+            if (normalizedPath.Contains(segA, StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryTranslateUiPathNormalized(source, SwapPathSegment(normalizedPath, segA, segB), out translated))
+                    return true;
+            }
+            else if (normalizedPath.Contains(segB, StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryTranslateUiPathNormalized(source, SwapPathSegment(normalizedPath, segB, segA), out translated))
+                    return true;
+            }
         }
 
         return false;
@@ -860,6 +923,52 @@ public sealed class TranslationManager
             scene = ResolveStoryScenarioIdCore(snapshot, resourceId);
 
         var normalized = NormalizeSubSkillKey(source);
+        if (TryTranslateStoryExactSingle(snapshot, normalized, scene, resourceId, out translated, out var conflict, out var uniqueScene))
+        {
+            if (!string.IsNullOrEmpty(uniqueScene))
+                StorySceneContext.NotifyUniqueSceneMatched(uniqueScene);
+            return true;
+        }
+        if (conflict)
+            return false;
+
+        if (TryTranslateConcatenatedStoryExact(snapshot, normalized, scene, resourceId, out translated))
+        {
+            AddKnownTranslationValue(translated);
+            return true;
+        }
+
+        if (IsKnownStoryTranslationValueCore(snapshot, source))
+            return false;
+
+        EnsureStoryFragmentIndex(snapshot);
+        if (TryTranslateIndexedFragments(source, snapshot.StoryFragmentIndex, out var fragmentTranslated))
+        {
+            if (TryTranslateConcatenatedStoryExact(snapshot, NormalizeSubSkillKey(fragmentTranslated), scene, resourceId, out var completedTranslated))
+                translated = completedTranslated;
+            else
+                translated = fragmentTranslated;
+            AddKnownTranslationValue(translated);
+            return true;
+        }
+
+        translated = source;
+        return false;
+    }
+
+    private static bool TryTranslateStoryExactSingle(
+        ScenarioSnapshot snapshot,
+        string normalized,
+        string scene,
+        string resourceId,
+        out string translated,
+        out bool conflict,
+        out string uniqueScene)
+    {
+        translated = normalized;
+        conflict = false;
+        uniqueScene = string.Empty;
+
         var displayNormalized = NormalizeStoryDisplayValue(normalized);
         var hasDifferentDisplay =
             !ReferenceEquals(displayNormalized, normalized) &&
@@ -868,14 +977,12 @@ public sealed class TranslationManager
         // 1. Check active scene table first so a global conflict never blocks an exact scene match.
         if (!string.IsNullOrEmpty(scene))
         {
-            if (TryLookupStoryIndexInScene(snapshot.StoryParseIndex, normalized, scene, out translated, out var uniqueScene) ||
+            if (TryLookupStoryIndexInScene(snapshot.StoryParseIndex, normalized, scene, out translated, out uniqueScene) ||
                 TryLookupStoryIndexInScene(snapshot.StoryDisplayIndex, normalized, scene, out translated, out uniqueScene) ||
                 (hasDifferentDisplay &&
                  (TryLookupStoryIndexInScene(snapshot.StoryParseIndex, displayNormalized, scene, out translated, out uniqueScene) ||
                   TryLookupStoryIndexInScene(snapshot.StoryDisplayIndex, displayNormalized, scene, out translated, out uniqueScene))))
             {
-                if (!string.IsNullOrEmpty(uniqueScene))
-                    StorySceneContext.NotifyUniqueSceneMatched(uniqueScene);
                 return true;
             }
         }
@@ -890,47 +997,36 @@ public sealed class TranslationManager
         }
 
         // 2. Global / fallback lookup across parse and display indexes.
-        if (TryLookupStoryIndex(snapshot.StoryParseIndex, normalized, scene, out translated, out var parseConflict, out var uniqueMatched))
-        {
-            if (!string.IsNullOrEmpty(uniqueMatched))
-                StorySceneContext.NotifyUniqueSceneMatched(uniqueMatched);
+        if (TryLookupStoryIndex(snapshot.StoryParseIndex, normalized, scene, out translated, out var parseConflict, out uniqueScene))
             return true;
-        }
 
-        if (TryLookupStoryIndex(snapshot.StoryDisplayIndex, normalized, scene, out translated, out var displayConflict, out uniqueMatched))
-        {
-            if (!string.IsNullOrEmpty(uniqueMatched))
-                StorySceneContext.NotifyUniqueSceneMatched(uniqueMatched);
+        if (TryLookupStoryIndex(snapshot.StoryDisplayIndex, normalized, scene, out translated, out var displayConflict, out uniqueScene))
             return true;
-        }
 
         if (hasDifferentDisplay)
         {
-            if (TryLookupStoryIndex(snapshot.StoryParseIndex, displayNormalized, scene, out translated, out var dispParseConflict, out uniqueMatched))
-            {
-                if (!string.IsNullOrEmpty(uniqueMatched))
-                    StorySceneContext.NotifyUniqueSceneMatched(uniqueMatched);
+            if (TryLookupStoryIndex(snapshot.StoryParseIndex, displayNormalized, scene, out translated, out var dispParseConflict, out uniqueScene))
                 return true;
-            }
             if (!parseConflict && !dispParseConflict &&
-                TryLookupStoryIndex(snapshot.StoryDisplayIndex, displayNormalized, scene, out translated, out var dispDisplayConflict, out uniqueMatched))
+                TryLookupStoryIndex(snapshot.StoryDisplayIndex, displayNormalized, scene, out translated, out var dispDisplayConflict, out uniqueScene))
             {
-                if (!string.IsNullOrEmpty(uniqueMatched))
-                    StorySceneContext.NotifyUniqueSceneMatched(uniqueMatched);
                 return true;
             }
             if (parseConflict || displayConflict || dispParseConflict)
+            {
+                conflict = true;
                 return false;
+            }
         }
 
         if (parseConflict || displayConflict)
+        {
+            conflict = true;
             return false;
+        }
 
-        if (IsKnownStoryTranslationValueCore(snapshot, source))
-            return false;
-
-        EnsureStoryFragmentIndex(snapshot);
-        return TryTranslateIndexedFragments(source, snapshot.StoryFragmentIndex, out translated);
+        translated = normalized;
+        return false;
     }
 
     /// <summary>
@@ -966,19 +1062,47 @@ public sealed class TranslationManager
             return false;
 
         var snapshot = GetLoadedScenarioSnapshot();
-        if (IsKnownStoryTranslationValueCore(snapshot, source))
+        var lookup = NormalizeSubSkillKey(source);
+        if (IsSingleKnownStoryValue(snapshot, source) || IsSingleKnownStoryValue(snapshot, lookup))
             return false;
 
-        var lookup = NormalizeSubSkillKey(source);
+        var scene = ResolveStoryScenarioIdCore(snapshot, scenarioId);
+        if (scene.Length == 0 && allowCandidateInference && !string.IsNullOrEmpty(ScenarioContext.CurrentResourceId))
+            scene = ResolveStoryScenarioIdCore(snapshot, ScenarioContext.CurrentResourceId);
+
+        if (TryTranslateStoryBeforeParseSingle(snapshot, lookup, scene, allowCandidateInference, out translated, out var conflict, out uniqueScene))
+            return true;
+        if (conflict)
+            return false;
+
+        if (TryTranslateConcatenatedStoryBeforeParse(snapshot, lookup, scene, allowCandidateInference, out translated, out uniqueScene))
+        {
+            AddKnownTranslationValue(translated);
+            return true;
+        }
+
+        translated = source;
+        return false;
+    }
+
+    private static bool TryTranslateStoryBeforeParseSingle(
+        ScenarioSnapshot snapshot,
+        string lookup,
+        string scene,
+        bool allowCandidateInference,
+        out string translated,
+        out bool conflict,
+        out string uniqueScene)
+    {
+        translated = lookup;
+        conflict = false;
+        uniqueScene = string.Empty;
+
         var displayLookup = NormalizeStoryDisplayValue(lookup);
         var hasControlTag = HasUtageDisplayControlTag(lookup);
         var hasDifferentDisplay =
             !ReferenceEquals(displayLookup, lookup) &&
             !string.Equals(displayLookup, lookup, StringComparison.Ordinal);
-
-        var scene = ResolveStoryScenarioIdCore(snapshot, scenarioId);
-        if (scene.Length == 0 && allowCandidateInference && !string.IsNullOrEmpty(ScenarioContext.CurrentResourceId))
-            scene = ResolveStoryScenarioIdCore(snapshot, ScenarioContext.CurrentResourceId);
 
         // 1. Check active scene table first before any global conflict check.
         if (!string.IsNullOrEmpty(scene))
@@ -1015,7 +1139,7 @@ public sealed class TranslationManager
         }
 
         // 2. Global / fallback lookup.
-        if (TryLookupStoryIndex(snapshot.StoryParseIndex, lookup, scene, out translated, out var conflict, out uniqueScene))
+        if (TryLookupStoryIndex(snapshot.StoryParseIndex, lookup, scene, out translated, out conflict, out uniqueScene))
             return true;
 
         if (!hasControlTag)
@@ -1037,10 +1161,287 @@ public sealed class TranslationManager
                 return true;
             }
             if (conflict || displayConflict)
+            {
+                conflict = true;
                 return false;
+            }
         }
 
-        translated = source;
+        translated = lookup;
+        return false;
+    }
+
+    private bool TryTranslateConcatenatedStoryExact(
+        ScenarioSnapshot snapshot,
+        string normalized,
+        string scene,
+        string resourceId,
+        out string translated)
+    {
+        translated = normalized;
+        var clauses = SplitIntoStoryClauses(normalized);
+        if (clauses.Count < 2)
+            return false;
+
+        var activeScene = scene;
+        var builder = new StringBuilder(normalized.Length + 16);
+        if (clauses[0].Start > 0)
+            builder.Append(normalized, 0, clauses[0].Start);
+
+        var translatedCount = 0;
+        var idx = 0;
+        while (idx < clauses.Count)
+        {
+            if (idx > 0 && clauses[idx].Start > clauses[idx - 1].End)
+            {
+                builder.Append(
+                    normalized,
+                    clauses[idx - 1].End,
+                    clauses[idx].Start - clauses[idx - 1].End);
+            }
+
+            var maxEnd = idx == 0 ? clauses.Count - 2 : clauses.Count - 1;
+            var matched = false;
+            for (var endIdx = maxEnd; endIdx >= idx; endIdx--)
+            {
+                var startPos = clauses[idx].Start;
+                var length = clauses[endIdx].End - startPos;
+                var spanText = normalized.Substring(startPos, length);
+
+                if (TryTranslateStoryExactSingle(
+                        snapshot,
+                        spanText,
+                        activeScene,
+                        resourceId,
+                        out var spanTranslated,
+                        out var conflict,
+                        out var spanUniqueScene))
+                {
+                    if (!string.IsNullOrEmpty(spanUniqueScene))
+                    {
+                        StorySceneContext.NotifyUniqueSceneMatched(spanUniqueScene);
+                        if (string.IsNullOrEmpty(activeScene))
+                            activeScene = spanUniqueScene;
+                    }
+                    builder.Append(spanTranslated);
+                    translatedCount++;
+                    idx = endIdx + 1;
+                    matched = true;
+                    break;
+                }
+                if (conflict)
+                    return false;
+
+                if (IsSingleKnownStoryValue(snapshot, spanText))
+                {
+                    builder.Append(spanText);
+                    idx = endIdx + 1;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched)
+            {
+                var singleSpan = normalized.Substring(clauses[idx].Start, clauses[idx].End - clauses[idx].Start);
+                var trimmedSingle = singleSpan.Trim(' ', '\t', '\u3000', '\n');
+                if (snapshot.Fallback.ContainsKey(singleSpan) ||
+                    (trimmedSingle.Length > 0 && snapshot.Fallback.ContainsKey(trimmedSingle)))
+                {
+                    builder.Append(singleSpan);
+                    idx++;
+                    continue;
+                }
+                return false;
+            }
+        }
+
+        if (clauses[^1].End < normalized.Length)
+            builder.Append(normalized, clauses[^1].End, normalized.Length - clauses[^1].End);
+
+        if (translatedCount <= 0)
+            return false;
+
+        translated = builder.ToString();
+        return !string.Equals(normalized, translated, StringComparison.Ordinal);
+    }
+
+    private bool TryTranslateConcatenatedStoryBeforeParse(
+        ScenarioSnapshot snapshot,
+        string lookup,
+        string scene,
+        bool allowCandidateInference,
+        out string translated,
+        out string uniqueScene)
+    {
+        translated = lookup;
+        uniqueScene = string.Empty;
+        var clauses = SplitIntoStoryClauses(lookup);
+        if (clauses.Count < 2)
+            return false;
+
+        var activeScene = scene;
+        var builder = new StringBuilder(lookup.Length + 16);
+        if (clauses[0].Start > 0)
+            builder.Append(lookup, 0, clauses[0].Start);
+
+        var translatedCount = 0;
+        var idx = 0;
+        while (idx < clauses.Count)
+        {
+            if (idx > 0 && clauses[idx].Start > clauses[idx - 1].End)
+            {
+                builder.Append(
+                    lookup,
+                    clauses[idx - 1].End,
+                    clauses[idx].Start - clauses[idx - 1].End);
+            }
+
+            var maxEnd = idx == 0 ? clauses.Count - 2 : clauses.Count - 1;
+            var matched = false;
+            for (var endIdx = maxEnd; endIdx >= idx; endIdx--)
+            {
+                var startPos = clauses[idx].Start;
+                var length = clauses[endIdx].End - startPos;
+                var spanText = lookup.Substring(startPos, length);
+
+                if (TryTranslateStoryBeforeParseSingle(
+                        snapshot,
+                        spanText,
+                        activeScene,
+                        allowCandidateInference,
+                        out var spanTranslated,
+                        out var conflict,
+                        out var spanUniqueScene))
+                {
+                    if (!string.IsNullOrEmpty(spanUniqueScene))
+                    {
+                        uniqueScene = spanUniqueScene;
+                        if (allowCandidateInference)
+                        {
+                            StorySceneContext.NotifyUniqueSceneMatched(spanUniqueScene);
+                            if (string.IsNullOrEmpty(activeScene))
+                                activeScene = spanUniqueScene;
+                        }
+                    }
+                    builder.Append(spanTranslated);
+                    translatedCount++;
+                    idx = endIdx + 1;
+                    matched = true;
+                    break;
+                }
+                if (conflict)
+                    return false;
+
+                if (IsSingleKnownStoryValue(snapshot, spanText))
+                {
+                    builder.Append(spanText);
+                    idx = endIdx + 1;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched)
+            {
+                var singleSpan = lookup.Substring(clauses[idx].Start, clauses[idx].End - clauses[idx].Start);
+                var trimmedSingle = singleSpan.Trim(' ', '\t', '\u3000', '\n');
+                if (snapshot.Fallback.ContainsKey(singleSpan) ||
+                    (trimmedSingle.Length > 0 && snapshot.Fallback.ContainsKey(trimmedSingle)))
+                {
+                    builder.Append(singleSpan);
+                    idx++;
+                    continue;
+                }
+                return false;
+            }
+        }
+
+        if (clauses[^1].End < lookup.Length)
+            builder.Append(lookup, clauses[^1].End, lookup.Length - clauses[^1].End);
+
+        if (translatedCount <= 0)
+            return false;
+
+        translated = builder.ToString();
+        return !string.Equals(lookup, translated, StringComparison.Ordinal);
+    }
+
+    private static List<(int Start, int End)> SplitIntoStoryClauses(string text)
+    {
+        var clauses = new List<(int Start, int End)>(4);
+        if (string.IsNullOrEmpty(text))
+            return clauses;
+
+        var n = text.Length;
+        var i = 0;
+        while (i < n)
+        {
+            while (i < n && text[i] == '\n')
+                i++;
+            if (i >= n)
+                break;
+
+            var start = i;
+            while (i < n)
+            {
+                var ch = text[i];
+                if (ch == '<')
+                {
+                    var close = text.IndexOf('>', i);
+                    if (close > i)
+                    {
+                        i = close + 1;
+                        continue;
+                    }
+                }
+
+                if (ch == '\n')
+                    break;
+
+                if (IsStoryClauseEndPunctuation(ch))
+                {
+                    while (i < n && IsStoryClauseEndPunctuation(text[i]))
+                        i++;
+                    while (i < n && text[i] == '<' && TryAdvancePastUtageControlTag(text, i, out var nextIdx))
+                        i = nextIdx;
+                    break;
+                }
+
+                i++;
+            }
+
+            if (i > start)
+                clauses.Add((start, i));
+        }
+
+        return clauses;
+    }
+
+    private static bool IsStoryClauseEndPunctuation(char c) =>
+        c == '。' || c == '？' || c == '！' || c == '?' || c == '!' ||
+        c == '…' || c == '」' || c == '』' || c == '）' || c == '】' ||
+        c == '～' || c == '〜' || c == '―' || c == '─';
+
+    private static bool TryAdvancePastUtageControlTag(string text, int index, out int nextIndex)
+    {
+        nextIndex = index;
+        if (index >= text.Length || text[index] != '<')
+            return false;
+
+        var close = text.IndexOf('>', index);
+        if (close <= index)
+            return false;
+
+        var tagSpan = text.AsSpan(index, close - index + 1);
+        if (tagSpan.Contains("interval".AsSpan(), StringComparison.OrdinalIgnoreCase) ||
+            tagSpan.Contains("speed".AsSpan(), StringComparison.OrdinalIgnoreCase) ||
+            tagSpan.Contains("sound".AsSpan(), StringComparison.OrdinalIgnoreCase))
+        {
+            nextIndex = close + 1;
+            return true;
+        }
+
         return false;
     }
 
@@ -1356,10 +1757,59 @@ public sealed class TranslationManager
         return IsKnownStoryTranslationValueCore(GetLoadedScenarioSnapshot(), value);
     }
 
-    private static bool IsKnownStoryTranslationValueCore(ScenarioSnapshot snapshot, string value) =>
-        !string.IsNullOrEmpty(value) &&
-        (snapshot.KnownStoryTranslationValues.Contains(value) ||
-         snapshot.KnownStoryTranslationValues.Contains(NormalizeStoryDisplayValue(value)));
+    private bool IsSingleKnownStoryValue(ScenarioSnapshot snapshot, string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return false;
+        if (_knownTranslationValues.Contains(value) ||
+            snapshot.KnownStoryTranslationValues.Contains(value) ||
+            snapshot.KnownStoryTranslationValues.Contains(NormalizeStoryDisplayValue(value)))
+            return true;
+        var trimmed = value.Trim(' ', '\t', '\u3000', '\n');
+        return trimmed.Length > 0 &&
+               trimmed.Length != value.Length &&
+               (_knownTranslationValues.Contains(trimmed) ||
+                snapshot.KnownStoryTranslationValues.Contains(trimmed) ||
+                snapshot.KnownStoryTranslationValues.Contains(NormalizeStoryDisplayValue(trimmed)));
+    }
+
+    private bool IsKnownStoryTranslationValueCore(ScenarioSnapshot snapshot, string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return false;
+
+        if (IsSingleKnownStoryValue(snapshot, value))
+            return true;
+
+        var normalized = NormalizeSubSkillKey(value);
+        if (!ReferenceEquals(normalized, value) && IsSingleKnownStoryValue(snapshot, normalized))
+            return true;
+
+        var clauses = SplitIntoStoryClauses(normalized);
+        if (clauses.Count < 2)
+            return false;
+
+        var idx = 0;
+        while (idx < clauses.Count)
+        {
+            var matched = false;
+            var maxEnd = idx == 0 ? clauses.Count - 2 : clauses.Count - 1;
+            for (var endIdx = maxEnd; endIdx >= idx; endIdx--)
+            {
+                var spanText = normalized.Substring(clauses[idx].Start, clauses[endIdx].End - clauses[idx].Start);
+                if (IsSingleKnownStoryValue(snapshot, spanText))
+                {
+                    idx = endIdx + 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched)
+                return false;
+        }
+
+        return true;
+    }
 
     public void ResetInferredStoryScenario()
     {
@@ -1580,7 +2030,7 @@ public sealed class TranslationManager
 
     private sealed class NumberTemplate
     {
-        internal const string NumberPattern = @"(?<number>[+\-−＋]?\d+(?:[.,．]\d+)?)";
+        internal const string NumberPattern = @"(?<number>[+\-−＋]?(?:\d+(?:[.,．]\d+)?|\{\d+(?::[^}]*)?\}))";
         private readonly string _translation;
         private readonly string[] _sourcePieces;
         private readonly string[] _translationPieces;
@@ -1946,11 +2396,30 @@ public sealed class TranslationManager
         }
     }
 
+    private static bool ContainsDigitOrFormatPlaceholder(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return false;
+        for (var i = 0; i < value.Length; i++)
+        {
+            var c = value[i];
+            if ((c >= '0' && c <= '9') || (c >= '０' && c <= '９') || c == '{')
+                return true;
+        }
+        return false;
+    }
+
     private static bool TryTranslateNumberTemplate(
         string source,
         IEnumerable<NumberTemplate> templates,
         out string translated)
     {
+        if (!ContainsDigitOrFormatPlaceholder(source))
+        {
+            translated = source;
+            return false;
+        }
+
         foreach (var template in templates)
             if (template.TryTranslate(source, out translated))
                 return true;

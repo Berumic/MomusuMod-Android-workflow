@@ -26,9 +26,11 @@ internal static class UiStyleManager
     // into one UGUI Canvas draw call.
     private static readonly Dictionary<MaterialStyleKey, Material> SharedMaterials = new();
     private static readonly Dictionary<int, MaterialStyleKey> InstanceStyleKeys = new();
+    private static readonly Dictionary<int, StyleRule> InstanceAppliedRules = new();
     private static readonly HashSet<int> ModMaterialIds = new();
     private static readonly Dictionary<int, Material> OriginalGameMaterials = new();
     private static readonly Dictionary<int, Color> MaterialBaseFaceColors = new();
+    private static readonly Dictionary<int, (int Frame, bool HasProp, Color Color)> MaterialFaceColorFrameCache = new();
     private static readonly Dictionary<int, Color> PreStyleVertexColors = new();
 
     // Sibling __MMTDUnderlay projection layers for explicit "underlay": true style rules.
@@ -40,6 +42,7 @@ internal static class UiStyleManager
     private static string _stylePath;
     [ThreadStatic]
     private static bool _applying;
+    private static int _presentationDepth;
     private static TMP_Text _batchText;
     private static TMP_Text _activePresentationText;
     private static string _pendingTextOverride;
@@ -181,6 +184,7 @@ internal static class UiStyleManager
             return;
         var id = text.GetInstanceID();
         InstanceStyleKeys.Remove(id);
+        InstanceAppliedRules.Remove(id);
         var material = text.fontSharedMaterial;
         if (material != null && !IsModMaterial(material))
             OriginalGameMaterials[id] = material;
@@ -202,7 +206,7 @@ internal static class UiStyleManager
     }
 
     internal static bool SubmitBaseline(TMP_Text text, TMP_FontAsset font, float width,
-        float dilate, Color outlineColor, float? spacing, bool outline = true)
+        float dilate, Color outlineColor, float? spacing, bool outline = true, bool isTranslated = true)
     {
         if (_batchText == null || _batchText != text) return false;
         _batchBaseline = new StyleValues
@@ -215,6 +219,7 @@ internal static class UiStyleManager
             Outline = outline
         };
         _batchRequested = true;
+        _batchTranslated |= isTranslated;
         _batchFont = font;
         _batchWidth = width;
         _batchDilate = dilate;
@@ -223,6 +228,15 @@ internal static class UiStyleManager
 
     internal static void BeginPresentation(TMP_Text text, string pendingText = null)
     {
+        if (_presentationDepth > 0 && _batchText == text)
+        {
+            _presentationDepth++;
+            if (!string.IsNullOrEmpty(pendingText))
+                _pendingTextOverride = pendingText;
+            return;
+        }
+
+        _presentationDepth = 1;
         _batchText = text;
         _activePresentationText = text;
         _pendingTextOverride = pendingText;
@@ -233,6 +247,13 @@ internal static class UiStyleManager
 
     internal static void EndPresentation()
     {
+        if (_presentationDepth > 1)
+        {
+            _presentationDepth--;
+            return;
+        }
+
+        _presentationDepth = 0;
         var text = _batchText;
         _batchText = null;
         _resolvedBaseline = _batchBaseline;
@@ -272,7 +293,9 @@ internal static class UiStyleManager
         }
         SharedMaterials.Clear();
         InstanceStyleKeys.Clear();
+        InstanceAppliedRules.Clear();
         MaterialBaseFaceColors.Clear();
+        MaterialFaceColorFrameCache.Clear();
         SelectableTextsCache.Clear();
         ResolvedRulesByPath.Clear();
         Rules.Clear();
@@ -359,20 +382,7 @@ internal static class UiStyleManager
             return false;
 
         var path = UiHierarchyClassifier.GetNormalizedHierarchyPath(text.transform);
-        if (!ResolvedRulesByPath.TryGetValue(path, out var matched))
-        {
-            foreach (var rule in Rules)
-            {
-                if (UiStylePolicy.PathContains(path, rule.Path))
-                {
-                    matched = rule;
-                    break;
-                }
-            }
-            if (ResolvedRulesByPath.Count >= 2048)
-                ResolvedRulesByPath.Clear();
-            ResolvedRulesByPath[path] = matched;
-        }
+        var matched = ResolveRuleForPath(path);
         var values = UiStylePolicy.Resolve(matched?.Values, _defaults, _resolvedBaseline, isTranslated);
         if (values == null)
         {
@@ -489,6 +499,7 @@ internal static class UiStyleManager
             underlaySoftness,
             outlineSoftness: 0f);
         InstanceStyleKeys[instanceId] = styleKey;
+        InstanceAppliedRules[instanceId] = matched;
 
         if (text.fontSharedMaterial != material)
         {
@@ -524,6 +535,62 @@ internal static class UiStyleManager
         return true;
     }
 
+    private static StyleRule ResolveRuleForPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return null;
+        if (!ResolvedRulesByPath.TryGetValue(path, out var matched))
+        {
+            foreach (var rule in Rules)
+            {
+                if (UiStylePolicy.PathContains(path, rule.Path))
+                {
+                    matched = rule;
+                    break;
+                }
+            }
+            if (ResolvedRulesByPath.Count >= 2048)
+                ResolvedRulesByPath.Clear();
+            ResolvedRulesByPath[path] = matched;
+        }
+        return matched;
+    }
+
+    internal static bool HasMatchingAppliedRule(TMP_Text text, int instanceId)
+    {
+        if (text?.transform == null || !InstanceAppliedRules.TryGetValue(instanceId, out var appliedRule))
+            return false;
+        var path = UiHierarchyClassifier.GetNormalizedHierarchyPath(text.transform);
+        return ReferenceEquals(appliedRule, ResolveRuleForPath(path));
+    }
+
+    internal static bool TryGetMaterialFaceColor(Material material, out Color faceColor)
+    {
+        if (material == null)
+        {
+            faceColor = default;
+            return false;
+        }
+
+        var matId = material.GetInstanceID();
+        var currentFrame = Time.frameCount;
+        if (MaterialFaceColorFrameCache.TryGetValue(matId, out var cached) &&
+            cached.Frame == currentFrame)
+        {
+            faceColor = cached.Color;
+            return cached.HasProp;
+        }
+
+        var hasProp = cached.Frame != 0
+            ? cached.HasProp
+            : material.HasProperty("_FaceColor");
+        faceColor = hasProp ? material.GetColor("_FaceColor") : default;
+        if (MaterialFaceColorFrameCache.Count >= 512)
+            MaterialFaceColorFrameCache.Clear();
+        MaterialFaceColorFrameCache[matId] = (currentFrame, hasProp, faceColor);
+        return hasProp;
+    }
+
     private static Color ResolveLiveBaseFaceColor(
         TMP_Text text,
         int instanceId,
@@ -535,19 +602,16 @@ internal static class UiStyleManager
             return Color.white;
 
         if (OriginalGameMaterials.TryGetValue(instanceId, out var gameMaterial) &&
-            gameMaterial != null &&
-            gameMaterial.HasProperty("_FaceColor"))
+            TryGetMaterialFaceColor(gameMaterial, out var liveColor))
         {
-            var liveColor = gameMaterial.GetColor("_FaceColor");
             MaterialBaseFaceColors[instanceId] = liveColor;
             return liveColor;
         }
 
         if (originalMaterial != null &&
             !IsModMaterial(originalMaterial) &&
-            originalMaterial.HasProperty("_FaceColor"))
+            TryGetMaterialFaceColor(originalMaterial, out var origColor))
         {
-            var origColor = originalMaterial.GetColor("_FaceColor");
             MaterialBaseFaceColors[instanceId] = origColor;
             return origColor;
         }
@@ -561,9 +625,8 @@ internal static class UiStyleManager
         if (MaterialBaseFaceColors.TryGetValue(instanceId, out var cachedFaceColor))
             return cachedFaceColor;
 
-        if (baseMaterial != null && baseMaterial.HasProperty("_FaceColor"))
+        if (TryGetMaterialFaceColor(baseMaterial, out var fallbackColor))
         {
-            var fallbackColor = baseMaterial.GetColor("_FaceColor");
             MaterialBaseFaceColors[instanceId] = fallbackColor;
             return fallbackColor;
         }
@@ -968,6 +1031,7 @@ internal static class UiStyleManager
         if (text == null) return;
         var id = text.GetInstanceID();
         InstanceStyleKeys.Remove(id);
+        InstanceAppliedRules.Remove(id);
         MaterialBaseFaceColors.Remove(id);
         OriginalGameMaterials.Remove(id);
         if (PreStyleVertexColors.TryGetValue(id, out var savedColor))

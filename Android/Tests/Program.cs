@@ -77,6 +77,15 @@ try
     Check(UiHierarchyClassifier.GetHierarchyPath(card) == "DetachedRoot/Card(Clone)" &&
           !UiHierarchyClassifier.IsUnderUiCanvas(card),
         "Hierarchy invalidation refreshes reparented UI entries");
+    var unparentedCard = new UnityEngine.Transform { name = "Shop_SaleContent3(Clone)" };
+    var unparentedLabel = new UnityEngine.Transform { name = "Text", parent = unparentedCard };
+    Check(UiHierarchyClassifier.GetHierarchyPath(unparentedLabel) == "Shop_SaleContent3(Clone)/Text" &&
+          !UiHierarchyClassifier.IsUnderUiCanvas(unparentedLabel),
+        "Unparented prefab hierarchy paths are cached before parenting");
+    unparentedCard.parent = canvas;
+    Check(UiHierarchyClassifier.GetHierarchyPath(unparentedLabel) == "UICanvas/Shop_SaleContent3(Clone)/Text" &&
+          UiHierarchyClassifier.IsUnderUiCanvas(unparentedLabel),
+        "Parenting an unparented prefab root automatically updates descendant cached paths");
     var internalLayer = new UnityEngine.GameObject { name = "Underlay" };
     var internalComponent = new UnityEngine.UI.Image { transform = internalLayer.transform };
     UiHierarchyClassifier.RegisterInternalLayer(internalLayer, internalComponent);
@@ -287,6 +296,14 @@ try
         "Inferred scene persists into playback context after script scope disposal");
     Check(translations.ResolveStoryScenarioId("nml_10399_01") == "10399a0_nml",
         "Resource ID base number resolves character scenario folder");
+    Check(translations.TryTranslateStoryBeforeParse("普通じゃないのは確か……え？", out result) && result == "这确实不正常……诶？",
+        "Concatenated same-page UTAGE story rows translate before parsing");
+    Check(translations.TryTranslateStoryExact("普通じゃないのは確か……え？", "10399a0_nml", null, out result) && result == "这确实不正常……诶？",
+        "Concatenated same-page UTAGE story rows translate in exact display lookup");
+    Check(translations.TryTranslateStoryExact("这确实不正常……え？", "10399a0_nml", null, out result) && result == "这确实不正常……诶？",
+        "Partially translated concatenated story row translates remaining short Japanese sentence");
+    Check(translations.IsKnownStoryTranslationValue("这确实不正常……诶？") && translations.IsKnownTranslationValue("这确实不正常……诶？"),
+        "Concatenated translated story row is recognized as known translation value");
     StorySceneContext.ClearPlayback();
 
     using var server = new FixtureServer();

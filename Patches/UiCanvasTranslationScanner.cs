@@ -20,7 +20,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
     private const float TransitionWatchDurationSeconds = 0.25f;
     private const int DiscoveryFastCheckBudget = 64;
     private const int DiscoveryProcessBudget = 8;
-    private const int MaxUnparentedRetries = 4;
+    private const int MaxUnparentedRetries = 30;
 
     private static UiCanvasTranslationScanner _instance;
     private readonly Dictionary<int, string> _observedValues = new();
@@ -69,6 +69,13 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
             return;
         PendingTextRefreshes.Remove(instanceId);
         _instance?._unparentedRetryCounts.Remove(instanceId);
+    }
+
+    internal static void RecordObservedValue(int instanceId, string translated)
+    {
+        var scanner = _instance;
+        if (scanner != null && instanceId != 0)
+            scanner._observedValues[instanceId] = translated;
     }
 
     internal static void RecordFastProcessedText(int instanceId, string translated, TMP_Text text = null)
@@ -324,13 +331,7 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         UiStyleManager.BeginPresentation(text);
         try
         {
-            var isTranslated = ProcessTextCore(text, allowDiagnostics, scheduleRetry);
-            if (isTranslated && !UiHierarchyClassifier.ShouldUseSubSkillPresentation(text))
-            {
-                UiStyleManager.Apply(text, Plugin.Settings.UiTextOutlineWidth.Value,
-                    Plugin.Settings.UiTextFaceDilate.Value, TmpFontInstaller.LoadedFont,
-                    isTranslated: true);
-            }
+            ProcessTextCore(text, allowDiagnostics, scheduleRetry);
         }
         finally
         {
@@ -371,7 +372,8 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
             string.Equals(observedTranslated, source, StringComparison.Ordinal) &&
             Plugin.Translations.IsKnownUiTextTranslationValue(source))
         {
-            TmpFontInstaller.ApplyToTranslatedUiText(text, source);
+            if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(text, source, null, isSubSkill: false))
+                TmpFontInstaller.ApplyToTranslatedUiText(text, source);
             return true;
         }
 
@@ -385,14 +387,16 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
 
             if (!string.Equals(source, translated, StringComparison.Ordinal))
                 text.text = translated;
-            TmpFontInstaller.ApplyToTranslatedUiText(text, translated, source);
+            if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(text, translated, source, isSubSkill: false))
+                TmpFontInstaller.ApplyToTranslatedUiText(text, translated, source);
             _observedValues[instanceId] = translated;
             return true;
         }
 
         if (Plugin.Translations.IsKnownUiTextTranslationValue(source))
         {
-            TmpFontInstaller.ApplyToTranslatedUiText(text, source);
+            if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(text, source, null, isSubSkill: false))
+                TmpFontInstaller.ApplyToTranslatedUiText(text, source);
             _observedValues[instanceId] = source;
             return true;
         }
@@ -400,7 +404,8 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         if (Plugin.Settings.TranslateSubSkills.Value &&
             Plugin.Translations.IsKnownSubSkillTranslationValue(source))
         {
-            TmpFontInstaller.ApplyToTranslatedSubSkillText(text, source);
+            if (!TmpFontInstaller.TryFastCompleteTranslatedTmpText(text, source, null, isSubSkill: true))
+                TmpFontInstaller.ApplyToTranslatedSubSkillText(text, source);
             _observedValues[instanceId] = source;
             return true;
         }
@@ -525,7 +530,6 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
         foreach (var text in _pendingTextSnapshot)
         {
             if (text == null || text.gameObject == null ||
-                !text.gameObject.activeInHierarchy ||
                 UiHierarchyClassifier.IsUiTextSoftOutlineLayer(text))
                 continue;
 
@@ -544,11 +548,17 @@ public sealed class UiCanvasTranslationScanner : MonoBehaviour
 
             if (!UiHierarchyClassifier.IsUnderUiCanvas(text))
             {
+                if (!text.gameObject.activeInHierarchy)
+                {
+                    _unparentedRetryCounts.Remove(instanceId);
+                    continue;
+                }
                 var retries = _unparentedRetryCounts.TryGetValue(instanceId, out var count) ? count + 1 : 1;
                 if (retries <= MaxUnparentedRetries)
                 {
                     _unparentedRetryCounts[instanceId] = retries;
-                    PendingTextRefreshes.Enqueue(instanceId, text, Time.frameCount + 1, activation: true);
+                    var delay = retries <= 4 ? 1 : 2;
+                    PendingTextRefreshes.Enqueue(instanceId, text, Time.frameCount + delay, activation: true);
                 }
                 else
                 {

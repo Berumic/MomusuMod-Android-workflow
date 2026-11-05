@@ -423,9 +423,14 @@ public static class TmpFontInstaller
             return false;
 
         var instanceId = text.GetInstanceID();
-        if (!UiStyleManager.IsInstanceStyled(text, instanceId) ||
+        var flags = UiHierarchyClassifier.GetFlags(text);
+        if ((flags & UiPathFlags.UnderUiCanvas) == 0 ||
+            !UiStyleManager.IsInstanceStyled(text, instanceId) ||
             UiStyleManager.HasUnderlay(instanceId) ||
-            !UiHierarchyClassifier.IsUnderUiCanvas(text))
+            !UiStyleManager.HasMatchingAppliedRule(text, instanceId) ||
+            (flags & (UiPathFlags.UnitDetailFontOverride | UiPathFlags.CommonSortFilter)) != 0 ||
+            ((flags & UiPathFlags.ShopOrPopupLayout) != 0 &&
+             !Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing)))
             return false;
 
         if (isSubSkill)
@@ -461,6 +466,7 @@ public static class TmpFontInstaller
 
         var prevApplying = _applying;
         _applying = true;
+        UiStyleManager.BeginPresentation(text, content);
         try
         {
             var useSubSkillPresentation = UiHierarchyClassifier.ShouldUseSubSkillPresentation(text);
@@ -473,13 +479,19 @@ public static class TmpFontInstaller
         }
         finally
         {
-            _applying = prevApplying;
+            try { UiStyleManager.EndPresentation(); }
+            finally { _applying = prevApplying; }
         }
 
         if (UiHierarchyClassifier.IsUnderUiCanvas(text))
+        {
             UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, content, text);
+        }
         else
+        {
+            UiCanvasTranslationScanner.RecordObservedValue(instanceId, content);
             UiCanvasTranslationScanner.QueueActivationRefresh(text);
+        }
 
         if (SubSkillFontLoggedIds.Add(instanceId))
             Plugin.Log.LogInfo($"Applied TMP presentation to translated sub-skill: {UiHierarchyClassifier.GetHierarchyPath(text.transform)}");
@@ -510,6 +522,7 @@ public static class TmpFontInstaller
 
         var prevApplying = _applying;
         _applying = true;
+        UiStyleManager.BeginPresentation(text, content);
         try
         {
             ApplyTranslatedTmpText(text, content, useSubSkillPresentation: false);
@@ -523,13 +536,19 @@ public static class TmpFontInstaller
         }
         finally
         {
-            _applying = prevApplying;
+            try { UiStyleManager.EndPresentation(); }
+            finally { _applying = prevApplying; }
         }
 
         if (UiHierarchyClassifier.IsUnderUiCanvas(text))
+        {
             UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, content, text);
+        }
         else
+        {
+            UiCanvasTranslationScanner.RecordObservedValue(instanceId, content);
             UiCanvasTranslationScanner.QueueActivationRefresh(text);
+        }
     }
 
     internal static void ApplyUntranslatedCanvasPresentation(TMP_Text text, UiPathFlags flags, string pendingText)
@@ -1406,8 +1425,8 @@ public static class TmpFontInstaller
             EnableVertexGradient = text.enableVertexGradient;
             Gradient = text.colorGradient;
             GradientPreset = text.colorGradientPreset;
-            HasFaceColor = Material != null && Material.HasProperty("_FaceColor");
-            FaceColor = HasFaceColor ? Material.GetColor("_FaceColor") : default;
+            HasFaceColor = UiStyleManager.TryGetMaterialFaceColor(Material, out var faceColor);
+            FaceColor = faceColor;
         }
 
         public TMP_FontAsset Font { get; }
@@ -1429,11 +1448,8 @@ public static class TmpFontInstaller
 
         public bool TryGetFaceColor(out Color faceColor)
         {
-            if (Material != null && Material.HasProperty("_FaceColor"))
-            {
-                faceColor = Material.GetColor("_FaceColor");
+            if (UiStyleManager.TryGetMaterialFaceColor(Material, out faceColor))
                 return true;
-            }
             faceColor = FaceColor;
             return HasFaceColor;
         }
