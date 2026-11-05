@@ -1119,7 +1119,12 @@ public sealed class TranslationManager
         if (TryTranslateStoryBeforeParseSingle(snapshot, lookup, scene, allowCandidateInference, out translated, out var conflict, out uniqueScene))
             return true;
         if (conflict)
+        {
+            // Failed display-form lookups may overwrite the output with text
+            // stripped of UTAGE controls. A conflict must preserve the raw row.
+            translated = source;
             return false;
+        }
 
         if (TryTranslateConcatenatedStoryBeforeParse(snapshot, lookup, scene, allowCandidateInference, out translated, out uniqueScene))
         {
