@@ -23,6 +23,7 @@ public sealed class TranslationManager
     private readonly ModConfig _config;
     private readonly Dictionary<string, string> _names = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _uiTexts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _uiTextsStripped = new(StringComparer.Ordinal);
 
     // Two-generation cache: when primary reaches capacity, demote to secondary
     // instead of wiping all cached UI translations at once.
@@ -71,6 +72,15 @@ public sealed class TranslationManager
         public bool IsLoaded;
     }
 
+    private static readonly (string A, string B)[] UiStateSegmentPairs =
+    {
+        ("/On/", "/Off/"),
+        ("/Active/", "/Inactive/"),
+        ("/Select/", "/Unselect/"),
+        ("/Selected/", "/Unselected/"),
+        ("/Enable/", "/Disable/")
+    };
+
     private static readonly Regex ScenarioResourceIdPattern = new(
         @"^(?<base>\d+)[a-z]\d+_(?<kind>nml|r18)$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
@@ -83,6 +93,15 @@ public sealed class TranslationManager
         @"</?(?:interval|speed|sound)(?:=[^>]*)?>",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
     );
+    private static readonly Regex UiLayoutTagRegex = new(
+        @"</?(?:cspace|indent|line-indent|scale|pos|voffset|mspace|space|size)(?:=[^>]*)?>",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
+    );
+
+    private static string StripUiLayoutTags(string value) =>
+        string.IsNullOrEmpty(value) || value.IndexOf('<') < 0
+            ? value
+            : UiLayoutTagRegex.Replace(value, string.Empty);
 
     public TranslationManager(string pluginRoot, ModConfig config)
     {
@@ -114,6 +133,7 @@ public sealed class TranslationManager
         _nameExTemplates.Clear();
         _nameSceneTemplates.Clear();
         _uiTexts.Clear();
+        _uiTextsStripped.Clear();
         _uiPathTables.Clear();
         _uiPathTablesByLeaf.Clear();
         _uiNumberTemplates.Clear();
@@ -180,6 +200,12 @@ public sealed class TranslationManager
                             AddNumberTemplate(_uiNumberTemplates, pair.Key, pair.Value);
                             AddExTemplate(_uiExTemplates, pair.Key, pair.Value);
                         }
+                        var strippedKey = StripUiLayoutTags(pair.Key);
+                        if (!string.IsNullOrEmpty(strippedKey))
+                        {
+                            var strippedVal = StripUiLayoutTags(pair.Value);
+                            _uiTextsStripped.TryAdd(strippedKey, string.IsNullOrEmpty(strippedVal) ? pair.Value : strippedVal);
+                        }
                         AddKnownTranslationValue(pair.Value);
                         _knownUiTextTranslationValues.Add(pair.Value);
                     }
@@ -196,6 +222,12 @@ public sealed class TranslationManager
                         {
                             AddNumberTemplate(_uiNumberTemplates, pair.Key, pair.Value);
                             AddExTemplate(_uiExTemplates, pair.Key, pair.Value);
+                        }
+                        var strippedKey = StripUiLayoutTags(pair.Key);
+                        if (!string.IsNullOrEmpty(strippedKey))
+                        {
+                            var strippedVal = StripUiLayoutTags(pair.Value);
+                            _uiTextsStripped.TryAdd(strippedKey, string.IsNullOrEmpty(strippedVal) ? pair.Value : strippedVal);
                         }
                         AddKnownTranslationValue(pair.Value);
                         _knownUiTextTranslationValues.Add(pair.Value);
@@ -680,7 +712,21 @@ public sealed class TranslationManager
         bool hasNormalizedVariant,
         out string translated)
     {
+        var strippedSource = StripUiLayoutTags(source);
+        if (!string.IsNullOrEmpty(strippedSource) &&
+            (_uiTexts.TryGetValue(strippedSource, out translated) ||
+             _uiTextsStripped.TryGetValue(strippedSource, out translated)) &&
+            !string.IsNullOrEmpty(translated))
+        {
+            return true;
+        }
+
         if (TryTranslateNumberTemplate(source, _uiNumberTemplates, out translated))
+            return true;
+
+        if (!ReferenceEquals(strippedSource, source) &&
+            !string.IsNullOrEmpty(strippedSource) &&
+            TryTranslateNumberTemplate(strippedSource, _uiNumberTemplates, out translated))
             return true;
 
         if (TryTranslateExTemplate(source, _uiExTemplates, TryTranslateCapturedUiText, out translated))
@@ -730,15 +776,7 @@ public sealed class TranslationManager
         // Many toggle/tab buttons store their translation table under .../Off/Text or .../On/Text
         // depending on which state was active when F8 captured the snapshot. Fall back to the
         // opposite On/Off state path so button state switches always resolve the same table.
-        ReadOnlySpan<(string A, string B)> statePairs = stackalloc (string, string)[]
-        {
-            ("/On/", "/Off/"),
-            ("/Active/", "/Inactive/"),
-            ("/Select/", "/Unselect/"),
-            ("/Selected/", "/Unselected/"),
-            ("/Enable/", "/Disable/")
-        };
-        foreach (var (segA, segB) in statePairs)
+        foreach (var (segA, segB) in UiStateSegmentPairs)
         {
             if (normalizedPath.Contains(segA, StringComparison.OrdinalIgnoreCase))
             {
@@ -765,6 +803,14 @@ public sealed class TranslationManager
             if (!PathContainsSegmentSequence(normalizedPath, pathTable.Path))
                 continue;
             if (pathTable.Exact.TryGetValue(source, out var value) && !string.IsNullOrEmpty(value))
+            {
+                translated = value;
+                return true;
+            }
+            var stripped = StripUiLayoutTags(source);
+            if (!string.IsNullOrEmpty(stripped) &&
+                pathTable.ExactStripped.TryGetValue(stripped, out value) &&
+                !string.IsNullOrEmpty(value))
             {
                 translated = value;
                 return true;
@@ -2753,12 +2799,19 @@ public sealed class TranslationManager
         {
             Path = path;
             Exact = exact;
+            ExactStripped = new Dictionary<string, string>(StringComparer.Ordinal);
             NumberTemplates = new List<NumberTemplate>();
             ExTemplates = new List<ExTemplate>();
             foreach (var pair in exact)
             {
                 if (string.IsNullOrEmpty(pair.Value))
                     continue;
+                var strippedKey = StripUiLayoutTags(pair.Key);
+                if (!string.IsNullOrEmpty(strippedKey))
+                {
+                    var strippedVal = StripUiLayoutTags(pair.Value);
+                    ExactStripped.TryAdd(strippedKey, string.IsNullOrEmpty(strippedVal) ? pair.Value : strippedVal);
+                }
                 AddNumberTemplate(NumberTemplates, pair.Key, pair.Value);
                 AddExTemplate(ExTemplates, pair.Key, pair.Value);
             }
@@ -2768,6 +2821,7 @@ public sealed class TranslationManager
 
         public string Path { get; }
         public Dictionary<string, string> Exact { get; }
+        public Dictionary<string, string> ExactStripped { get; }
         public List<NumberTemplate> NumberTemplates { get; }
         public List<ExTemplate> ExTemplates { get; }
     }

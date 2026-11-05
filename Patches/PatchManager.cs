@@ -51,6 +51,7 @@ public static class PatchManager
         PatchStoryTextParserEntryPoints();
         PatchStorySceneEntryPoints();
         // Utage's full-screen history view uses this custom Text-derived control.
+        PatchTypeMethods("Utage.UguiNovelText", new[] { "set_text", "SetText", "UpdateText" });
         PatchTypeMethods("UguiNovelText", new[] { "set_text", "SetText", "UpdateText" });
         // The attach-ability window first stores the master-data description
         // through this method, then binds it to a TMP child. Translating here
@@ -65,17 +66,30 @@ public static class PatchManager
         PatchFontSetters("TMPro.TMP_Text");
         PatchFontSetters("UnityEngine.UI.Text");
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "set_fontSharedMaterial", "set_fontMaterial" });
-        // TMP_Text does not declare OnEnable(); TextMeshProUGUI overrides OnEnable() directly
-        // from MaskableGraphic. Patch TextMeshProUGUI.OnEnable so activating inactive On/Off
-        // tab or button labels immediately triggers translation.
         PatchTmpRefreshTriggers("TMPro.TMP_Text", new[] { "OnEnable" }, requestFastScan: true);
-        PatchTmpRefreshTriggers("TMPro.TextMeshProUGUI", new[] { "OnEnable" }, requestFastScan: true);
-        // Only patch OnTransformParentChanged (not OnCanvasHierarchyChanged, which Unity fires
-        // on every child whenever any ancestor container is enabled or disabled).
+        // TextMeshProUGUI declares OnEnable and OnCanvasHierarchyChanged (TMP_Text does not).
+        // When a tab/button toggles On/Off containers via SetActive(true), Unity invokes
+        // OnEnable and OnCanvasHierarchyChanged on the child TextMeshProUGUI.
+        PatchContextPostfixMethods(
+            "TMPro.TextMeshProUGUI",
+            new[] { "OnEnable", "OnCanvasHierarchyChanged" },
+            nameof(Hooks.OnCanvasHierarchyChanged));
         PatchContextPostfixMethods(
             "TMPro.TextMeshProUGUI",
             new[] { "OnTransformParentChanged" },
             nameof(Hooks.OnHierarchyChanged));
+        PatchContextPostfixMethods(
+            "UnityEngine.UI.Selectable",
+            new[] { "DoStateTransition", "OnPointerDown", "OnPointerUp", "OnSelect", "OnDeselect" },
+            nameof(Hooks.ApplyButtonState));
+        PatchContextPostfixMethods(
+            "UnityEngine.UI.Button",
+            new[] { "OnPointerClick" },
+            nameof(Hooks.ApplyButtonState));
+        PatchContextPostfixMethods(
+            "UnityEngine.UI.Toggle",
+            new[] { "OnPointerClick" },
+            nameof(Hooks.ApplyButtonState));
         // UTAGE 类型名和方法签名会随游戏版本变化；这些探针失败时只跳过，不阻止 TMP 补丁加载。
         foreach (var typeName in new[]
         {
@@ -287,6 +301,8 @@ public static class PatchManager
             "TMPro.TextMeshProUGUI" => typeof(TMPro.TextMeshProUGUI),
             "UnityEngine.UI.Text" => typeof(UnityEngine.UI.Text),
             "UnityEngine.UI.Selectable" => typeof(UnityEngine.UI.Selectable),
+            "UnityEngine.UI.Button" => typeof(UnityEngine.UI.Button),
+            "UnityEngine.UI.Toggle" => typeof(UnityEngine.UI.Toggle),
             "Utage.AdvScenarioData" => typeof(Utage.AdvScenarioData),
             "Utage.AdvCommand" => typeof(Utage.AdvCommand),
             "Utage.AdvCommandText" => typeof(Utage.AdvCommandText),
@@ -562,6 +578,19 @@ public static class PatchManager
             UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
 
+        public static void OnCanvasHierarchyChanged(object __instance)
+        {
+            if (UiStyleManager.IsApplying || TmpFontInstaller.IsApplying || UiCanvasTranslationScanner.IsApplying(__instance))
+                return;
+            if (__instance is not TMPro.TMP_Text tmpText || tmpText == null ||
+                tmpText.gameObject == null || !tmpText.gameObject.activeInHierarchy)
+                return;
+            if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(tmpText))
+                return;
+            UiStyleManager.MarkUnderlayDirty(tmpText.GetInstanceID());
+            UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
+        }
+
         public static void ApplyButtonState(object __instance) =>
             UiStyleManager.NotifySelectableStateChanged(__instance);
 
@@ -572,17 +601,7 @@ public static class PatchManager
             if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
             if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
             {
-                var instanceId = tmpText.GetInstanceID();
-                if (!TmpFontInstaller.IsTrackedTranslatedComponent(instanceId))
-                    return;
                 UiStyleManager.InvalidateInstanceStyle(tmpText);
-                if (tmpText.gameObject != null &&
-                    tmpText.gameObject.activeInHierarchy &&
-                    UiHierarchyClassifier.IsUnderUiCanvas(tmpText))
-                {
-                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
-                    return;
-                }
                 UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
                 return;
             }
@@ -597,17 +616,7 @@ public static class PatchManager
             if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
             if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
             {
-                var instanceId = tmpText.GetInstanceID();
-                if (!TmpFontInstaller.IsTrackedTranslatedComponent(instanceId))
-                    return;
                 UiStyleManager.InvalidateInstanceStyle(tmpText);
-                if (tmpText.gameObject != null &&
-                    tmpText.gameObject.activeInHierarchy &&
-                    UiHierarchyClassifier.IsUnderUiCanvas(tmpText))
-                {
-                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
-                    return;
-                }
                 UiCanvasTranslationScanner.QueueActivationRefresh(tmpText);
                 return;
             }
@@ -621,19 +630,9 @@ public static class PatchManager
             if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(__instance)) return;
             if (__instance is TMPro.TMP_Text tmpText && tmpText != null)
             {
-                var instanceId = tmpText.GetInstanceID();
-                if (SlotBindingCache.TryGetValue(instanceId, out var binding) &&
-                    !binding.IsTranslated &&
-                    !TmpFontInstaller.IsTrackedTranslatedComponent(instanceId))
+                if (tmpText.gameObject == null || !tmpText.gameObject.activeInHierarchy)
                     return;
-
-                if (tmpText.gameObject != null &&
-                    tmpText.gameObject.activeInHierarchy &&
-                    UiHierarchyClassifier.IsUnderUiCanvas(tmpText))
-                {
-                    UiCanvasTranslationScanner.ProcessTextImmediate(tmpText);
-                    return;
-                }
+                UiStyleManager.MarkUnderlayDirty(tmpText.GetInstanceID());
             }
             UiCanvasTranslationScanner.QueueActivationRefresh(__instance);
         }
@@ -698,6 +697,7 @@ public static class PatchManager
                     if (UiStyleManager.IsInstanceStyled(tmpInstance, instanceId))
                     {
                         __0 = slotBinding.Translated;
+                        UiStyleManager.MarkUnderlayDirty(instanceId);
                         return;
                     }
                 }
@@ -810,15 +810,7 @@ public static class PatchManager
 
             if (isTmpText)
             {
-                if (isUnderUiCanvas && !isUnformattedTemplate)
-                {
-                    TmpFontInstaller.ApplyUntranslatedCanvasPresentation(tmpInstance, flags, __0);
-                    UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, __0, tmpInstance);
-                }
-                else
-                {
-                    UiCanvasTranslationScanner.QueueActivationRefresh(tmpInstance);
-                }
+                UiCanvasTranslationScanner.QueueActivationRefresh(tmpInstance);
             }
         }
 

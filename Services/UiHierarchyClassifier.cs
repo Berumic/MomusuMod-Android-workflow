@@ -59,20 +59,29 @@ public static class UiHierarchyClassifier
             string normalizedPath,
             UiPathFlags flags,
             int validatedFrame,
-            Transform unparentedRoot = null)
+            Transform immediateParent,
+            Transform trackedNode,
+            Transform expectedTrackedParent)
         {
             FullPath = fullPath;
             NormalizedPath = normalizedPath;
             Flags = flags;
             ValidatedFrame = validatedFrame;
-            UnparentedRoot = unparentedRoot;
+            ImmediateParent = immediateParent;
+            TrackedNode = trackedNode;
+            ExpectedTrackedParent = expectedTrackedParent;
         }
 
         public string FullPath { get; }
         public string NormalizedPath { get; }
         public UiPathFlags Flags { get; }
         public int ValidatedFrame { get; }
-        public Transform UnparentedRoot { get; }
+        public Transform ImmediateParent { get; }
+        public Transform TrackedNode { get; }
+        public Transform ExpectedTrackedParent { get; }
+
+        public CachedHierarchyPath WithValidatedFrame(int frame) =>
+            new(FullPath, NormalizedPath, Flags, frame, ImmediateParent, TrackedNode, ExpectedTrackedParent);
     }
 
     public static void RegisterInternalLayer(GameObject layerObject, Component layerComponent)
@@ -267,25 +276,46 @@ public static class UiHierarchyClassifier
         return entry.FullPath ?? string.Empty;
     }
 
-    private static bool IsValidCachedEntry(in CachedHierarchyPath cached)
+    private static bool IsValidCachedEntry(in CachedHierarchyPath cached, Transform transform)
     {
-        if ((cached.Flags & UiPathFlags.HasCanvasAncestor) != 0)
-            return true;
-        return cached.UnparentedRoot != null && cached.UnparentedRoot.parent == null;
+        if (transform == null)
+            return false;
+
+        var isUnderUiCanvas = (cached.Flags & UiPathFlags.UnderUiCanvas) != 0;
+        if (!isUnderUiCanvas && cached.ValidatedFrame != Time.frameCount)
+            return false;
+
+        if (transform.parent != cached.ImmediateParent)
+            return false;
+
+        if (cached.TrackedNode != null && cached.TrackedNode.parent != cached.ExpectedTrackedParent)
+            return false;
+
+        return true;
     }
 
-    private static bool TryGetValidCachedPath(int instanceId, out CachedHierarchyPath cached)
+    private static bool TryGetValidCachedPath(int instanceId, Transform transform, out CachedHierarchyPath cached)
     {
+        var currentFrame = Time.frameCount;
         if (_primaryCache.TryGetValue(instanceId, out cached))
         {
-            if (IsValidCachedEntry(in cached))
+            if (IsValidCachedEntry(in cached, transform))
+            {
+                if (cached.ValidatedFrame != currentFrame)
+                {
+                    cached = cached.WithValidatedFrame(currentFrame);
+                    _primaryCache[instanceId] = cached;
+                }
                 return true;
+            }
             _primaryCache.Remove(instanceId);
         }
         else if (_secondaryCache.TryGetValue(instanceId, out cached))
         {
-            if (IsValidCachedEntry(in cached))
+            if (IsValidCachedEntry(in cached, transform))
             {
+                if (cached.ValidatedFrame != currentFrame)
+                    cached = cached.WithValidatedFrame(currentFrame);
                 PromoteOrInsert(instanceId, cached);
                 return true;
             }
@@ -302,13 +332,27 @@ public static class UiHierarchyClassifier
         return name.Replace("(Clone)", string.Empty, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsCanvasOrAdvRootName(string name) =>
+        !string.IsNullOrEmpty(name) &&
+        (string.Equals(name, "Canvas", StringComparison.OrdinalIgnoreCase) ||
+         name.StartsWith("UICanvas", StringComparison.OrdinalIgnoreCase) ||
+         string.Equals(name, "ExtraCanvas", StringComparison.OrdinalIgnoreCase) ||
+         string.Equals(name, "AdvEngine", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsMovableWindowContainerName(string parentName) =>
+        string.Equals(parentName, "WindowPageStockObject", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(parentName, "Page", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(parentName, "WindowState", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(parentName, "CanvasManagerContent", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(parentName, "Content", StringComparison.OrdinalIgnoreCase);
+
     private static CachedHierarchyPath GetOrCreateCachedPath(Transform transform)
     {
         if (transform == null)
             return default;
 
         var instanceId = transform.GetInstanceID();
-        if (TryGetValidCachedPath(instanceId, out var cached))
+        if (TryGetValidCachedPath(instanceId, transform, out var cached))
             return cached;
 
         try
@@ -320,7 +364,12 @@ public static class UiHierarchyClassifier
             for (var current = transform; current != null; current = current.parent)
             {
                 var currentId = current.GetInstanceID();
-                if (current != transform && TryGetValidCachedPath(currentId, out var ancestorCached))
+                // Never reuse a cached ancestor unless that ancestor is already under UICanvas;
+                // otherwise a pooled window moved out of WindowPageStockObject would inherit
+                // its stale WindowPageStockObject prefix from an intermediate ancestor.
+                if (current != transform &&
+                    TryGetValidCachedPath(currentId, current, out var ancestorCached) &&
+                    (ancestorCached.Flags & UiPathFlags.UnderUiCanvas) != 0)
                 {
                     baseCached = ancestorCached;
                     hasBaseCached = true;
@@ -339,22 +388,44 @@ public static class UiHierarchyClassifier
             var currentFrame = Time.frameCount;
             var fullPath = hasBaseCached ? baseCached.FullPath : string.Empty;
             var normalizedPath = hasBaseCached ? baseCached.NormalizedPath : string.Empty;
-            var topUnparentedRoot = hasBaseCached
-                ? baseCached.UnparentedRoot
+            var trackedNode = hasBaseCached
+                ? baseCached.TrackedNode
                 : (chain.Count > 0 ? chain[^1].Node : null);
+            var expectedTrackedParent = hasBaseCached
+                ? baseCached.ExpectedTrackedParent
+                : trackedNode?.parent;
             CachedHierarchyPath result = default;
 
             for (var i = chain.Count - 1; i >= 0; i--)
             {
                 var item = chain[i];
+                var parentNode = item.Node.parent;
+                var parentName = parentNode != null ? parentNode.name : null;
+                var isDirectChildOfStagingRoot =
+                    !hasBaseCached &&
+                    i == chain.Count - 2 &&
+                    !IsCanvasOrAdvRootName(chain[^1].Name);
+                if (isDirectChildOfStagingRoot ||
+                    (!string.IsNullOrEmpty(parentName) && IsMovableWindowContainerName(parentName)))
+                {
+                    trackedNode = item.Node;
+                    expectedTrackedParent = parentNode;
+                }
+
                 var normalizedLeaf = StripCloneSuffix(item.Name);
                 fullPath = string.IsNullOrEmpty(fullPath) ? item.Name : string.Concat(fullPath, "/", item.Name);
                 normalizedPath = string.IsNullOrEmpty(normalizedPath)
                     ? normalizedLeaf
                     : string.Concat(normalizedPath, "/", normalizedLeaf);
                 var flags = ComputeFlags(fullPath, item.Name);
-                var unparentedRoot = (flags & UiPathFlags.HasCanvasAncestor) != 0 ? null : topUnparentedRoot;
-                result = new CachedHierarchyPath(fullPath, normalizedPath, flags, currentFrame, unparentedRoot);
+                result = new CachedHierarchyPath(
+                    fullPath,
+                    normalizedPath,
+                    flags,
+                    currentFrame,
+                    parentNode,
+                    trackedNode,
+                    expectedTrackedParent);
                 PromoteOrInsert(item.Id, result);
             }
 
@@ -546,12 +617,12 @@ public static class UiHierarchyClassifier
 
     public static void InvalidateTransform(Transform transform)
     {
-        if (transform == null)
-            return;
-
-        var id = transform.GetInstanceID();
-        _primaryCache.Remove(id);
-        _secondaryCache.Remove(id);
+        for (var current = transform; current != null; current = current.parent)
+        {
+            var id = current.GetInstanceID();
+            _primaryCache.Remove(id);
+            _secondaryCache.Remove(id);
+        }
     }
 
     public static void ClearCache()

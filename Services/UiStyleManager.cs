@@ -17,6 +17,10 @@ namespace MonsterMusumeTDMod.Services;
 
 internal static class UiStyleManager
 {
+    private const int MaxNewUnderlaysPerFrame = 4;
+    private const int MaxPassiveUnderlayChecksPerFrame = 16;
+    private const int MaxUnderlayPoolCount = 192;
+
     private static readonly List<StyleRule> Rules = new();
     private static readonly Dictionary<string, StyleRule> ResolvedRulesByPath = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Regex ColorTagRegex = new(@"</?color(?:=[^>]*)?>", RegexOptions.IgnoreCase);
@@ -35,8 +39,14 @@ internal static class UiStyleManager
 
     // Sibling __MMTDUnderlay projection layers for explicit "underlay": true style rules.
     private static readonly Dictionary<int, UnderlayLayerState> UnderlayLayers = new();
+    private static readonly List<UnderlayLayerState> UnderlayStateSnapshot = new();
     private static readonly List<int> UnderlayCleanupBuffer = new();
+    private static readonly Stack<(GameObject Obj, RectTransform Rect, TextMeshProUGUI Text)> UnderlayPool = new();
     private static readonly Dictionary<int, (int ChildCount, TMP_Text[] Texts)> SelectableTextsCache = new();
+    private static Il2CppReferenceArray<Il2CppSystem.Type> _rectTransformTypeArray;
+    private static Transform _underlayPoolRoot;
+    private static int _lastUnderlaySyncFrame = -1;
+    private static int _underlayPollCursor;
 
     private static StyleValues _defaults = new();
     private static string _stylePath;
@@ -56,6 +66,7 @@ internal static class UiStyleManager
 
     private sealed class UnderlayLayerState
     {
+        public int SourceInstanceId;
         public TMP_Text SourceText;
         public GameObject UnderlayObject;
         public RectTransform UnderlayRect;
@@ -510,7 +521,7 @@ internal static class UiStyleManager
 
         if (useUnderlay)
         {
-            EnsureAndSyncUnderlayLayer(
+            ScheduleUnderlayLayer(
                 text,
                 instanceId,
                 materialFont,
@@ -697,7 +708,7 @@ internal static class UiStyleManager
         return material;
     }
 
-    private static void EnsureAndSyncUnderlayLayer(
+    private static void ScheduleUnderlayLayer(
         TMP_Text text,
         int instanceId,
         TMP_FontAsset materialFont,
@@ -712,7 +723,7 @@ internal static class UiStyleManager
         float underlayDilate,
         float underlaySoftness)
     {
-        if (text == null || text.gameObject == null || text.rectTransform == null || text.transform?.parent == null)
+        if (text == null)
             return;
 
         var tintedUnderlayColor = new Color(
@@ -757,57 +768,12 @@ internal static class UiStyleManager
             0f,
             outlineSoftness: underlaySoftness);
 
-        if (!UnderlayLayers.TryGetValue(instanceId, out var state) ||
-            state == null ||
-            state.UnderlayObject == null ||
-            state.UnderlayText == null)
+        if (!UnderlayLayers.TryGetValue(instanceId, out var state) || state == null)
         {
-            var underlayName = $"{text.gameObject.name}__MMTDUnderlay";
-            var existingTransform = text.transform.parent.Find(underlayName);
-            GameObject underlayObject;
-            if (existingTransform != null && existingTransform.gameObject != null)
-            {
-                underlayObject = existingTransform.gameObject;
-                UiHierarchyClassifier.RegisterInternalLayer(underlayObject, existingTransform);
-            }
-            else
-            {
-                underlayObject = new GameObject(
-                    underlayName,
-                    new Il2CppReferenceArray<Il2CppSystem.Type>(new[] { Il2CppType.Of<RectTransform>() }));
-                UiHierarchyClassifier.RegisterInternalLayer(underlayObject, underlayObject.transform);
-                underlayObject.SetActive(false);
-                underlayObject.transform.SetParent(text.transform.parent, worldPositionStays: false);
-            }
-
-            var layoutElement = underlayObject.GetComponent<LayoutElement>();
-            if (layoutElement == null)
-                layoutElement = underlayObject.AddComponent<LayoutElement>();
-            if (layoutElement != null)
-            {
-                layoutElement.ignoreLayout = true;
-                UiHierarchyClassifier.RegisterInternalLayer(underlayObject, layoutElement);
-            }
-
-            var underlayText = underlayObject.GetComponent<TextMeshProUGUI>();
-            if (underlayText == null)
-            {
-                if (underlayObject.activeSelf)
-                    underlayObject.SetActive(false);
-                underlayText = underlayObject.AddComponent<TextMeshProUGUI>();
-            }
-            if (underlayText == null)
-                return;
-
-            UiHierarchyClassifier.RegisterInternalLayer(underlayObject, underlayText);
-            underlayText.raycastTarget = false;
-
             state = new UnderlayLayerState
             {
+                SourceInstanceId = instanceId,
                 SourceText = text,
-                UnderlayObject = underlayObject,
-                UnderlayRect = underlayObject.GetComponent<RectTransform>(),
-                UnderlayText = underlayText,
                 Dirty = true
             };
             UnderlayLayers[instanceId] = state;
@@ -819,8 +785,104 @@ internal static class UiStyleManager
         state.OffsetX = underlayOffsetX;
         state.OffsetY = underlayOffsetY;
         state.Dirty = true;
+    }
 
-        SyncUnderlayState(state, force: true);
+    private static bool TryEnsureUnderlayObject(UnderlayLayerState state, ref int createdThisFrame)
+    {
+        if (state.UnderlayObject != null && state.UnderlayText != null)
+            return true;
+
+        var text = state.SourceText;
+        if (text == null || text.gameObject == null || text.rectTransform == null ||
+            text.transform?.parent == null ||
+            !text.gameObject.activeInHierarchy || !text.gameObject.activeSelf || !text.enabled ||
+            string.IsNullOrWhiteSpace(text.text))
+        {
+            return false;
+        }
+
+        while (UnderlayPool.Count > 0)
+        {
+            var pooled = UnderlayPool.Pop();
+            if (pooled.Obj == null || pooled.Text == null || pooled.Rect == null)
+                continue;
+
+            var previousApplyingPool = _applying;
+            _applying = true;
+            try
+            {
+                pooled.Obj.name = $"{text.gameObject.name}__MMTDUnderlay";
+                UiHierarchyClassifier.RegisterInternalLayer(pooled.Obj, pooled.Text);
+                pooled.Obj.transform.SetParent(text.transform.parent, worldPositionStays: false);
+                state.UnderlayObject = pooled.Obj;
+                state.UnderlayRect = pooled.Rect;
+                state.UnderlayText = pooled.Text;
+                state.Dirty = true;
+                return true;
+            }
+            finally
+            {
+                _applying = previousApplyingPool;
+            }
+        }
+
+        if (createdThisFrame >= MaxNewUnderlaysPerFrame)
+            return false;
+
+        createdThisFrame++;
+        var previousApplying = _applying;
+        _applying = true;
+        try
+        {
+            var underlayName = $"{text.gameObject.name}__MMTDUnderlay";
+            _rectTransformTypeArray ??= new Il2CppReferenceArray<Il2CppSystem.Type>(
+                new[] { Il2CppType.Of<RectTransform>() });
+
+            var underlayObject = new GameObject(underlayName, _rectTransformTypeArray);
+            UiHierarchyClassifier.RegisterInternalLayer(underlayObject, underlayObject.transform);
+            underlayObject.SetActive(false);
+
+            var layoutElement = underlayObject.AddComponent<LayoutElement>();
+            if (layoutElement != null)
+            {
+                layoutElement.ignoreLayout = true;
+                UiHierarchyClassifier.RegisterInternalLayer(underlayObject, layoutElement);
+            }
+
+            var underlayText = underlayObject.AddComponent<TextMeshProUGUI>();
+            if (underlayText == null)
+            {
+                UnityEngine.Object.Destroy(underlayObject);
+                return false;
+            }
+
+            UiHierarchyClassifier.RegisterInternalLayer(underlayObject, underlayText);
+            underlayText.raycastTarget = false;
+            underlayObject.transform.SetParent(text.transform.parent, worldPositionStays: false);
+
+            state.UnderlayObject = underlayObject;
+            state.UnderlayRect = underlayObject.GetComponent<RectTransform>();
+            state.UnderlayText = underlayText;
+            state.Dirty = true;
+            return true;
+        }
+        finally
+        {
+            _applying = previousApplying;
+        }
+    }
+
+    private static Transform GetOrCreatePoolRoot()
+    {
+        if (_underlayPoolRoot != null && _underlayPoolRoot.gameObject != null)
+            return _underlayPoolRoot;
+
+        var rootObj = new GameObject("__MMTDUnderlayPool");
+        UnityEngine.Object.DontDestroyOnLoad(rootObj);
+        rootObj.SetActive(false);
+        UiHierarchyClassifier.RegisterInternalLayer(rootObj, rootObj.transform);
+        _underlayPoolRoot = rootObj.transform;
+        return _underlayPoolRoot;
     }
 
     private static void DisableUnderlayLayer(int instanceId)
@@ -829,10 +891,36 @@ internal static class UiStyleManager
             return;
 
         UnderlayLayers.Remove(instanceId);
-        if (state.UnderlayObject != null)
+        if (state.UnderlayObject == null)
+            return;
+
+        var previousApplying = _applying;
+        _applying = true;
+        try
         {
+            if (state.UnderlayText != null && UnderlayPool.Count < MaxUnderlayPoolCount)
+            {
+                if (state.UnderlayObject.activeSelf)
+                    state.UnderlayObject.SetActive(false);
+                var poolRoot = GetOrCreatePoolRoot();
+                state.UnderlayObject.transform.SetParent(poolRoot, worldPositionStays: false);
+                UnderlayPool.Push((state.UnderlayObject, state.UnderlayRect, state.UnderlayText));
+                state.UnderlayObject = null;
+                state.UnderlayRect = null;
+                state.UnderlayText = null;
+                return;
+            }
+
             UiHierarchyClassifier.UnregisterInternalLayer(state.UnderlayObject, state.UnderlayText);
             UnityEngine.Object.Destroy(state.UnderlayObject);
+        }
+        catch
+        {
+            // Ignore teardown race during scene/window destruction.
+        }
+        finally
+        {
+            _applying = previousApplying;
         }
     }
 
@@ -855,6 +943,12 @@ internal static class UiStyleManager
         }
 
         var shouldBeActive = source.gameObject.activeInHierarchy && source.gameObject.activeSelf && source.enabled;
+        if (!shouldBeActive && !state.LastActive && !underlayObject.activeSelf)
+        {
+            state.Dirty = false;
+            return;
+        }
+
         var sourceRect = source.rectTransform;
         var anchoredPos = sourceRect != null ? sourceRect.anchoredPosition : Vector2.zero;
         var sizeDelta = sourceRect != null ? sourceRect.sizeDelta : Vector2.zero;
@@ -892,6 +986,13 @@ internal static class UiStyleManager
             state.LastAnchoredPosition = anchoredPos;
             state.LastSizeDelta = sizeDelta;
             state.LastSourceText = currentText;
+
+            if (!shouldBeActive)
+            {
+                if (underlayObject.activeSelf)
+                    underlayObject.SetActive(false);
+                return;
+            }
 
             var underlayTransform = underlayObject.transform;
             if (underlayTransform.parent != parent)
@@ -987,6 +1088,12 @@ internal static class UiStyleManager
 
     internal static bool HasUnderlay(int instanceId) => UnderlayLayers.ContainsKey(instanceId);
 
+    internal static void MarkUnderlayDirty(int instanceId)
+    {
+        if (instanceId != 0 && UnderlayLayers.TryGetValue(instanceId, out var state) && state != null)
+            state.Dirty = true;
+    }
+
     internal static bool IsInstanceStyled(int instanceId) => InstanceStyleKeys.ContainsKey(instanceId);
 
     internal static bool IsInstanceStyled(TMP_Text text, int instanceId) =>
@@ -997,31 +1104,55 @@ internal static class UiStyleManager
 
     internal static void NotifySelectableStateChanged(object instance)
     {
-        if (_applying || UnderlayLayers.Count == 0 ||
+        if (_applying ||
             instance is not Selectable selectable || selectable == null ||
-            selectable.gameObject == null || !selectable.gameObject.activeInHierarchy)
+            selectable.gameObject == null)
             return;
 
-        SyncAllUnderlayLayers();
+        var texts = GetOrCollectSelectableTexts(selectable);
+        if (texts == null || texts.Length == 0)
+            return;
+
+        for (var i = 0; i < texts.Length; i++)
+        {
+            var text = texts[i];
+            if (text != null)
+                MarkUnderlayDirty(text.GetInstanceID());
+        }
+        MonsterMusumeTDMod.Patches.UiCanvasTranslationScanner.NotifySelectableTransition(texts);
     }
 
     private static TMP_Text[] GetOrCollectSelectableTexts(Selectable selectable)
     {
-        var selectableId = selectable.GetInstanceID();
         var transform = selectable.transform;
-        var childCount = transform != null ? transform.childCount : 0;
-        if (!SelectableTextsCache.TryGetValue(selectableId, out var cached) ||
+        if (transform == null)
+            return Array.Empty<TMP_Text>();
+
+        // Many tab buttons place the Selectable inside .../Tab/Off or .../Tab/Off/Btn
+        // while the active state label sits under .../Tab/On/Text (or sibling tabs sit under TabGroup).
+        // Walk up 1-2 small containers so clicking Off also discovers On/Text and sibling tabs.
+        var scopeTransform = transform;
+        if (scopeTransform.parent != null && scopeTransform.parent.childCount <= 16)
+        {
+            scopeTransform = scopeTransform.parent;
+            if (scopeTransform.parent != null && scopeTransform.parent.childCount <= 16)
+                scopeTransform = scopeTransform.parent;
+        }
+
+        var scopeId = scopeTransform.GetInstanceID();
+        var childCount = scopeTransform.childCount;
+        if (!SelectableTextsCache.TryGetValue(scopeId, out var cached) ||
             cached.ChildCount != childCount ||
             cached.Texts == null)
         {
             if (SelectableTextsCache.Count > 512)
                 SelectableTextsCache.Clear();
-            var il2cppArray = selectable.GetComponentsInChildren<TMP_Text>(true);
+            var il2cppArray = scopeTransform.GetComponentsInChildren<TMP_Text>(true);
             var managedArray = new TMP_Text[il2cppArray.Length];
             for (var i = 0; i < il2cppArray.Length; i++)
                 managedArray[i] = il2cppArray[i];
             cached = (childCount, managedArray);
-            SelectableTextsCache[selectableId] = cached;
+            SelectableTextsCache[scopeId] = cached;
         }
         return cached.Texts;
     }
@@ -1047,8 +1178,8 @@ internal static class UiStyleManager
     {
         if (text == null || UnderlayLayers.Count == 0)
             return;
-        if (UnderlayLayers.TryGetValue(text.GetInstanceID(), out var state))
-            SyncUnderlayState(state, force: false);
+        if (UnderlayLayers.TryGetValue(text.GetInstanceID(), out var state) && state != null)
+            state.Dirty = true;
     }
 
     internal static void PrepareUnderlayForTextChange(object instance)
@@ -1065,20 +1196,49 @@ internal static class UiStyleManager
 
     internal static void SyncAllUnderlayLayers()
     {
-        if (UnderlayLayers.Count == 0)
+        if (UnderlayLayers.Count == 0 || _lastUnderlaySyncFrame == Time.frameCount)
             return;
+        _lastUnderlaySyncFrame = Time.frameCount;
 
         UnderlayCleanupBuffer.Clear();
+        UnderlayStateSnapshot.Clear();
+        var createdThisFrame = 0;
+
         foreach (var entry in UnderlayLayers)
         {
             var state = entry.Value;
-            if (state == null || state.SourceText == null || state.SourceText.gameObject == null ||
-                state.UnderlayObject == null || state.UnderlayText == null)
+            if (state == null || state.SourceText == null || state.SourceText.gameObject == null)
             {
                 UnderlayCleanupBuffer.Add(entry.Key);
                 continue;
             }
-            SyncUnderlayState(state, force: false);
+
+            if (state.UnderlayObject == null || state.UnderlayText == null)
+            {
+                if (!TryEnsureUnderlayObject(state, ref createdThisFrame))
+                    continue;
+            }
+
+            if (state.Dirty)
+            {
+                SyncUnderlayState(state, force: false);
+            }
+            else
+            {
+                UnderlayStateSnapshot.Add(state);
+            }
+        }
+
+        if (UnderlayStateSnapshot.Count > 0)
+        {
+            var count = Math.Min(UnderlayStateSnapshot.Count, MaxPassiveUnderlayChecksPerFrame);
+            for (var i = 0; i < count; i++)
+            {
+                if (_underlayPollCursor >= UnderlayStateSnapshot.Count)
+                    _underlayPollCursor = 0;
+                var state = UnderlayStateSnapshot[_underlayPollCursor++];
+                SyncUnderlayState(state, force: false);
+            }
         }
 
         for (var i = 0; i < UnderlayCleanupBuffer.Count; i++)

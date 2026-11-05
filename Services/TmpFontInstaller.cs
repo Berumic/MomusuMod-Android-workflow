@@ -426,7 +426,6 @@ public static class TmpFontInstaller
         var flags = UiHierarchyClassifier.GetFlags(text);
         if ((flags & UiPathFlags.UnderUiCanvas) == 0 ||
             !UiStyleManager.IsInstanceStyled(text, instanceId) ||
-            UiStyleManager.HasUnderlay(instanceId) ||
             !UiStyleManager.HasMatchingAppliedRule(text, instanceId) ||
             (flags & (UiPathFlags.UnitDetailFontOverride | UiPathFlags.CommonSortFilter)) != 0 ||
             ((flags & UiPathFlags.ShopOrPopupLayout) != 0 &&
@@ -438,6 +437,7 @@ public static class TmpFontInstaller
             if (!SubSkillTextInstanceIds.Contains(instanceId))
                 return false;
             SubSkillTranslatedValues[instanceId] = translated;
+            UiStyleManager.MarkUnderlayDirty(instanceId);
             UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, translated, text);
             return true;
         }
@@ -450,6 +450,7 @@ public static class TmpFontInstaller
         UiTextTranslatedValues[instanceId] = translated;
         if (!string.IsNullOrEmpty(source))
             UiTextSourceValues[instanceId] = source;
+        UiStyleManager.MarkUnderlayDirty(instanceId);
         UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, translated, text);
         return true;
     }
@@ -690,6 +691,11 @@ public static class TmpFontInstaller
         var instanceId = text.GetInstanceID();
         if (!SubSkillTextInstanceIds.Contains(instanceId))
             return;
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            return;
+        }
         SubSkillTextInstanceIds.Remove(instanceId);
 
         var prevApplying = _applying;
@@ -739,6 +745,11 @@ public static class TmpFontInstaller
         var instanceId = text.GetInstanceID();
         if (!UiTextInstanceIds.Contains(instanceId))
             return;
+        if (PatchManager.DeferringTmpPresentation)
+        {
+            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            return;
+        }
         UiTextInstanceIds.Remove(instanceId);
 
         var prevApplying = _applying;
