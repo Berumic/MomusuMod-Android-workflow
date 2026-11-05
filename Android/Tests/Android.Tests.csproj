@@ -11,7 +11,7 @@
     <Compile Include="..\..\Services\MaterialKeywords.cs" />
     <Compile Include="..\..\Services\UiRefreshQueue.cs;..\..\Services\UiStylePolicy.cs" />
     <Compile Include="..\..\Services\UiHierarchyClassifier.cs" />
-    <Compile Include="../../Services/StoryTranslationIndex.cs;../../Services/StorySceneContext.cs" />
+    <Compile Include="../../Services/StoryTranslationIndex.cs;../../Services/StorySceneContext.cs;../../Services/ScenarioContext.cs" />
     <Reference Include="Mono.Cecil" HintPath="$(AndroidWorkspace)\Loader\Mono.Cecil.dll" />
   </ItemGroup>
 </Project>

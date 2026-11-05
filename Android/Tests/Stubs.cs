@@ -2,6 +2,7 @@ namespace UnityEngine
 {
     public class Object
     {
+        public virtual string name { get; set; } = string.Empty;
         private static int _nextId;
         private readonly int _instanceId = ++_nextId;
         public int GetInstanceID() => _instanceId;
@@ -10,7 +11,6 @@ namespace UnityEngine
     {
         public Transform transform { get; set; }
         public GameObject gameObject { get; set; }
-        public string name { get; set; } = string.Empty;
         public T[] GetComponentsInChildren<T>(bool includeInactive = false) => System.Array.Empty<T>();
     }
     public class Transform : Component
@@ -20,7 +20,7 @@ namespace UnityEngine
     public class GameObject : Object
     {
         public Transform transform { get; } = new();
-        public string name { get => transform.name; set => transform.name = value; }
+        public override string name { get => transform.name; set => transform.name = value; }
         public bool activeInHierarchy { get; set; } = true;
     }
     public class Canvas : Component

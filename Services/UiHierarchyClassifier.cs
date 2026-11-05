@@ -60,6 +60,7 @@ public static class UiHierarchyClassifier
             UiPathFlags flags,
             int validatedFrame,
             Transform immediateParent,
+            Transform hierarchyRoot,
             Transform trackedNode,
             Transform expectedTrackedParent)
         {
@@ -68,6 +69,7 @@ public static class UiHierarchyClassifier
             Flags = flags;
             ValidatedFrame = validatedFrame;
             ImmediateParent = immediateParent;
+            HierarchyRoot = hierarchyRoot;
             TrackedNode = trackedNode;
             ExpectedTrackedParent = expectedTrackedParent;
         }
@@ -77,11 +79,12 @@ public static class UiHierarchyClassifier
         public UiPathFlags Flags { get; }
         public int ValidatedFrame { get; }
         public Transform ImmediateParent { get; }
+        public Transform HierarchyRoot { get; }
         public Transform TrackedNode { get; }
         public Transform ExpectedTrackedParent { get; }
 
         public CachedHierarchyPath WithValidatedFrame(int frame) =>
-            new(FullPath, NormalizedPath, Flags, frame, ImmediateParent, TrackedNode, ExpectedTrackedParent);
+            new(FullPath, NormalizedPath, Flags, frame, ImmediateParent, HierarchyRoot, TrackedNode, ExpectedTrackedParent);
     }
 
     public static void RegisterInternalLayer(GameObject layerObject, Component layerComponent)
@@ -288,6 +291,11 @@ public static class UiHierarchyClassifier
         if (transform.parent != cached.ImmediateParent)
             return false;
 
+        // A detached prefab can be parented while every descendant keeps its
+        // immediate/tracked parent. Its former top-level root must stay unparented.
+        if (cached.HierarchyRoot != null && cached.HierarchyRoot.parent != null)
+            return false;
+
         if (cached.TrackedNode != null && cached.TrackedNode.parent != cached.ExpectedTrackedParent)
             return false;
 
@@ -388,6 +396,9 @@ public static class UiHierarchyClassifier
             var currentFrame = Time.frameCount;
             var fullPath = hasBaseCached ? baseCached.FullPath : string.Empty;
             var normalizedPath = hasBaseCached ? baseCached.NormalizedPath : string.Empty;
+            var hierarchyRoot = hasBaseCached
+                ? baseCached.HierarchyRoot
+                : (chain.Count > 0 ? chain[^1].Node : null);
             var trackedNode = hasBaseCached
                 ? baseCached.TrackedNode
                 : (chain.Count > 0 ? chain[^1].Node : null);
@@ -424,6 +435,7 @@ public static class UiHierarchyClassifier
                     flags,
                     currentFrame,
                     parentNode,
+                    hierarchyRoot,
                     trackedNode,
                     expectedTrackedParent);
                 PromoteOrInsert(item.Id, result);

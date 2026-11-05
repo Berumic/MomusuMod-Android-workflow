@@ -86,6 +86,16 @@ try
     Check(UiHierarchyClassifier.GetHierarchyPath(unparentedLabel) == "UICanvas/Shop_SaleContent3(Clone)/Text" &&
           UiHierarchyClassifier.IsUnderUiCanvas(unparentedLabel),
         "Parenting an unparented prefab root automatically updates descendant cached paths");
+    var detachedWindow = new UnityEngine.Transform { name = "Window" };
+    var detachedContent = new UnityEngine.Transform { name = "Content", parent = detachedWindow };
+    var detachedItem = new UnityEngine.Transform { name = "Item", parent = detachedContent };
+    var detachedText = new UnityEngine.Transform { name = "Text", parent = detachedItem };
+    Check(UiHierarchyClassifier.GetHierarchyPath(detachedText) == "Window/Content/Item/Text",
+        "Nested detached prefab path is cached before parenting");
+    detachedWindow.parent = canvas;
+    Check(UiHierarchyClassifier.GetHierarchyPath(detachedText) == "UICanvas/Window/Content/Item/Text" &&
+          UiHierarchyClassifier.IsUnderUiCanvas(detachedText),
+        "Root parenting invalidates nested paths even when the tracked Content child stays in place");
     var internalLayer = new UnityEngine.GameObject { name = "Underlay" };
     var internalComponent = new UnityEngine.UI.Image { transform = internalLayer.transform };
     UiHierarchyClassifier.RegisterInternalLayer(internalLayer, internalComponent);
