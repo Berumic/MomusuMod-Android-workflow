@@ -7,14 +7,16 @@ namespace MonsterMusumeTDMod.Patches;
 
 public sealed class MosaicSuppressor : MonoBehaviour
 {
-    private const float ActiveScanIntervalSeconds = 0.5f;
-    private const float IdleScanIntervalSeconds = 1.5f;
+    private const float ActiveDiscoveryIntervalSeconds = 2.0f;
+    private const float StoryProbeIntervalSeconds = 0.75f;
+    private const float IdleScanIntervalSeconds = 4.0f;
 
     private static MosaicSuppressor _instance;
 
     private float _nextScanTime;
     private int _lastRenderFrame = -1;
     private bool _hasActiveR18Character;
+    private bool _cameraHookRegistered;
     private readonly HashSet<int> _detectedSpineMosaics = new();
     private readonly HashSet<int> _currentSpineMosaicIds = new();
     private readonly Dictionary<int, SpineMosaic> _activeSpineMosaics = new();
@@ -34,13 +36,7 @@ public sealed class MosaicSuppressor : MonoBehaviour
         if (_instance != null)
         {
             if (Time.unscaledTime >= _instance._nextScanTime)
-            {
-                _instance.ApplyToLoadedSpineMosaics();
-                var interval = _instance._activeSpineMosaics.Count > 0
-                    ? ActiveScanIntervalSeconds
-                    : IdleScanIntervalSeconds;
-                _instance._nextScanTime = Time.unscaledTime + interval;
-            }
+                _instance.RunScheduledScan();
             return _instance._hasActiveR18Character;
         }
 
@@ -52,7 +48,6 @@ public sealed class MosaicSuppressor : MonoBehaviour
         _instance = this;
         _preRenderCallback = (Camera.CameraCallback)(Action<Camera>)ApplyTransparentOverlaysBeforeRender;
         _nextScanTime = Time.unscaledTime + 1.2f;
-        Camera.onPreRender += _preRenderCallback;
     }
 
     public void OnDestroy()
@@ -60,8 +55,7 @@ public sealed class MosaicSuppressor : MonoBehaviour
         if (_instance == this)
             _instance = null;
 
-        if (_preRenderCallback != null)
-            Camera.onPreRender -= _preRenderCallback;
+        SetCameraHookRegistered(false);
 
         foreach (var material in _transparentOverlayMaterials.Values)
             if (material != null)
@@ -76,15 +70,74 @@ public sealed class MosaicSuppressor : MonoBehaviour
         }
     }
 
+    private void SetCameraHookRegistered(bool shouldRegister)
+    {
+        if (_cameraHookRegistered == shouldRegister || _preRenderCallback == null)
+            return;
+        _cameraHookRegistered = shouldRegister;
+        if (shouldRegister)
+            Camera.onPreRender += _preRenderCallback;
+        else
+            Camera.onPreRender -= _preRenderCallback;
+    }
+
     public void Update()
     {
         if (Time.unscaledTime < _nextScanTime)
             return;
 
+        RunScheduledScan();
+    }
+
+    private void RunScheduledScan()
+    {
+        // Fast-prune existing tracked SpineMosaics before deciding whether a full heap scan is needed.
+        if (_activeSpineMosaics.Count > 0)
+        {
+            _removedSpineMosaicIds.Clear();
+            var stillHasR18 = false;
+            foreach (var pair in _activeSpineMosaics)
+            {
+                var mosaic = pair.Value;
+                if (mosaic == null || mosaic.gameObject == null || !mosaic.gameObject.activeInHierarchy)
+                {
+                    _removedSpineMosaicIds.Add(pair.Key);
+                    continue;
+                }
+                var path = UiHierarchyClassifier.GetHierarchyPath(mosaic.transform);
+                if (!stillHasR18 &&
+                    (path.Contains("/layer_R18/", StringComparison.OrdinalIgnoreCase) ||
+                     path.Contains("/r18_scenes/", StringComparison.OrdinalIgnoreCase)))
+                {
+                    stillHasR18 = true;
+                }
+            }
+            for (var i = 0; i < _removedSpineMosaicIds.Count; i++)
+            {
+                var id = _removedSpineMosaicIds[i];
+                _activeSpineMosaics.Remove(id);
+                _cachedRenderers.Remove(id);
+            }
+
+            if (_activeSpineMosaics.Count > 0)
+            {
+                _hasActiveR18Character = stillHasR18;
+                SetCameraHookRegistered(true);
+                _nextScanTime = Time.unscaledTime + ActiveDiscoveryIntervalSeconds;
+                return;
+            }
+        }
+
         ApplyToLoadedSpineMosaics();
+        SetCameraHookRegistered(_activeSpineMosaics.Count > 0);
+
+        var isStoryContextActive =
+            !string.IsNullOrEmpty(StorySceneContext.EffectivePlaybackId) ||
+            !string.IsNullOrEmpty(ScenarioContext.CurrentId) ||
+            !string.IsNullOrEmpty(ScenarioContext.CurrentResourceId);
         var interval = _activeSpineMosaics.Count > 0
-            ? ActiveScanIntervalSeconds
-            : IdleScanIntervalSeconds;
+            ? ActiveDiscoveryIntervalSeconds
+            : (isStoryContextActive ? StoryProbeIntervalSeconds : IdleScanIntervalSeconds);
         _nextScanTime = Time.unscaledTime + interval;
     }
 

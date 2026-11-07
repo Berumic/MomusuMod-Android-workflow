@@ -23,6 +23,7 @@ public static class ScenarioContext
 
     public static void ClearResourceContext()
     {
+        Volatile.Write(ref _current, string.Empty);
         Volatile.Write(ref _resource, string.Empty);
     }
 

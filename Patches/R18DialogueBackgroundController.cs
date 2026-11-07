@@ -10,8 +10,9 @@ namespace MonsterMusumeTDMod.Patches;
 public sealed class R18DialogueBackgroundController : MonoBehaviour
 {
     private const float ScanIntervalSeconds = 0.1f;
-    private const float R18StateCacheSeconds = 0.25f;
-    private const float BackgroundDiscoverySeconds = 1f;
+    private const float IdleScanIntervalSeconds = 1.0f;
+    private const float R18StateCacheSeconds = 0.5f;
+    private const float BackgroundDiscoverySeconds = 1.5f;
     private const float PresentationDiscoverySeconds = 0.25f;
     private const int PresentationStablePassesRequired = 2;
 
@@ -45,6 +46,19 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
         if (Time.unscaledTime < _nextScanTime)
             return;
 
+        var hasStoryContext =
+            _isTransparent ||
+            _lastR18Scene ||
+            _forcePresentationRefresh ||
+            !string.IsNullOrEmpty(StorySceneContext.EffectivePlaybackId) ||
+            !string.IsNullOrEmpty(ScenarioContext.CurrentId) ||
+            !string.IsNullOrEmpty(ScenarioContext.CurrentResourceId);
+        if (!hasStoryContext)
+        {
+            _nextScanTime = Time.unscaledTime + IdleScanIntervalSeconds;
+            return;
+        }
+
         _nextScanTime = Time.unscaledTime + ScanIntervalSeconds;
         var isR18Scene = IsR18SceneActive();
         var forcePresentationRefresh = _forcePresentationRefresh;
@@ -69,7 +83,9 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
         var shouldHide = Core.Plugin.Settings.HideR18DialogueBackground.Value && isR18Scene;
         if (shouldHide)
         {
-            if (presentationStateChanged || Time.unscaledTime >= _nextBackgroundDiscoveryTime)
+            var hasValidCachedBackgrounds = HasValidHiddenBackgrounds();
+            if (presentationStateChanged ||
+                (!hasValidCachedBackgrounds && Time.unscaledTime >= _nextBackgroundDiscoveryTime))
             {
                 _nextBackgroundDiscoveryTime = Time.unscaledTime + BackgroundDiscoverySeconds;
                 HideBackgrounds();
@@ -107,6 +123,18 @@ public sealed class R18DialogueBackgroundController : MonoBehaviour
             RestoreButtonOutlines();
             RestoreStoryOutlines();
         }
+    }
+
+    private bool HasValidHiddenBackgrounds()
+    {
+        if (_originalColors.Count == 0)
+            return false;
+        foreach (var entry in _originalColors.Values)
+        {
+            if (entry.Graphic == null || entry.Graphic.gameObject == null || !entry.Graphic.gameObject.activeInHierarchy)
+                return false;
+        }
+        return true;
     }
 
     public void OnDestroy()
