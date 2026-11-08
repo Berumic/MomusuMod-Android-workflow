@@ -17,6 +17,9 @@ public sealed class ModConfig
     public ConfigEntry<bool> EnableUiSnapshotHotkey { get; }
     public ConfigEntry<bool> EnableUiPerformanceLog { get; }
     public ConfigEntry<bool> EnableSubSkillScanHotkey { get; }
+    public ConfigEntry<bool> EnableDownloadMonitor { get; }
+    public ConfigEntry<bool> DownloadMonitorOnlyBundles { get; }
+    public ConfigEntry<bool> SaveDownloadMonitorLog { get; }
     public ConfigEntry<string> Language { get; }
     public ConfigEntry<string> FontAssetPath { get; }
     public ConfigEntry<bool> EnableSpineMosaicReplacement { get; }
@@ -39,6 +42,21 @@ public sealed class ModConfig
         _config = config;
         EnableUiPerformanceLog = config.Bind("Debug", "EnableUiPerformanceLog", false,
             "每5秒记录UI刷新请求、合并数量和处理耗时，用于排查切页卡顿");
+        EnableDownloadMonitor = config.Bind(
+            "Debug",
+            "EnableDownloadMonitor",
+            true,
+            "监视游戏资源与网络下载请求，在后台输出下载消息与 URL 来源");
+        DownloadMonitorOnlyBundles = config.Bind(
+            "Debug",
+            "DownloadMonitorOnlyBundles",
+            false,
+            "仅输出资源包 (.bundle / /aas/ / /resources/) 下载请求，忽略普通 API 请求");
+        SaveDownloadMonitorLog = config.Bind(
+            "Debug",
+            "SaveDownloadMonitorLog",
+            true,
+            "将捕获到的下载请求同步追加写入插件目录下的 download_requests.log");
         Enabled = config.Bind("Translation", "Enabled", true, "启用运行时翻译");
         TranslateScenarios = config.Bind("Translation", "TranslateScenarios", true, "翻译剧情正文和剧情 Log");
         TranslateSubSkills = config.Bind("Translation", "TranslateSubSkills", true, "翻译副技能名称和说明");

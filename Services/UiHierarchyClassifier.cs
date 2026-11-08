@@ -61,6 +61,7 @@ public static class UiHierarchyClassifier
             int validatedFrame,
             Transform immediateParent,
             Transform hierarchyRoot,
+            Transform rootChildNode,
             Transform trackedNode,
             Transform expectedTrackedParent)
         {
@@ -70,6 +71,7 @@ public static class UiHierarchyClassifier
             ValidatedFrame = validatedFrame;
             ImmediateParent = immediateParent;
             HierarchyRoot = hierarchyRoot;
+            RootChildNode = rootChildNode;
             TrackedNode = trackedNode;
             ExpectedTrackedParent = expectedTrackedParent;
         }
@@ -80,11 +82,12 @@ public static class UiHierarchyClassifier
         public int ValidatedFrame { get; }
         public Transform ImmediateParent { get; }
         public Transform HierarchyRoot { get; }
+        public Transform RootChildNode { get; }
         public Transform TrackedNode { get; }
         public Transform ExpectedTrackedParent { get; }
 
         public CachedHierarchyPath WithValidatedFrame(int frame) =>
-            new(FullPath, NormalizedPath, Flags, frame, ImmediateParent, HierarchyRoot, TrackedNode, ExpectedTrackedParent);
+            new(FullPath, NormalizedPath, Flags, frame, ImmediateParent, HierarchyRoot, RootChildNode, TrackedNode, ExpectedTrackedParent);
     }
 
     public static void RegisterInternalLayer(GameObject layerObject, Component layerComponent)
@@ -187,6 +190,9 @@ public static class UiHierarchyClassifier
             }
         }
     }
+
+    public static bool IsKnownInternalLayerId(int instanceId) =>
+        InternalLayerIds.Count > 0 && InternalLayerIds.Contains(instanceId);
 
     public static bool IsUiTextSoftOutlineLayer(object component)
     {
@@ -296,6 +302,11 @@ public static class UiHierarchyClassifier
         if (cached.HierarchyRoot != null && cached.HierarchyRoot.parent != null)
             return false;
 
+        // If the hierarchy root was a staging container like WindowPageStockObject,
+        // its direct child must still be parented to that root.
+        if (cached.RootChildNode != null && cached.RootChildNode.parent != cached.HierarchyRoot)
+            return false;
+
         if (cached.TrackedNode != null && cached.TrackedNode.parent != cached.ExpectedTrackedParent)
             return false;
 
@@ -399,6 +410,9 @@ public static class UiHierarchyClassifier
             var hierarchyRoot = hasBaseCached
                 ? baseCached.HierarchyRoot
                 : (chain.Count > 0 ? chain[^1].Node : null);
+            var rootChildNode = hasBaseCached
+                ? baseCached.RootChildNode
+                : (chain.Count >= 2 ? chain[^2].Node : null);
             var trackedNode = hasBaseCached
                 ? baseCached.TrackedNode
                 : (chain.Count > 0 ? chain[^1].Node : null);
@@ -436,6 +450,7 @@ public static class UiHierarchyClassifier
                     currentFrame,
                     parentNode,
                     hierarchyRoot,
+                    rootChildNode,
                     trackedNode,
                     expectedTrackedParent);
                 PromoteOrInsert(item.Id, result);
@@ -482,15 +497,17 @@ public static class UiHierarchyClassifier
             flags |= UiPathFlags.HomeDeckSubSkillName;
 
         var isHomeDeckExSkill =
-            path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) &&
+            (path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) ||
+             path.Contains("Unit_DeckList", StringComparison.OrdinalIgnoreCase) ||
+             path.Contains("DeckUnitSlot", StringComparison.OrdinalIgnoreCase)) &&
             path.Contains("/ExSkillChangeButton/SkillName/", StringComparison.OrdinalIgnoreCase) &&
             path.EndsWith("/SkillNameText", StringComparison.OrdinalIgnoreCase);
         if (isHomeDeckExSkill)
             flags |= UiPathFlags.HomeDeckExSkillSlotName;
 
         var isQuestDungeonSkill =
-            path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase) &&
-            path.Contains("/Quest_Dungeon", StringComparison.OrdinalIgnoreCase) &&
+            (path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase) ||
+             path.Contains("Quest_Dungeon", StringComparison.OrdinalIgnoreCase)) &&
             path.Contains("/QuestContentDungeon", StringComparison.OrdinalIgnoreCase) &&
             (path.EndsWith("/Back/FeaturedSkillName", StringComparison.OrdinalIgnoreCase) ||
              path.EndsWith("/Back/UniqueSkillName", StringComparison.OrdinalIgnoreCase));
@@ -549,7 +566,9 @@ public static class UiHierarchyClassifier
         if (isSubSkillScroll ||
             isQuestDungeonSkill ||
             isEquippedAttach ||
-            (path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) &&
+            ((path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) ||
+              path.Contains("Unit_DeckList", StringComparison.OrdinalIgnoreCase) ||
+              path.Contains("DeckUnitSlot", StringComparison.OrdinalIgnoreCase)) &&
              path.Contains("ExSkillChangeButton/SkillName/", StringComparison.OrdinalIgnoreCase)))
         {
             flags |= UiPathFlags.ShouldUseSubSkillPresentation;
@@ -710,7 +729,9 @@ public static class UiHierarchyClassifier
     public static bool IsEquippedSubSkillAttachPath(string path) =>
         !string.IsNullOrEmpty(path) &&
         (path.Contains("Home_Deck", StringComparison.OrdinalIgnoreCase) ||
-         path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase)) &&
+         path.Contains("Home_Quest", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("Unit_DeckList", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("DeckUnitSlot", StringComparison.OrdinalIgnoreCase)) &&
         path.Contains("/AttachAbilityButton", StringComparison.OrdinalIgnoreCase);
 
     public static bool IsHomeDeckExSkillSlotName(Transform transform) =>

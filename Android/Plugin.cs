@@ -44,7 +44,7 @@ public sealed class Plugin : MelonMod
         _ = typeof(Il2CppUtage.TextData).Assembly;
         _ = typeof(Il2CppTMPro.TMP_Text).Assembly;
         _ = typeof(UnityEngine.UI.Text).Assembly;
-        PatchManager.Install(Translations, Settings);
+        PatchManager.Install(Translations, Settings, AndroidPaths.PluginPath);
         Log.LogInfo($"Android translations: {AndroidPaths.ModDirectory}");
     }
 

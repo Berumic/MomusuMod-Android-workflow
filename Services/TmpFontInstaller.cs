@@ -150,6 +150,8 @@ public static class TmpFontInstaller
             UiTextTranslatedValues.Remove(id);
             UiTextSourceValues.Remove(id);
             UiTextInstanceIds.Remove(id);
+            SubSkillTextInstanceIds.Remove(id);
+            SubSkillTranslatedValues.Remove(id);
             OriginalTranslatedTmpFonts.Remove(id);
         }
 
@@ -274,9 +276,6 @@ public static class TmpFontInstaller
 
     public static void ApplyToCurrentText(object component)
     {
-        // UiStyleManager deliberately assigns non-default fonts. The patched
-        // TMP font setter re-enters here; applying the default font during
-        // that callback would pair one font asset with another font's atlas.
         if (_applying || _applyingConfiguredUiStyle || UiStyleManager.IsApplying ||
             _loadedFont == null || component is not TMP_Text text)
             return;
@@ -299,57 +298,38 @@ public static class TmpFontInstaller
         var instanceId = text.GetInstanceID();
         if (StoryTextInstanceIds.Contains(instanceId))
         {
-            ApplyTo(text, text.text);
+            ApplyTo(text);
             return;
         }
 
-        if (SubSkillTranslatedValues.TryGetValue(instanceId, out var translated) &&
+        if ((UiTextTranslatedValues.TryGetValue(instanceId, out var translated) ||
+             SubSkillTranslatedValues.TryGetValue(instanceId, out translated)) &&
             string.Equals(text.text, translated, StringComparison.Ordinal))
         {
-            ApplyTo(text, text.text);
+            ApplyTo(text);
             if (UiHierarchyClassifier.ShouldUseSubSkillPresentation(text))
                 ApplySubSkillPresentationIfNeeded(text, isTranslatedOverride: true, pendingText: translated);
-            else if (UiHierarchyClassifier.IsUnderUiCanvas(text))
+            else
                 ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: translated);
             return;
         }
 
-        if (UiTextTranslatedValues.TryGetValue(instanceId, out translated) &&
-            string.Equals(text.text, translated, StringComparison.Ordinal))
-        {
-            ApplyTo(text, text.text);
-            ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: translated);
-            return;
-        }
-
-        // The game may restore a recycled TMP component's original font
-        // without assigning its text again. Do not depend on the previous
-        // registration surviving that rebind; the translated value itself is
-        // enough to restore the Alimama presentation.
         if (UiHierarchyClassifier.IsUnderUiCanvas(text) &&
             Plugin.Translations != null)
         {
-            if (!UiHierarchyClassifier.IsSubSkillText(text) &&
-                Plugin.Translations.IsKnownUiTextTranslationValue(text.text))
+            var currentText = text.text;
+            if (Plugin.Translations.IsKnownUiTextTranslationValue(currentText) ||
+                (Plugin.Settings?.TranslateSubSkills.Value == true &&
+                 Plugin.Translations.IsKnownSubSkillTranslationValue(currentText)))
             {
                 UiTextInstanceIds.Add(instanceId);
-                UiTextTranslatedValues[instanceId] = text.text;
+                UiTextTranslatedValues[instanceId] = currentText;
                 UiTextComponents[instanceId] = text;
-                ApplyTo(text, text.text);
-                ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: text.text);
-                return;
-            }
-
-            if (Plugin.Settings?.TranslateSubSkills.Value == true &&
-                Plugin.Translations.IsKnownSubSkillTranslationValue(text.text))
-            {
-                SubSkillTextInstanceIds.Add(instanceId);
-                SubSkillTranslatedValues[instanceId] = text.text;
-                ApplyTo(text, text.text);
+                ApplyTo(text);
                 if (UiHierarchyClassifier.ShouldUseSubSkillPresentation(text))
-                    ApplySubSkillPresentationIfNeeded(text, isTranslatedOverride: true, pendingText: text.text);
+                    ApplySubSkillPresentationIfNeeded(text, isTranslatedOverride: true, pendingText: currentText);
                 else
-                    ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: text.text);
+                    ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: currentText);
                 return;
             }
         }
@@ -360,21 +340,8 @@ public static class TmpFontInstaller
         UiTextTranslatedValues.Remove(instanceId);
     }
 
-    public static void ApplyToVisibleSubSkillText(TMP_Text text)
-    {
-        if (_loadedFont == null || text == null || text.transform == null ||
-            !UiHierarchyClassifier.IsSubSkillScrollText(text.transform) ||
-            Plugin.Translations == null ||
-            !Plugin.Translations.IsKnownSubSkillTranslationValue(text.text))
-            return;
-
-        var instanceId = text.GetInstanceID();
-        SubSkillTextInstanceIds.Add(instanceId);
-        SubSkillTranslatedValues[instanceId] = text.text;
-        ApplyTranslatedTmpText(text, text.text, useSubSkillPresentation: true);
-        if (SubSkillFontLoggedIds.Add(instanceId))
-            Plugin.Log.LogInfo($"Applied TMP font to sub-skill text: {UiHierarchyClassifier.GetHierarchyPath(text.transform)}");
-    }
+    public static void ApplyToVisibleSubSkillText(TMP_Text text) =>
+        ApplyToTranslatedUiText(text, text?.text);
 
     /// <summary>
     /// Applies the Chinese TMP font only to the card just rebound by the
@@ -402,17 +369,12 @@ public static class TmpFontInstaller
             if (text == null)
                 continue;
             var textId = text.GetInstanceID();
-            if (SubSkillTextInstanceIds.Contains(textId) && UiStyleManager.IsInstanceStyled(text, textId))
+            if (UiTextInstanceIds.Contains(textId) && UiStyleManager.IsInstanceStyled(text, textId))
                 continue;
-            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            UiCanvasTranslationScanner.QueueActivationRefreshById(textId, text);
         }
     }
 
-    /// <summary>
-    /// A sub-skill description can be rendered in many windows, not only the
-    /// attach-ability ScrollView. Mark the actual translation target so every
-    /// TMP instance receives the same line spacing, outline, and weight.
-    /// </summary>
     internal static bool TryFastCompleteTranslatedTmpText(
         object component,
         string translated,
@@ -432,21 +394,13 @@ public static class TmpFontInstaller
              !Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing)))
             return false;
 
-        if (isSubSkill)
-        {
-            if (!SubSkillTextInstanceIds.Contains(instanceId))
-                return false;
-            SubSkillTranslatedValues[instanceId] = translated;
-            UiStyleManager.MarkUnderlayDirty(instanceId);
-            UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, translated, text);
-            return true;
-        }
-
-        if (!UiTextInstanceIds.Contains(instanceId))
+        if (!UiTextInstanceIds.Contains(instanceId) && !SubSkillTextInstanceIds.Contains(instanceId))
             return false;
         if (translated.IndexOf('\n') >= 0 &&
             (!UiTextTranslatedValues.TryGetValue(instanceId, out var prevUi) || prevUi.IndexOf('\n') < 0))
             return false;
+
+        UiTextInstanceIds.Add(instanceId);
         UiTextTranslatedValues[instanceId] = translated;
         if (!string.IsNullOrEmpty(source))
             UiTextSourceValues[instanceId] = source;
@@ -455,53 +409,13 @@ public static class TmpFontInstaller
         return true;
     }
 
-    public static void ApplyToTranslatedSubSkillText(object component, string content)
-    {
-        if (_loadedFont == null || component is not TMP_Text text || text == null)
-            return;
+    public static void ApplyToTranslatedSubSkillText(object component, string content) =>
+        ApplyToTranslatedUiText(component, content);
 
-        var instanceId = text.GetInstanceID();
-        SubSkillTextInstanceIds.Add(instanceId);
-        SubSkillTranslatedValues[instanceId] = content;
-        CaptureOriginalPresentation(text);
-
-        var prevApplying = _applying;
-        _applying = true;
-        UiStyleManager.BeginPresentation(text, content);
-        try
-        {
-            var useSubSkillPresentation = UiHierarchyClassifier.ShouldUseSubSkillPresentation(text);
-            ApplyTranslatedTmpText(
-                text,
-                content,
-                useSubSkillPresentation: useSubSkillPresentation);
-            if (!useSubSkillPresentation)
-                ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: content);
-        }
-        finally
-        {
-            try { UiStyleManager.EndPresentation(); }
-            finally { _applying = prevApplying; }
-        }
-
-        if (UiHierarchyClassifier.IsUnderUiCanvas(text))
-        {
-            UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, content, text);
-        }
-        else
-        {
-            UiCanvasTranslationScanner.RecordObservedValue(instanceId, content);
-            UiCanvasTranslationScanner.QueueActivationRefresh(text);
-        }
-
-        if (SubSkillFontLoggedIds.Add(instanceId))
-            Plugin.Log.LogInfo($"Applied TMP presentation to translated sub-skill: {UiHierarchyClassifier.GetHierarchyPath(text.transform)}");
-    }
-
-    /// <summary>Marks a translated UICanvas label so a recycled TMP component keeps its Chinese font.</summary>
+    /// <summary>Unified presentation handler for all translated UI and sub-skill TMP components.</summary>
     public static void ApplyToTranslatedUiText(object component, string content, string source = null)
     {
-        if (_loadedFont == null || component is not TMP_Text text || text == null)
+        if (_loadedFont == null || component is not TMP_Text text || text == null || string.IsNullOrEmpty(content))
             return;
         if (UiHierarchyClassifier.IsUiTextSoftOutlineLayer(text) ||
             UiHierarchyClassifier.IsUiTranslationExcluded(text))
@@ -526,14 +440,16 @@ public static class TmpFontInstaller
         UiStyleManager.BeginPresentation(text, content);
         try
         {
-            ApplyTranslatedTmpText(text, content, useSubSkillPresentation: false);
-            if (content.Contains('\n') &&
+            var useSubSkillPresentation = UiHierarchyClassifier.ShouldUseSubSkillPresentation(text);
+            ApplyTranslatedTmpText(text, content, useSubSkillPresentation: useSubSkillPresentation);
+            if (!useSubSkillPresentation &&
+                content.Contains('\n') &&
                 !Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing))
             {
                 text.lineSpacing = SubSkillMinimumLineSpacing;
-                text.SetAllDirty();
             }
-            ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: content);
+            if (!useSubSkillPresentation)
+                ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: content);
         }
         finally
         {
@@ -541,6 +457,7 @@ public static class TmpFontInstaller
             finally { _applying = prevApplying; }
         }
 
+        UiStyleManager.MarkUnderlayDirty(instanceId);
         if (UiHierarchyClassifier.IsUnderUiCanvas(text))
         {
             UiCanvasTranslationScanner.RecordFastProcessedText(instanceId, content, text);
@@ -548,7 +465,7 @@ public static class TmpFontInstaller
         else
         {
             UiCanvasTranslationScanner.RecordObservedValue(instanceId, content);
-            UiCanvasTranslationScanner.QueueActivationRefresh(text);
+            UiCanvasTranslationScanner.QueueActivationRefreshById(instanceId, text);
         }
     }
 
@@ -561,6 +478,12 @@ public static class TmpFontInstaller
         {
             return;
         }
+
+        var candidateText = pendingText ?? text.text;
+        // Never replace the font on untranslated Japanese text (containing non-ASCII characters not in alimama),
+        // which would otherwise trigger expensive TMP fallback searches and TMP_SubMeshUI allocations.
+        if (!Supports(candidateText))
+            return;
 
         var prevApplying = _applying;
         _applying = true;
@@ -630,14 +553,12 @@ public static class TmpFontInstaller
             UiTextSourceValues.Remove(instanceId);
             UiTextTranslatedValues.Remove(instanceId);
             UiTextInstanceIds.Remove(instanceId);
+            SubSkillTextInstanceIds.Remove(instanceId);
+            SubSkillTranslatedValues.Remove(instanceId);
         }
         foreach (var text in textsToRestore)
             RestoreTranslatedUiText(text);
 
-        // A newly opened detail panel may have been populated before its TMP
-        // setter saw the final UICanvas hierarchy, so it is not in
-        // UiTextComponents yet. Include every visible UICanvas TMP in F6's
-        // retry pass so first-entry path translations can be applied directly.
         foreach (var text in FindActiveTmpTexts())
         {
             if (text == null || text.gameObject == null ||
@@ -673,7 +594,8 @@ public static class TmpFontInstaller
         foreach (var text in FindActiveTmpTexts())
         {
             if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
-                !SubSkillTextInstanceIds.Contains(text.GetInstanceID()))
+                (!SubSkillTextInstanceIds.Contains(text.GetInstanceID()) &&
+                 !UiHierarchyClassifier.ShouldUseSubSkillPresentation(text)))
                 continue;
 
             UiCanvasTranslationScanner.QueueActivationRefresh(text);
@@ -683,19 +605,23 @@ public static class TmpFontInstaller
         return refreshed;
     }
 
-    public static void RestoreTranslatedSubSkillText(object component)
+    public static void RestoreTranslatedSubSkillText(object component) =>
+        RestoreTranslatedUiText(component);
+
+    public static void RestoreTranslatedUiText(object component)
     {
         if (component is not TMP_Text text || text == null)
             return;
 
         var instanceId = text.GetInstanceID();
-        if (!SubSkillTextInstanceIds.Contains(instanceId))
+        if (!UiTextInstanceIds.Contains(instanceId) && !SubSkillTextInstanceIds.Contains(instanceId))
             return;
         if (PatchManager.DeferringTmpPresentation)
         {
             UiCanvasTranslationScanner.QueueActivationRefresh(text);
             return;
         }
+        UiTextInstanceIds.Remove(instanceId);
         SubSkillTextInstanceIds.Remove(instanceId);
 
         var prevApplying = _applying;
@@ -703,7 +629,11 @@ public static class TmpFontInstaller
         try
         {
             UiStyleManager.ReleasePresentation(text);
+            UiTextTranslatedValues.Remove(instanceId);
             SubSkillTranslatedValues.Remove(instanceId);
+            UiTextSourceValues.Remove(instanceId);
+            UiTextComponents.Remove(instanceId);
+
             if (UiHierarchyClassifier.IsUnitDetailFontOverride(text))
             {
                 OriginalTranslatedTmpFonts.Remove(instanceId);
@@ -737,97 +667,11 @@ public static class TmpFontInstaller
         }
     }
 
-    public static void RestoreTranslatedUiText(object component)
-    {
-        if (component is not TMP_Text text || text == null)
-            return;
-
-        var instanceId = text.GetInstanceID();
-        if (!UiTextInstanceIds.Contains(instanceId))
-            return;
-        if (PatchManager.DeferringTmpPresentation)
-        {
-            UiCanvasTranslationScanner.QueueActivationRefresh(text);
-            return;
-        }
-        UiTextInstanceIds.Remove(instanceId);
-
-        var prevApplying = _applying;
-        _applying = true;
-        try
-        {
-            UiStyleManager.ReleasePresentation(text);
-            UiTextTranslatedValues.Remove(instanceId);
-            UiTextSourceValues.Remove(instanceId);
-            UiTextComponents.Remove(instanceId);
-
-            if (UiHierarchyClassifier.IsUnitDetailFontOverride(text))
-            {
-                OriginalTranslatedTmpFonts.Remove(instanceId);
-                ApplyUnitDetailFont(text, isTranslatedOverride: false);
-                return;
-            }
-
-            if (SubSkillTextInstanceIds.Contains(instanceId) ||
-                !OriginalTranslatedTmpFonts.TryGetValue(instanceId, out var original))
-                return;
-
-            OriginalTranslatedTmpFonts.Remove(instanceId);
-            var changed = false;
-            if (original.Font != null && text.font != original.Font)
-            {
-                text.font = original.Font;
-                changed = true;
-            }
-            if (original.Material != null && text.fontSharedMaterial != original.Material)
-            {
-                text.fontSharedMaterial = original.Material;
-                text.UpdateMeshPadding();
-                changed = true;
-            }
-            original.RestoreVertexColors(text);
-            if (changed)
-                text.SetAllDirty();
-        }
-        finally
-        {
-            _applying = prevApplying;
-        }
-    }
-
-    /// <summary>
-    /// Runs after TMP has accepted a text assignment. Some skill windows set
-    /// their default font while rebinding a card, after the translation prefix
-    /// has already run. Match the final visible value instead of retaining a
-    /// window-specific component marker.
-    /// </summary>
     public static void ReapplyTranslatedSubSkillText(object component)
     {
         if (_loadedFont == null || component is not TMP_Text text)
             return;
-
-        var instanceId = text.GetInstanceID();
-        var visibleText = text.text;
-        var isMappedValue = SubSkillTranslatedValues.TryGetValue(instanceId, out var mappedValue) &&
-                            string.Equals(visibleText, mappedValue, StringComparison.Ordinal);
-        var isKnownValue = Plugin.Translations != null &&
-                           Plugin.Translations.IsKnownSubSkillTranslationValue(visibleText);
-        if (!isMappedValue && !isKnownValue)
-        {
-            SubSkillTextInstanceIds.Remove(instanceId);
-            SubSkillTranslatedValues.Remove(instanceId);
-            return;
-        }
-
-        SubSkillTextInstanceIds.Add(instanceId);
-        SubSkillTranslatedValues[instanceId] = visibleText;
-        var useSubSkillPresentation = UiHierarchyClassifier.ShouldUseSubSkillPresentation(text);
-        ApplyTranslatedTmpText(
-            text,
-            visibleText,
-            useSubSkillPresentation: useSubSkillPresentation);
-        if (!useSubSkillPresentation && UiHierarchyClassifier.IsUnderUiCanvas(text))
-            ApplyUiTextPresentation(text, isTranslatedOverride: true, pendingText: visibleText);
+        ApplyToTranslatedUiText(text, text.text);
     }
 
     /// <summary>Applies a loaded path style immediately after UI hierarchy events.</summary>
@@ -869,9 +713,13 @@ public static class TmpFontInstaller
             !UiHierarchyClassifier.IsUnitDetailFontOverride(text))
             return;
 
+        var currentText = pendingText ?? text.text;
+        var isTranslated = isTranslatedOverride ?? IsTextTranslated(text, currentText);
+        if (!isTranslated && !Supports(currentText))
+            return;
+
         CaptureOriginalPresentation(text);
 
-        var currentText = pendingText ?? text.text;
         var compact = UiHierarchyClassifier.IsUnitDetailNoOutlineText(text);
         var requiresSpacing = UiHierarchyClassifier.IsUnitDetailFixedSpacingText(text) ||
                               (!string.IsNullOrEmpty(currentText) && currentText.Contains('\n'));
@@ -886,11 +734,11 @@ public static class TmpFontInstaller
                 dilate,
                 UiTextOutlineColor,
                 spacing,
-                !compact))
+                !compact,
+                isTranslated: true))
             return;
 
         EnsureUnitDetailMaterials();
-        var isTranslated = isTranslatedOverride ?? IsTextTranslated(text, currentText);
         UiStyleManager.BeginPresentation(text, currentText);
         try
         {
@@ -901,13 +749,14 @@ public static class TmpFontInstaller
                 dilate,
                 UiTextOutlineColor,
                 spacing,
-                !compact);
+                !compact,
+                isTranslated: true);
             UiStyleManager.Apply(
                 text,
                 width,
                 dilate,
                 _loadedFont,
-                isTranslated,
+                isTranslated: true,
                 currentText);
         }
         finally
@@ -1297,18 +1146,11 @@ public static class TmpFontInstaller
             return;
 
         var id = text.GetInstanceID();
-        if (!OriginalTranslatedTmpFonts.ContainsKey(id))
-        {
-            UiStyleManager.ObserveGameMaterial(text);
-            OriginalTranslatedTmpFonts[id] = new TmpPresentationState(text);
+        if (OriginalTranslatedTmpFonts.ContainsKey(id))
             return;
-        }
 
-        if (text.font != null && !IsModFont(text.font))
-        {
-            UiStyleManager.ObserveGameMaterial(text);
-            OriginalTranslatedTmpFonts[id] = new TmpPresentationState(text);
-        }
+        UiStyleManager.ObserveGameMaterial(text);
+        OriginalTranslatedTmpFonts[id] = new TmpPresentationState(text);
     }
 
     private static void ApplyTranslatedTmpText(TMP_Text source, string content, bool useSubSkillPresentation)
@@ -1341,13 +1183,6 @@ public static class TmpFontInstaller
         {
             _applying = prevApplying;
         }
-    }
-
-    private static bool ApplyTo(TMP_Text text, string content)
-    {
-        if (!Supports(content))
-            return false;
-        return ApplyTo(text);
     }
 
     private static bool ApplyTo(TMP_Text text)
@@ -1394,7 +1229,7 @@ public static class TmpFontInstaller
                 changed = true;
             }
 
-            if (changed)
+            if (changed && !PatchManager.DeferringTmpPresentation)
                 text.SetAllDirty();
             return changed;
         }
@@ -1414,8 +1249,12 @@ public static class TmpFontInstaller
 
     internal static TMP_FontAsset ResolveStyleFont(string name, TMP_FontAsset fallback, bool isTranslated = false)
     {
+        // Never replace the game's Japanese font on untranslated labels, which would otherwise
+        // fail glyph lookups on Japanese kana/kanji and allocate fallback TMP_SubMeshUI objects.
+        if (!isTranslated)
+            return null;
         if (string.IsNullOrWhiteSpace(name))
-            return isTranslated ? (_loadedFont ?? fallback) : null;
+            return _loadedFont ?? fallback;
         if (string.Equals(name, "alimama", StringComparison.OrdinalIgnoreCase))
             return _loadedFont ?? fallback;
         if (LoadedFonts.TryGetValue(name.Trim(), out var font) && font != null)
@@ -1434,8 +1273,16 @@ public static class TmpFontInstaller
             Material = text.fontSharedMaterial;
             Color = text.color;
             EnableVertexGradient = text.enableVertexGradient;
-            Gradient = text.colorGradient;
-            GradientPreset = text.colorGradientPreset;
+            if (EnableVertexGradient)
+            {
+                Gradient = text.colorGradient;
+                GradientPreset = text.colorGradientPreset;
+            }
+            else
+            {
+                Gradient = default;
+                GradientPreset = null;
+            }
             HasFaceColor = UiStyleManager.TryGetMaterialFaceColor(Material, out var faceColor);
             FaceColor = faceColor;
         }
@@ -1453,8 +1300,11 @@ public static class TmpFontInstaller
         {
             text.color = Color;
             text.enableVertexGradient = EnableVertexGradient;
-            text.colorGradientPreset = GradientPreset;
-            text.colorGradient = Gradient;
+            if (EnableVertexGradient)
+            {
+                text.colorGradientPreset = GradientPreset;
+                text.colorGradient = Gradient;
+            }
         }
 
         public bool TryGetFaceColor(out Color faceColor)
@@ -1580,19 +1430,18 @@ public static class TmpFontInstaller
         if (UiHierarchyClassifier.IsHomeDeckExSkillSlotName(text.transform) ||
             UiHierarchyClassifier.IsQuestDungeonSkillName(text.transform))
         {
-            ApplyForcedTmpTextPresentation(text, useSubSkillPresentation: true);
+            if (Supports(text.text))
+                ApplyForcedTmpTextPresentation(text, useSubSkillPresentation: true);
             return;
         }
 
         if (!UiHierarchyClassifier.IsHomeDeckSubSkillName(text.transform) ||
             Plugin.Translations == null ||
-            !Plugin.Translations.IsKnownSubSkillTranslationValue(text.text))
+            (!Plugin.Translations.IsKnownSubSkillTranslationValue(text.text) &&
+             !Plugin.Translations.IsKnownUiTextTranslationValue(text.text)))
             return;
 
-        var instanceId = text.GetInstanceID();
-        SubSkillTextInstanceIds.Add(instanceId);
-        SubSkillTranslatedValues[instanceId] = text.text;
-        ApplyTranslatedTmpText(text, text.text, useSubSkillPresentation: true);
+        ApplyToTranslatedUiText(text, text.text);
     }
 
     private static float GetUiTextOutlineWidth() => Mathf.Clamp(
@@ -1613,7 +1462,8 @@ public static class TmpFontInstaller
         if (!Mathf.Approximately(text.lineSpacing, SubSkillMinimumLineSpacing))
         {
             text.lineSpacing = SubSkillMinimumLineSpacing;
-            text.SetAllDirty();
+            if (!PatchManager.DeferringTmpPresentation)
+                text.SetAllDirty();
         }
     }
 

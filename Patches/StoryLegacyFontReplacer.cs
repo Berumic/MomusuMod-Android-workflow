@@ -8,8 +8,8 @@ namespace MonsterMusumeTDMod.Patches;
 
 public sealed class StoryLegacyFontReplacer : MonoBehaviour
 {
-    private const float ScanIntervalSeconds = 0.1f;
-    private const float FallbackDiscoveryIntervalSeconds = 2.5f;
+    private const float ScanIntervalSeconds = 0.05f;
+    private const float ActiveDiscoveryIntervalSeconds = 0.5f;
     private const float IdleDiscoveryIntervalSeconds = 1.5f;
 
     private static StoryLegacyFontReplacer _instance;
@@ -49,18 +49,6 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
         if (Time.unscaledTime < _nextScanTime)
             return;
 
-        for (var index = _storyTexts.Count - 1; index >= 0; index--)
-        {
-            var text = _storyTexts[index];
-            if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
-                !UiHierarchyClassifier.IsStoryMessageText(text))
-            {
-                if (text != null)
-                    _storyTextIds.Remove(text.GetInstanceID());
-                _storyTexts.RemoveAt(index);
-            }
-        }
-
         var isStoryActive = _storyTexts.Count > 0 ||
                             !string.IsNullOrEmpty(StorySceneContext.EffectivePlaybackId) ||
                             !string.IsNullOrEmpty(ScenarioContext.CurrentId) ||
@@ -72,13 +60,10 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
         }
 
         _nextScanTime = Time.unscaledTime + ScanIntervalSeconds;
-
-        // Only fall back to a global Text scan when a story scene is active but no
-        // story Text component has been registered via NotifyStoryTextActive yet.
-        if (_storyTexts.Count == 0 && Time.unscaledTime >= _nextDiscoveryTime)
+        if (Time.unscaledTime >= _nextDiscoveryTime)
         {
             RefreshStoryTextTargets();
-            _nextDiscoveryTime = Time.unscaledTime + FallbackDiscoveryIntervalSeconds;
+            _nextDiscoveryTime = Time.unscaledTime + ActiveDiscoveryIntervalSeconds;
         }
 
         if (_storyTexts.Count == 0)
@@ -88,7 +73,16 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
         for (var index = _storyTexts.Count - 1; index >= 0; index--)
         {
             var text = _storyTexts[index];
-            if (text != null && text.enabled)
+            if (text == null || text.gameObject == null || !text.gameObject.activeInHierarchy ||
+                !UiHierarchyClassifier.IsStoryMessageText(text))
+            {
+                if (text != null)
+                    _storyTextIds.Remove(text.GetInstanceID());
+                _storyTexts.RemoveAt(index);
+                continue;
+            }
+
+            if (text.enabled)
                 PatchManager.ProcessDiscoveredLegacyText(text);
         }
     }

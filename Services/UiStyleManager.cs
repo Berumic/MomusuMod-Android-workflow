@@ -17,7 +17,7 @@ namespace MonsterMusumeTDMod.Services;
 
 internal static class UiStyleManager
 {
-    private const int MaxNewUnderlaysPerFrame = 4;
+    private const int MaxNewUnderlaysPerFrame = 12;
     private const int MaxPassiveUnderlayChecksPerFrame = 16;
     private const int MaxUnderlayPoolCount = 192;
 
@@ -47,6 +47,7 @@ internal static class UiStyleManager
     private static Transform _underlayPoolRoot;
     private static int _lastUnderlaySyncFrame = -1;
     private static int _underlayPollCursor;
+    private static bool _hasDirtyUnderlays;
 
     private static StyleValues _defaults = new();
     private static string _stylePath;
@@ -66,7 +67,6 @@ internal static class UiStyleManager
 
     private sealed class UnderlayLayerState
     {
-        public int SourceInstanceId;
         public TMP_Text SourceText;
         public GameObject UnderlayObject;
         public RectTransform UnderlayRect;
@@ -294,6 +294,16 @@ internal static class UiStyleManager
 
     public static void Reload()
     {
+        if (UnderlayLayers.Count > 0)
+        {
+            UnderlayCleanupBuffer.Clear();
+            foreach (var key in UnderlayLayers.Keys)
+                UnderlayCleanupBuffer.Add(key);
+            for (var i = 0; i < UnderlayCleanupBuffer.Count; i++)
+                DisableUnderlayLayer(UnderlayCleanupBuffer[i]);
+            UnderlayCleanupBuffer.Clear();
+        }
+
         foreach (var material in SharedMaterials.Values)
         {
             if (material != null)
@@ -427,13 +437,21 @@ internal static class UiStyleManager
             TmpFontInstaller.CaptureOriginalPresentation(text);
             var originalColor = text.color;
             var originalGradientEnabled = text.enableVertexGradient;
-            var originalGradient = text.colorGradient;
-            var originalGradientPreset = text.colorGradientPreset;
-            text.font = selectedFont;
-            text.color = originalColor;
-            text.enableVertexGradient = originalGradientEnabled;
-            text.colorGradientPreset = originalGradientPreset;
-            text.colorGradient = originalGradient;
+            if (originalGradientEnabled)
+            {
+                var originalGradient = text.colorGradient;
+                var originalGradientPreset = text.colorGradientPreset;
+                text.font = selectedFont;
+                text.color = originalColor;
+                text.enableVertexGradient = true;
+                text.colorGradientPreset = originalGradientPreset;
+                text.colorGradient = originalGradient;
+            }
+            else
+            {
+                text.font = selectedFont;
+                text.color = originalColor;
+            }
             changed = true;
         }
 
@@ -541,7 +559,7 @@ internal static class UiStyleManager
             DisableUnderlayLayer(instanceId);
         }
 
-        if (changed)
+        if (changed && !MonsterMusumeTDMod.Patches.PatchManager.DeferringTmpPresentation)
             text.SetAllDirty();
         return true;
     }
@@ -772,7 +790,6 @@ internal static class UiStyleManager
         {
             state = new UnderlayLayerState
             {
-                SourceInstanceId = instanceId,
                 SourceText = text,
                 Dirty = true
             };
@@ -785,6 +802,11 @@ internal static class UiStyleManager
         state.OffsetX = underlayOffsetX;
         state.OffsetY = underlayOffsetY;
         state.Dirty = true;
+        _hasDirtyUnderlays = true;
+
+        var createdThisFrame = 0;
+        if (TryEnsureUnderlayObject(state, ref createdThisFrame))
+            SyncUnderlayState(state, force: true);
     }
 
     private static bool TryEnsureUnderlayObject(UnderlayLayerState state, ref int createdThisFrame)
@@ -795,11 +817,16 @@ internal static class UiStyleManager
         var text = state.SourceText;
         if (text == null || text.gameObject == null || text.rectTransform == null ||
             text.transform?.parent == null ||
-            !text.gameObject.activeInHierarchy || !text.gameObject.activeSelf || !text.enabled ||
-            string.IsNullOrWhiteSpace(text.text))
+            !text.gameObject.activeInHierarchy || !text.gameObject.activeSelf || !text.enabled)
         {
             return false;
         }
+
+        var currentText = (_pendingTextOverride != null && text == _activePresentationText)
+            ? _pendingTextOverride
+            : text.text;
+        if (string.IsNullOrWhiteSpace(currentText))
+            return false;
 
         while (UnderlayPool.Count > 0)
         {
@@ -979,7 +1006,10 @@ internal static class UiStyleManager
         _applying = true;
         try
         {
-            state.Dirty = false;
+            var deferring = MonsterMusumeTDMod.Patches.PatchManager.DeferringTmpPresentation;
+            state.Dirty = deferring;
+            if (deferring)
+                _hasDirtyUnderlays = true;
             state.LastActive = shouldBeActive;
             state.LastAlpha = currentAlpha;
             state.LastFontSize = currentFontSize;
@@ -1091,16 +1121,35 @@ internal static class UiStyleManager
     internal static void MarkUnderlayDirty(int instanceId)
     {
         if (instanceId != 0 && UnderlayLayers.TryGetValue(instanceId, out var state) && state != null)
+        {
             state.Dirty = true;
+            _hasDirtyUnderlays = true;
+        }
     }
 
     internal static bool IsInstanceStyled(int instanceId) => InstanceStyleKeys.ContainsKey(instanceId);
 
-    internal static bool IsInstanceStyled(TMP_Text text, int instanceId) =>
-        text != null &&
-        InstanceStyleKeys.ContainsKey(instanceId) &&
-        TmpFontInstaller.IsModFont(text.font) &&
-        IsModMaterial(text.fontSharedMaterial);
+    internal static bool IsInstanceStyled(TMP_Text text, int instanceId)
+    {
+        if (text == null ||
+            !InstanceStyleKeys.ContainsKey(instanceId) ||
+            !TmpFontInstaller.IsModFont(text.font) ||
+            !IsModMaterial(text.fontSharedMaterial))
+        {
+            return false;
+        }
+
+        if (UnderlayLayers.TryGetValue(instanceId, out var underlayState) && underlayState != null)
+        {
+            if (underlayState.UnderlayObject == null || underlayState.UnderlayText == null)
+            {
+                underlayState.Dirty = true;
+                _hasDirtyUnderlays = true;
+            }
+        }
+
+        return true;
+    }
 
     internal static void NotifySelectableStateChanged(object instance)
     {
@@ -1179,7 +1228,10 @@ internal static class UiStyleManager
         if (text == null || UnderlayLayers.Count == 0)
             return;
         if (UnderlayLayers.TryGetValue(text.GetInstanceID(), out var state) && state != null)
+        {
             state.Dirty = true;
+            _hasDirtyUnderlays = true;
+        }
     }
 
     internal static void PrepareUnderlayForTextChange(object instance)
@@ -1191,14 +1243,22 @@ internal static class UiStyleManager
             state != null)
         {
             state.Dirty = true;
+            _hasDirtyUnderlays = true;
         }
     }
 
     internal static void SyncAllUnderlayLayers()
     {
-        if (UnderlayLayers.Count == 0 || _lastUnderlaySyncFrame == Time.frameCount)
+        if (UnderlayLayers.Count == 0)
             return;
-        _lastUnderlaySyncFrame = Time.frameCount;
+
+        var currentFrame = Time.frameCount;
+        var isNewFrame = _lastUnderlaySyncFrame != currentFrame;
+        if (!isNewFrame && !_hasDirtyUnderlays)
+            return;
+
+        _lastUnderlaySyncFrame = currentFrame;
+        _hasDirtyUnderlays = false;
 
         UnderlayCleanupBuffer.Clear();
         UnderlayStateSnapshot.Clear();
@@ -1216,20 +1276,23 @@ internal static class UiStyleManager
             if (state.UnderlayObject == null || state.UnderlayText == null)
             {
                 if (!TryEnsureUnderlayObject(state, ref createdThisFrame))
+                {
+                    _hasDirtyUnderlays = true;
                     continue;
+                }
             }
 
             if (state.Dirty)
             {
                 SyncUnderlayState(state, force: false);
             }
-            else
+            else if (isNewFrame)
             {
                 UnderlayStateSnapshot.Add(state);
             }
         }
 
-        if (UnderlayStateSnapshot.Count > 0)
+        if (isNewFrame && UnderlayStateSnapshot.Count > 0)
         {
             var count = Math.Min(UnderlayStateSnapshot.Count, MaxPassiveUnderlayChecksPerFrame);
             for (var i = 0; i < count; i++)
