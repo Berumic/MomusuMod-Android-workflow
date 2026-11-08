@@ -1,24 +1,11 @@
 # 如果你需要下载安装包
 1. 在release中寻找latest
 2. 下载 monmusutdx-vxxx-mod-xxx.apk 并安装
-3. 每天北京时间 15:05 自动从 DMM 下载 FANZA 原版并检查是否需要构建，也可手动触发。
 
 需要注意的是安卓版在各种ui界面性能比较差，推荐保留原版，这边只用来看剧情。
 
-## 每日自动下载 FANZA APK
+*本项目为vibe产物
 
-下载前先通过 HEAD 读取 DMM 的 ETag、文件长度和服务端文件版本标识，未变化且命中 Actions 缓存时复用原版 APK，不再从 DMM 重复下载。APK 的 versionCode 仍由 aapt 读取；HTTP 文件标识不是游戏版本号。首次运行、缓存被清理或文件变化时重新下载。HEAD 失败或缺少可靠标识时安全回退到下载。插件与翻译更新不会因为原版未变而被跳过。缓存命中仍需从 GitHub 恢复缓存，工具链也仍按原流程获取。
-
-默认分支工作流每天 15:05（北京时间，UTC 07:05）从 `https://dl-app.games.dmm.com/android/jp.co.dmm.fanzagames.monmusutdx` 下载，跟随 HTTPS 重定向并保存为 `input.apk`，无需下载地址或原文件名包含 `.apk` 后缀。下载失败自动重试，下载结果检查 APK 结构，再由现有步骤校验包名并读取 versionCode。
-
-继续使用现有签名 Secrets 和 `build-tools-v1`。APK、插件、构建配方或翻译指纹变化时才构建并发布 `mod-monmusutdx-v<versionCode>`；完全相同时跳过。新产物沿用 Latest 发布规则。GitHub 定时任务可能排队延迟，只有默认分支中的工作流参与定时运行。
-
-想立即测试：Actions → Build Mod APK → Run workflow，勾选 `download_from_dmm`，保留 `publish_release`。无需填写源 Release 标签或附件名；直链模式会忽略这两项。不勾选则保留原有 Release 上传模式。直链下载需要 GitHub Runner 能访问 DMM；本地成功不代表 Runner 网络一定可用。
-
-
-# MonsterMusumeTD Android 自动打包
-
-上传原版游戏 APK 到 GitHub Release，工作流生成包含 LemonLoader、汉化插件、字体和最新翻译的独立包名 APK。支持与原版共存，使用 GitHub 托管 Windows runner，无需本地电脑一直开机，也不需要 DMM 下载接口。
 
 ## 独立包名与发布标签
 
