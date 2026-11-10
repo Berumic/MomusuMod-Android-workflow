@@ -33,6 +33,8 @@ internal static class UiStyleManager
     private static readonly Dictionary<int, StyleRule> InstanceAppliedRules = new();
     private static readonly HashSet<int> ModMaterialIds = new();
     private static readonly Dictionary<int, Material> OriginalGameMaterials = new();
+    private static readonly Dictionary<int, string> OriginalGameFontNames = new();
+    private static readonly Dictionary<int, StyleValues> GameMaterialStyleCache = new();
     private static readonly Dictionary<int, Color> MaterialBaseFaceColors = new();
     private static readonly Dictionary<int, (int Frame, bool HasProp, Color Color)> MaterialFaceColorFrameCache = new();
     private static readonly Dictionary<int, Color> PreStyleVertexColors = new();
@@ -196,24 +198,58 @@ internal static class UiStyleManager
         var id = text.GetInstanceID();
         InstanceStyleKeys.Remove(id);
         InstanceAppliedRules.Remove(id);
-        var material = text.fontSharedMaterial;
-        if (material != null && !IsModMaterial(material))
-            OriginalGameMaterials[id] = material;
+        ObserveGameMaterial(text);
     }
 
     internal static void ObserveGameMaterial(TMP_Text text)
     {
         if (text == null)
             return;
+        var id = text.GetInstanceID();
+        var font = text.font;
+        if (font != null && !TmpFontInstaller.IsModFont(font) && !string.IsNullOrEmpty(font.name))
+            OriginalGameFontNames[id] = font.name;
         var material = text.fontSharedMaterial;
         if (material != null && !IsModMaterial(material))
-            OriginalGameMaterials[text.GetInstanceID()] = material;
+            OriginalGameMaterials[id] = material;
     }
 
-    private static void ObserveGameMaterial(Material material, int instanceId)
+    private static void ObserveGameMaterial(TMP_Text text, Material material, int instanceId)
     {
+        if (text != null)
+        {
+            var font = text.font;
+            if (font != null && !TmpFontInstaller.IsModFont(font) && !string.IsNullOrEmpty(font.name))
+                OriginalGameFontNames[instanceId] = font.name;
+        }
         if (material != null && !IsModMaterial(material))
             OriginalGameMaterials[instanceId] = material;
+    }
+
+    internal static bool IsKurokaneInstance(TMP_Text text)
+    {
+        if (text == null)
+            return false;
+        var id = text.GetInstanceID();
+        if (OriginalGameFontNames.TryGetValue(id, out var origFontName) &&
+            origFontName.Contains("Kurokane", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (OriginalGameMaterials.TryGetValue(id, out var origMat) &&
+            origMat != null &&
+            origMat.name != null &&
+            origMat.name.Contains("Kurokane", StringComparison.OrdinalIgnoreCase))
+            return true;
+        var currentFont = text.font;
+        if (currentFont != null && !TmpFontInstaller.IsModFont(currentFont) &&
+            currentFont.name != null &&
+            currentFont.name.Contains("Kurokane", StringComparison.OrdinalIgnoreCase))
+            return true;
+        var currentMat = text.fontSharedMaterial;
+        if (currentMat != null && !IsModMaterial(currentMat) &&
+            currentMat.name != null &&
+            currentMat.name.Contains("Kurokane", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return false;
     }
 
     internal static bool SubmitBaseline(TMP_Text text, TMP_FontAsset font, float width,
@@ -315,6 +351,7 @@ internal static class UiStyleManager
         SharedMaterials.Clear();
         InstanceStyleKeys.Clear();
         InstanceAppliedRules.Clear();
+        GameMaterialStyleCache.Clear();
         MaterialBaseFaceColors.Clear();
         MaterialFaceColorFrameCache.Clear();
         SelectableTextsCache.Clear();
@@ -402,19 +439,62 @@ internal static class UiStyleManager
         if (text?.transform == null)
             return false;
 
-        var path = UiHierarchyClassifier.GetNormalizedHierarchyPath(text.transform);
-        var matched = ResolveRuleForPath(path);
-        var values = UiStylePolicy.Resolve(matched?.Values, _defaults, _resolvedBaseline, isTranslated);
-        if (values == null)
+        var instanceId = text.GetInstanceID();
+        var originalMaterial = text.fontSharedMaterial;
+        ObserveGameMaterial(text, originalMaterial, instanceId);
+
+        if (!isTranslated &&
+            !TmpFontInstaller.IsModFont(text.font) &&
+            originalMaterial != null &&
+            !IsModMaterial(originalMaterial))
         {
             if (UnderlayLayers.Count > 0)
-                DisableUnderlayLayer(text.GetInstanceID());
+                DisableUnderlayLayer(instanceId);
             return false;
         }
 
-        var instanceId = text.GetInstanceID();
-        var originalMaterial = text.fontSharedMaterial;
-        ObserveGameMaterial(originalMaterial, instanceId);
+        var baseline = _resolvedBaseline;
+        StyleValues inherited = null;
+        if (Core.Plugin.Settings?.InheritGameFontStyle.Value != false)
+        {
+            inherited = GetOrExtractGameMaterialStyle(
+                text,
+                instanceId,
+                originalMaterial,
+                alimamaFont,
+                baseline?.LineSpacing);
+            if (inherited != null)
+                baseline = inherited;
+        }
+
+        var path = UiHierarchyClassifier.GetNormalizedHierarchyPath(text.transform);
+        var matched = ResolveRuleForPath(path);
+        var values = UiStylePolicy.Resolve(matched?.Values, _defaults, baseline, isTranslated);
+        if (values == null)
+        {
+            if (UnderlayLayers.Count > 0)
+                DisableUnderlayLayer(instanceId);
+            return false;
+        }
+
+        if (inherited != null)
+        {
+            values.Font = inherited.Font;
+            values.FontColor = null;
+            values.Outline = inherited.Outline;
+            values.OutlineWidth = inherited.OutlineWidth;
+            values.OutlineColor = inherited.OutlineColor;
+            values.FaceDilate = inherited.FaceDilate;
+            values.Underlay = inherited.Underlay;
+            if (inherited.Underlay == true)
+            {
+                values.UnderlayColor = inherited.UnderlayColor;
+                values.UnderlayOffsetX = inherited.UnderlayOffsetX;
+                values.UnderlayOffsetY = inherited.UnderlayOffsetY;
+                values.UnderlayDilate = inherited.UnderlayDilate;
+                values.UnderlaySoftness = inherited.UnderlaySoftness;
+            }
+        }
 
         var fontColor = values.FontColor;
         var outlineColor = values.OutlineColor ?? new Color32(0x54, 0x4A, 0x4A, 255);
@@ -562,6 +642,96 @@ internal static class UiStyleManager
         if (changed && !MonsterMusumeTDMod.Patches.PatchManager.DeferringTmpPresentation)
             text.SetAllDirty();
         return true;
+    }
+
+    private static StyleValues GetOrExtractGameMaterialStyle(
+        TMP_Text text,
+        int instanceId,
+        Material currentMaterial,
+        TMP_FontAsset defaultFont,
+        float? defaultLineSpacing)
+    {
+        var isKurokane = IsKurokaneInstance(text);
+        var targetFontName = isKurokane ? "FZKane" : defaultFont?.name;
+
+        Material gameMaterial = null;
+        if (instanceId != 0)
+            OriginalGameMaterials.TryGetValue(instanceId, out gameMaterial);
+        if (gameMaterial == null && currentMaterial != null && !IsModMaterial(currentMaterial))
+            gameMaterial = currentMaterial;
+        if (gameMaterial == null)
+            return null;
+
+        var matId = gameMaterial.GetInstanceID();
+        if (!GameMaterialStyleCache.TryGetValue(matId, out var cached))
+        {
+            var rawOutlineWidth = gameMaterial.HasProperty("_OutlineWidth")
+                ? gameMaterial.GetFloat("_OutlineWidth")
+                : 0f;
+            Color rawOutlineColor = gameMaterial.HasProperty("_OutlineColor")
+                ? gameMaterial.GetColor("_OutlineColor")
+                : (Color)new Color32(0x54, 0x4A, 0x4A, 255);
+            // In Unity 2022.3 Il2Cpp, TextMeshPro/Mobile/Distance Field uses local shader keywords
+            // so HasShaderKeyword("OUTLINE_ON") is false on all original game materials.
+            // Whether an original material has an outline is determined directly by _OutlineWidth > 0.001f.
+            var hasOutline = rawOutlineWidth > 0.001f && rawOutlineColor.a > 0.001f;
+
+            var rawFaceDilate = gameMaterial.HasProperty("_FaceDilate")
+                ? gameMaterial.GetFloat("_FaceDilate")
+                : 0f;
+
+            // Duplicated materials like FOT-KurokaneStd-EBAll SDF2 (used on サブスキル / EXスキル)
+            // have _OutlineWidth = 0 (no outline, no underlay) but retain serialized _UnderlayOffsetY
+            // values from the base material. Only outlined Kurokane materials use drop-shadow underlay.
+            var matIsKurokane = gameMaterial.name != null &&
+                                gameMaterial.name.Contains("Kurokane", StringComparison.OrdinalIgnoreCase);
+            var hasUnderlay = hasOutline &&
+                              (matIsKurokane ||
+                               gameMaterial.HasShaderKeyword("UNDERLAY_ON") ||
+                               gameMaterial.HasShaderKeyword("UNDERLAY_INNER"));
+
+            Color rawUnderlayColor = new Color32(0x26, 0x21, 0x1F, 255);
+            if (hasUnderlay && gameMaterial.HasProperty("_UnderlayColor"))
+            {
+                var matUnderlayColor = gameMaterial.GetColor("_UnderlayColor");
+                if (matUnderlayColor.a > 0.001f)
+                    rawUnderlayColor = matUnderlayColor;
+            }
+
+            cached = new StyleValues
+            {
+                Outline = hasOutline,
+                OutlineWidth = hasOutline ? rawOutlineWidth : 0f,
+                OutlineColor = rawOutlineColor,
+                FaceDilate = rawFaceDilate,
+                Underlay = hasUnderlay,
+                UnderlayColor = rawUnderlayColor,
+                UnderlayOffsetX = 0.05f,
+                UnderlayOffsetY = -0.4f,
+                UnderlayDilate = 0f,
+                UnderlaySoftness = 0f
+            };
+            if (GameMaterialStyleCache.Count >= 512)
+                GameMaterialStyleCache.Clear();
+            GameMaterialStyleCache[matId] = cached;
+        }
+
+        var useKurokaneUnderlay = !(cached.Underlay ?? false) && isKurokane && (cached.Outline ?? false);
+        return new StyleValues
+        {
+            Font = targetFontName,
+            LineSpacing = defaultLineSpacing,
+            Outline = cached.Outline,
+            OutlineWidth = cached.OutlineWidth,
+            OutlineColor = cached.OutlineColor,
+            FaceDilate = cached.FaceDilate,
+            Underlay = useKurokaneUnderlay ? true : cached.Underlay,
+            UnderlayColor = useKurokaneUnderlay ? (Color)new Color32(0x26, 0x21, 0x1F, 255) : cached.UnderlayColor,
+            UnderlayOffsetX = useKurokaneUnderlay ? 0.05f : cached.UnderlayOffsetX,
+            UnderlayOffsetY = useKurokaneUnderlay ? -0.4f : cached.UnderlayOffsetY,
+            UnderlayDilate = 0f,
+            UnderlaySoftness = useKurokaneUnderlay ? 0f : cached.UnderlaySoftness
+        };
     }
 
     private static StyleRule ResolveRuleForPath(string path)
@@ -751,7 +921,12 @@ internal static class UiStyleManager
             underlayColor.a * targetFaceColor.a);
         var layerOutlineWidth = outline ? Mathf.Clamp01(outlineWidth) : 0f;
         var layerHasOutline = layerOutlineWidth > 0.0001f;
-        var layerFaceDilate = Mathf.Clamp(faceDilate + underlayDilate, -1f, 1f);
+        // The sibling underlay text already enables layerOutlineWidth, so its outer contour
+        // matches the main text + outline when layerFaceDilate == faceDilate. Adding underlayDilate
+        // on top of layerOutlineWidth would double-dilate the shadow and make it overly thick/long.
+        var layerFaceDilate = layerHasOutline
+            ? Mathf.Clamp(faceDilate, -1f, 1f)
+            : Mathf.Clamp(faceDilate + underlayDilate, -1f, 1f);
         var selectedFontId = materialFont == null ? 0 : materialFont.GetInstanceID();
 
         var underlayKey = new MaterialStyleKey(
@@ -1044,7 +1219,7 @@ internal static class UiStyleManager
                 underlayRect.localScale = sourceRect.localScale;
                 underlayRect.localRotation = sourceRect.localRotation;
 
-                var offsetScale = Mathf.Max(2f, currentFontSize * 0.16f);
+                var offsetScale = Mathf.Max(1.5f, currentFontSize * 0.24f);
                 var pixelOffset = new Vector2(state.OffsetX * offsetScale, state.OffsetY * offsetScale);
                 underlayRect.anchoredPosition = anchoredPos + pixelOffset;
             }
@@ -1213,12 +1388,23 @@ internal static class UiStyleManager
         InstanceStyleKeys.Remove(id);
         InstanceAppliedRules.Remove(id);
         MaterialBaseFaceColors.Remove(id);
-        OriginalGameMaterials.Remove(id);
         if (PreStyleVertexColors.TryGetValue(id, out var savedColor))
         {
             PreStyleVertexColors.Remove(id);
             text.color = savedColor;
         }
+        if (UnderlayLayers.Count > 0)
+            DisableUnderlayLayer(id);
+    }
+
+    internal static void RemoveInstanceCache(int id)
+    {
+        InstanceStyleKeys.Remove(id);
+        InstanceAppliedRules.Remove(id);
+        MaterialBaseFaceColors.Remove(id);
+        OriginalGameMaterials.Remove(id);
+        OriginalGameFontNames.Remove(id);
+        PreStyleVertexColors.Remove(id);
         if (UnderlayLayers.Count > 0)
             DisableUnderlayLayer(id);
     }

@@ -26,6 +26,7 @@ public sealed class ModConfig
     public ConfigEntry<bool> HideR18DialogueBackground { get; }
     public ConfigEntry<bool> EnableR18WhiteTextOutline { get; }
     public ConfigEntry<bool> EnableR18ButtonTextOutline { get; }
+    public ConfigEntry<bool> InheritGameFontStyle { get; }
     public ConfigEntry<float> UiTextOutlineWidth { get; }
     public ConfigEntry<float> UiTextFaceDilate { get; }
     public ConfigEntry<bool> EnableTranslationAutoUpdate { get; }
@@ -94,11 +95,16 @@ public sealed class ModConfig
             "EnableButtonTextOutline",
             true,
             "在 R18 剧情中为 Auto、Skip、Log 按钮文字添加 #544A4A 描边");
+        InheritGameFontStyle = config.Bind(
+            "Translation.UIAppearance",
+            "InheritGameFontStyle",
+            true,
+            "让汉化文本自动沿用游戏原版 TMP 材质的描边开关、描边颜色/粗细、字重与投影样式（styles.json 规则仍可覆盖）");
         UiTextOutlineWidth = config.Bind(
             "Translation.UIAppearance",
             "UiTextOutlineWidth",
             0.3f,
-            "UICanvas 汉化文本描边宽度（建议 0 至 1）");
+            "UICanvas 汉化文本默认描边宽度（建议 0 至 1，当未沿用原版材质时生效）");
         UiTextFaceDilate = config.Bind(
             "Translation.UIAppearance",
             "UiTextFaceDilate",

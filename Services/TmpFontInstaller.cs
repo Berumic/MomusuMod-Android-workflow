@@ -48,7 +48,9 @@ public static class TmpFontInstaller
     internal static bool IsApplying => _applying || _applyingConfiguredUiStyle;
 
     private static Font _loadedLegacyFont;
+    private static Material _storyCleanMaterial;
     private static Material _r18StoryOutlineMaterial;
+    private static Material _r18StoryNameOutlineMaterial;
     private static Material _unitDetailOutlineMaterial;
     private static Material _unitDetailNoOutlineMaterial;
     private static readonly Dictionary<char, bool> SupportedCharCache = new(1024);
@@ -113,6 +115,15 @@ public static class TmpFontInstaller
          SubSkillTextInstanceIds.Contains(instanceId) ||
          StoryTextInstanceIds.Contains(instanceId));
 
+    internal static bool IsTrackedStoryText(int instanceId) =>
+        instanceId != 0 && StoryTextInstanceIds.Contains(instanceId);
+
+    internal static bool HasStoryTmpOverlay(Text legacyText) =>
+        legacyText != null &&
+        StoryTmpTexts.TryGetValue(legacyText.GetInstanceID(), out var overlay) &&
+        overlay != null &&
+        overlay.enabled;
+
     public static bool IsCurrentlyTranslatedComponent(Component component, string currentText)
     {
         if (component == null || string.IsNullOrEmpty(currentText))
@@ -153,6 +164,7 @@ public static class TmpFontInstaller
             SubSkillTextInstanceIds.Remove(id);
             SubSkillTranslatedValues.Remove(id);
             OriginalTranslatedTmpFonts.Remove(id);
+            UiStyleManager.RemoveInstanceCache(id);
         }
 
         PruneIdsBuffer.Clear();
@@ -175,10 +187,20 @@ public static class TmpFontInstaller
 
     public static void Unload()
     {
+        if (_storyCleanMaterial != null)
+        {
+            UnityEngine.Object.Destroy(_storyCleanMaterial);
+            _storyCleanMaterial = null;
+        }
         if (_r18StoryOutlineMaterial != null)
         {
             UnityEngine.Object.Destroy(_r18StoryOutlineMaterial);
             _r18StoryOutlineMaterial = null;
+        }
+        if (_r18StoryNameOutlineMaterial != null)
+        {
+            UnityEngine.Object.Destroy(_r18StoryNameOutlineMaterial);
+            _r18StoryNameOutlineMaterial = null;
         }
         if (_unitDetailOutlineMaterial != null)
         {
@@ -856,10 +878,15 @@ public static class TmpFontInstaller
 
     public static void ApplyToLegacyText(object component)
     {
-        if (_loadedLegacyFont == null || component is not Text text ||
-            !UiHierarchyClassifier.IsStoryMessageText(text) || Plugin.Translations == null ||
-            (!Plugin.Translations.IsKnownTranslationValue(text.text) &&
-             !Plugin.Translations.IsKnownStoryTranslationValue(text.text)))
+        if (_applying || _loadedLegacyFont == null || component is not Text text ||
+            !UiHierarchyClassifier.IsStoryMessageText(text))
+            return;
+
+        var id = text.GetInstanceID();
+        if (!StoryTextInstanceIds.Contains(id) &&
+            (Plugin.Translations == null ||
+             (!Plugin.Translations.IsKnownTranslationValue(text.text) &&
+              !Plugin.Translations.IsKnownStoryTranslationValue(text.text))))
             return;
 
         // Utage can assign its original font after writing a translated line.
@@ -874,35 +901,47 @@ public static class TmpFontInstaller
             return;
 
         var instanceId = legacyText.GetInstanceID();
-        // UTAGE owns the reveal state of the live dialogue. A separate TMP
-        // renderer cannot reproduce it from Text.text (which is the full line).
-        if (UiHierarchyClassifier.IsCurrentStoryDialogueText(legacyText))
-        {
-            ApplyLegacyStoryFont(legacyText);
-            RestoreOriginalText(legacyText);
-            return;
-        }
-        if (!_replaceStoryNames && UiHierarchyClassifier.IsStorySpeakerNameText(legacyText))
+        var isSpeakerName = UiHierarchyClassifier.IsStorySpeakerNameText(legacyText);
+        if (!_replaceStoryNames && isSpeakerName)
         {
             RestoreOriginalText(legacyText);
             return;
         }
 
-        // Utage parses <speed> and <interval> on its original UGUI text
-        // component. A Legacy Font retains that component and its typewriter
-        // state instead of bypassing it with a TMP overlay.
-        if (_loadedLegacyFont != null)
+        var textContent = content ?? legacyText.text;
+        // Speaker NameText has no typewriter reveal. Always prefer the TMP_FontAsset
+        // overlay (Alimama SDF) for speaker names when supported so characters like
+        // "爱丽丝" never fall back to the OS system font on UGUI Legacy Text.
+        var useTmpForSpeakerName = isSpeakerName &&
+                                   _loadedFont != null &&
+                                   !string.IsNullOrWhiteSpace(textContent) &&
+                                   Supports(textContent);
+
+        if (!useTmpForSpeakerName)
         {
-            ApplyLegacyStoryFont(legacyText);
-            RestoreOriginalText(legacyText);
-            return;
+            if (UiHierarchyClassifier.IsCurrentStoryDialogueText(legacyText) &&
+                (_loadedLegacyFont != null || !isSpeakerName))
+            {
+                ApplyLegacyStoryFont(legacyText);
+                RestoreOriginalText(legacyText);
+                return;
+            }
+
+            // Utage parses <speed> and <interval> on its original UGUI text
+            // component. A Legacy Font retains that component and its typewriter
+            // state instead of bypassing it with a TMP overlay.
+            if (_loadedLegacyFont != null)
+            {
+                ApplyLegacyStoryFont(legacyText);
+                RestoreOriginalText(legacyText);
+                return;
+            }
         }
 
         if (_loadedFont == null)
             return;
 
-        var textContent = content ?? legacyText.text;
-        if (!Supports(textContent))
+        if (string.IsNullOrWhiteSpace(textContent) || !Supports(textContent))
         {
             if (StoryTmpTexts.TryGetValue(instanceId, out var unsupportedOverlay) && unsupportedOverlay != null)
                 unsupportedOverlay.enabled = false;
@@ -912,10 +951,25 @@ public static class TmpFontInstaller
 
         if (StoryTmpTexts.TryGetValue(instanceId, out var existingText) && existingText != null)
         {
-            existingText.enabled = true;
+            var prevApplyingExisting = _applying;
+            _applying = true;
+            try
+            {
+                if (existingText.gameObject != null && !existingText.gameObject.activeSelf)
+                    existingText.gameObject.SetActive(true);
+                existingText.enabled = true;
+                if (legacyText.enabled)
+                    legacyText.enabled = false;
+            }
+            finally
+            {
+                _applying = prevApplyingExisting;
+            }
             return;
         }
 
+        var prevApplying = _applying;
+        _applying = true;
         try
         {
             var gameObject = legacyText.gameObject;
@@ -937,6 +991,10 @@ public static class TmpFontInstaller
                 overlayObject.transform.SetParent(gameObject.transform, worldPositionStays: false);
             }
 
+            UiHierarchyClassifier.RegisterInternalLayer(overlayObject, overlayObject.transform);
+            if (!overlayObject.activeSelf)
+                overlayObject.SetActive(true);
+
             var overlayRect = overlayObject.GetComponent<RectTransform>();
             if (overlayRect == null)
                 throw new InvalidOperationException("Story TMP overlay has no RectTransform");
@@ -954,13 +1012,15 @@ public static class TmpFontInstaller
             if (text == null)
                 throw new InvalidOperationException("AddComponent<TextMeshProUGUI> returned null");
 
+            UiHierarchyClassifier.RegisterInternalLayer(overlayObject, text);
             text.font = _loadedFont;
-            if (_loadedFont.material != null)
-                text.fontSharedMaterial = _loadedFont.material;
+            var initialMat = GetStoryCleanMaterial() ?? _loadedFont.material;
+            if (initialMat != null)
+                text.fontSharedMaterial = initialMat;
             text.fontSize = legacyText.fontSize;
             text.color = legacyText.color;
             text.richText = legacyText.supportRichText;
-            text.raycastTarget = legacyText.raycastTarget;
+            text.raycastTarget = false;
             text.maskable = legacyText.maskable;
             text.enableAutoSizing = false;
             text.enableWordWrapping = legacyText.horizontalOverflow != HorizontalWrapMode.Overflow;
@@ -982,30 +1042,52 @@ public static class TmpFontInstaller
             if (StoryTmpFailures.Add(instanceId))
                 Plugin.Log.LogWarning($"Failed to replace story LegacyText with TMP: {exception.Message}");
         }
+        finally
+        {
+            _applying = prevApplying;
+        }
     }
 
     public static void SyncKnownStoryText(Text legacyText, string content)
     {
-        if (legacyText != null && UiHierarchyClassifier.IsCurrentStoryDialogueText(legacyText))
+        if (legacyText == null)
+            return;
+
+        var isSpeakerName = UiHierarchyClassifier.IsStorySpeakerNameText(legacyText);
+        if (!_replaceStoryNames && isSpeakerName)
         {
-            ApplyLegacyStoryFont(legacyText);
             RestoreOriginalText(legacyText);
             return;
         }
-        if (legacyText != null && _loadedLegacyFont != null && UiHierarchyClassifier.IsStoryMessageText(legacyText))
+
+        if (string.IsNullOrWhiteSpace(content))
         {
-            if (!_replaceStoryNames && UiHierarchyClassifier.IsStorySpeakerNameText(legacyText))
+            RestoreOriginalText(legacyText);
+            return;
+        }
+
+        var useTmpForSpeakerName = isSpeakerName &&
+                                   _loadedFont != null &&
+                                   Supports(content);
+
+        if (!useTmpForSpeakerName)
+        {
+            if (UiHierarchyClassifier.IsCurrentStoryDialogueText(legacyText) &&
+                (_loadedLegacyFont != null || !isSpeakerName))
             {
+                ApplyLegacyStoryFont(legacyText);
                 RestoreOriginalText(legacyText);
                 return;
             }
-
-            ApplyLegacyStoryFont(legacyText);
-            RestoreOriginalText(legacyText);
-            return;
+            if (_loadedLegacyFont != null && UiHierarchyClassifier.IsStoryMessageText(legacyText))
+            {
+                ApplyLegacyStoryFont(legacyText);
+                RestoreOriginalText(legacyText);
+                return;
+            }
         }
 
-        if (legacyText == null || !StoryTmpTexts.TryGetValue(legacyText.GetInstanceID(), out var text) || text == null)
+        if (!StoryTmpTexts.TryGetValue(legacyText.GetInstanceID(), out var text) || text == null)
             return;
 
         if (!Supports(content))
@@ -1015,23 +1097,57 @@ public static class TmpFontInstaller
             return;
         }
 
-        var changed = false;
-        var preparedContent = PrepareForTmp(content);
-        if (!string.Equals(text.text, preparedContent, StringComparison.Ordinal))
+        var prevApplying = _applying;
+        _applying = true;
+        try
         {
-            text.text = preparedContent;
-            changed = true;
+            if (text.gameObject != null && !text.gameObject.activeSelf)
+                text.gameObject.SetActive(true);
+
+            var changed = false;
+            if (text.font != _loadedFont && _loadedFont != null)
+            {
+                text.font = _loadedFont;
+                changed = true;
+            }
+            if (!Mathf.Approximately(text.fontSize, legacyText.fontSize))
+            {
+                text.fontSize = legacyText.fontSize;
+                changed = true;
+            }
+            if (text.color != legacyText.color)
+            {
+                text.color = legacyText.color;
+                changed = true;
+            }
+            var targetAlign = ToTmpAlignment(legacyText.alignment);
+            if (text.alignment != targetAlign)
+            {
+                text.alignment = targetAlign;
+                changed = true;
+            }
+
+            var preparedContent = PrepareForTmp(content);
+            if (!string.Equals(text.text, preparedContent, StringComparison.Ordinal))
+            {
+                text.text = preparedContent;
+                changed = true;
+            }
+            ApplyR18StoryPresentation(text);
+            if (!text.enabled)
+            {
+                text.enabled = true;
+                changed = true;
+            }
+            if (legacyText.enabled)
+                legacyText.enabled = false;
+            if (changed)
+                text.SetAllDirty();
         }
-        ApplyR18StoryPresentation(text);
-        if (!text.enabled)
+        finally
         {
-            text.enabled = true;
-            changed = true;
+            _applying = prevApplying;
         }
-        if (legacyText.enabled)
-            legacyText.enabled = false;
-        if (changed)
-            text.SetAllDirty();
     }
 
     public static void RestoreOriginalText(Text legacyText)
@@ -1082,13 +1198,84 @@ public static class TmpFontInstaller
         var useWhiteOutline = useWhiteOutlineOverride ??
                               (Plugin.Settings.EnableR18WhiteTextOutline.Value &&
                                R18DialogueBackgroundController.IsR18SceneActive());
-        var material = useWhiteOutline ? GetR18StoryOutlineMaterial() : _loadedFont.material;
+        var parentName = text.transform?.parent != null ? text.transform.parent.name : string.Empty;
+        var isSpeakerName = string.Equals(parentName, "NameText", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(parentName, "Name", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(parentName, "CharacterName", StringComparison.OrdinalIgnoreCase);
+
+        Material material;
+        if (useWhiteOutline)
+        {
+            material = isSpeakerName ? GetR18StoryNameOutlineMaterial() : GetR18StoryOutlineMaterial();
+        }
+        else
+        {
+            material = GetStoryCleanMaterial() ?? _loadedFont.material;
+        }
+
         if (material == null || text.fontSharedMaterial == material)
             return;
 
         text.fontSharedMaterial = material;
         text.UpdateMeshPadding();
         text.SetAllDirty();
+    }
+
+    private static Material GetStoryCleanMaterial()
+    {
+        if (_storyCleanMaterial != null)
+            return _storyCleanMaterial;
+        if (_loadedFont == null || _loadedFont.material == null)
+            return null;
+
+        var material = new Material(_loadedFont.material)
+        {
+            name = $"{_loadedFont.material.name}_StoryClean"
+        };
+        UiStyleManager.RegisterModMaterial(material);
+        if (material.HasProperty("_OutlineWidth"))
+            material.SetFloat("_OutlineWidth", 0f);
+        if (material.HasProperty("_FaceDilate"))
+            material.SetFloat("_FaceDilate", 0f);
+        if (material.HasShaderKeyword("OUTLINE_ON"))
+            material.DisableKeyword("OUTLINE_ON");
+        if (material.HasShaderKeyword("UNDERLAY_ON"))
+            material.DisableKeyword("UNDERLAY_ON");
+        _storyCleanMaterial = material;
+        return _storyCleanMaterial;
+    }
+
+    private static Material GetR18StoryNameOutlineMaterial()
+    {
+        if (_r18StoryNameOutlineMaterial != null)
+        {
+            if (_r18StoryNameOutlineMaterial.HasProperty("_FaceDilate") &&
+                !Mathf.Approximately(_r18StoryNameOutlineMaterial.GetFloat("_FaceDilate"), GetUiTextFaceDilate()))
+                _r18StoryNameOutlineMaterial.SetFloat("_FaceDilate", GetUiTextFaceDilate());
+            return _r18StoryNameOutlineMaterial;
+        }
+        if (_loadedFont == null || _loadedFont.material == null)
+            return null;
+
+        var material = new Material(_loadedFont.material)
+        {
+            name = $"{_loadedFont.material.name}_R18NameDarkOutline"
+        };
+        if (!material.HasProperty("_OutlineColor") || !material.HasProperty("_OutlineWidth"))
+        {
+            UnityEngine.Object.Destroy(material);
+            return GetStoryCleanMaterial();
+        }
+
+        UiStyleManager.RegisterModMaterial(material);
+        material.SetColor("_OutlineColor", (Color)SubSkillOutlineColor);
+        material.SetFloat("_OutlineWidth", R18StoryOutlineWidth);
+        if (material.HasProperty("_FaceDilate"))
+            material.SetFloat("_FaceDilate", GetUiTextFaceDilate());
+        if (!material.HasShaderKeyword("OUTLINE_ON"))
+            material.EnableKeyword("OUTLINE_ON");
+        _r18StoryNameOutlineMaterial = material;
+        return _r18StoryNameOutlineMaterial;
     }
 
     private static Material GetR18StoryOutlineMaterial()
@@ -1131,10 +1318,23 @@ public static class TmpFontInstaller
         if (legacyText == null)
             return;
 
+        var id = legacyText.GetInstanceID();
+        StoryTextInstanceIds.Remove(id);
         RestoreOriginalText(legacyText);
-        if (StoryOriginalFonts.TryGetValue(legacyText.GetInstanceID(), out var originalFont) &&
+        if (StoryOriginalFonts.TryGetValue(id, out var originalFont) &&
             originalFont != null && legacyText.font != originalFont)
-            legacyText.font = originalFont;
+        {
+            var prevApplying = _applying;
+            _applying = true;
+            try
+            {
+                legacyText.font = originalFont;
+            }
+            finally
+            {
+                _applying = prevApplying;
+            }
+        }
     }
 
     internal static bool IsModFont(TMP_FontAsset font) =>
@@ -1145,11 +1345,11 @@ public static class TmpFontInstaller
         if (text == null)
             return;
 
+        UiStyleManager.ObserveGameMaterial(text);
         var id = text.GetInstanceID();
         if (OriginalTranslatedTmpFonts.ContainsKey(id))
             return;
 
-        UiStyleManager.ObserveGameMaterial(text);
         OriginalTranslatedTmpFonts[id] = new TmpPresentationState(text);
     }
 
@@ -1159,6 +1359,16 @@ public static class TmpFontInstaller
             return;
 
         ApplyForcedTmpTextPresentation(source, useSubSkillPresentation, content);
+    }
+
+    internal static TMP_FontAsset ResolveDefaultFontForText(TMP_Text text)
+    {
+        if (text != null && UiStyleManager.IsKurokaneInstance(text))
+        {
+            if (LoadedFonts.TryGetValue("FZKane", out var fzkane) && fzkane != null)
+                return fzkane;
+        }
+        return _loadedFont;
     }
 
     private static void ApplyForcedTmpTextPresentation(
@@ -1177,7 +1387,11 @@ public static class TmpFontInstaller
             if (useSubSkillPresentation)
                 ApplySubSkillPresentationIfNeeded(source, isTranslatedOverride: true, pendingText: pendingText);
             else
+            {
                 ApplyTranslatedShopAndPopupLayout(source);
+                if (!UiStyleManager.IsCollecting(source))
+                    ApplyUiTextPresentation(source, isTranslatedOverride: true, pendingText: pendingText);
+            }
         }
         finally
         {
@@ -1191,12 +1405,15 @@ public static class TmpFontInstaller
             return false;
 
         CaptureOriginalPresentation(text);
+        var targetFont = ResolveDefaultFontForText(text);
+        if (targetFont == null)
+            return false;
 
         if (UiStyleManager.IsCollecting(text))
         {
             UiStyleManager.SubmitBaseline(
                 text,
-                _loadedFont,
+                targetFont,
                 GetUiTextOutlineWidth(),
                 GetUiTextFaceDilate(),
                 GetUiTextOutlineColor(text),
@@ -1209,22 +1426,22 @@ public static class TmpFontInstaller
         _applying = true;
         try
         {
-            var fontChanged = text.font != _loadedFont;
+            var fontChanged = text.font != targetFont;
             var changed = fontChanged;
             if (fontChanged)
             {
                 var currentPresentation = new TmpPresentationState(text);
-                text.font = _loadedFont;
+                text.font = targetFont;
                 currentPresentation.RestoreVertexColors(text);
             }
 
-            // A reused TMP component can retain the Alimama font while the game
+            // A reused TMP component can retain the mod font while the game
             // clears its material. Restore only a missing material here; valid
             // per-slot outline materials remain untouched.
-            if (text.font == _loadedFont && _loadedFont.material != null &&
+            if (text.font == targetFont && targetFont.material != null &&
                 (fontChanged || text.fontSharedMaterial == null))
             {
-                text.fontSharedMaterial = _loadedFont.material;
+                text.fontSharedMaterial = targetFont.material;
                 text.UpdateMeshPadding();
                 changed = true;
             }
@@ -1330,11 +1547,13 @@ public static class TmpFontInstaller
             return;
         }
 
+        CaptureOriginalPresentation(text);
+        var defaultFont = ResolveDefaultFontForText(text);
         var width = GetUiTextOutlineWidth();
         var dilate = GetUiTextFaceDilate();
         if (UiStyleManager.SubmitBaseline(
                 text,
-                _loadedFont,
+                defaultFont,
                 width,
                 dilate,
                 SubSkillOutlineColor,
@@ -1347,7 +1566,7 @@ public static class TmpFontInstaller
         {
             UiStyleManager.SubmitBaseline(
                 text,
-                _loadedFont,
+                defaultFont,
                 width,
                 dilate,
                 SubSkillOutlineColor,
@@ -1356,7 +1575,7 @@ public static class TmpFontInstaller
                 text,
                 width,
                 dilate,
-                _loadedFont,
+                defaultFont,
                 isTranslated,
                 pendingText);
         }
@@ -1380,12 +1599,14 @@ public static class TmpFontInstaller
             return;
         }
 
+        CaptureOriginalPresentation(text);
+        var defaultFont = ResolveDefaultFontForText(text);
         var width = GetUiTextOutlineWidth();
         var dilate = GetUiTextFaceDilate();
         var outlineColor = GetUiTextOutlineColor(text);
         if (UiStyleManager.SubmitBaseline(
                 text,
-                _loadedFont,
+                defaultFont,
                 width,
                 dilate,
                 outlineColor,
@@ -1398,7 +1619,7 @@ public static class TmpFontInstaller
         {
             UiStyleManager.SubmitBaseline(
                 text,
-                _loadedFont,
+                defaultFont,
                 width,
                 dilate,
                 outlineColor,
@@ -1407,7 +1628,7 @@ public static class TmpFontInstaller
                 text,
                 width,
                 dilate,
-                _loadedFont,
+                defaultFont,
                 isTranslated,
                 pendingText);
         }
@@ -1555,12 +1776,22 @@ public static class TmpFontInstaller
             if (_loadedFont.material != null)
                 UiStyleManager.RegisterModMaterial(_loadedFont.material);
 
+            _loadedLegacyFont = null;
+            Font firstLegacyFont = null;
             foreach (var asset in _loadedBundle.LoadAllAssets<Font>())
             {
-                _loadedLegacyFont = asset;
-                _loadedLegacyFont.hideFlags |= HideFlags.DontUnloadUnusedAsset;
-                break;
+                if (asset == null)
+                    continue;
+                asset.hideFlags |= HideFlags.DontUnloadUnusedAsset;
+                firstLegacyFont ??= asset;
+                if (_loadedLegacyFont == null &&
+                    asset.name.Contains("alimama", StringComparison.OrdinalIgnoreCase))
+                {
+                    _loadedLegacyFont = asset;
+                }
             }
+
+            _loadedLegacyFont ??= firstLegacyFont;
 
             if (_loadedLegacyFont == null)
                 TryCreateDynamicLegacyFont();
@@ -1631,9 +1862,23 @@ public static class TmpFontInstaller
 
     private static void ApplyLegacyStoryFont(Text text)
     {
-        StoryOriginalFonts.TryAdd(text.GetInstanceID(), text.font);
+        var id = text.GetInstanceID();
+        StoryTextInstanceIds.Add(id);
+        if (text.font != null && text.font != _loadedLegacyFont)
+            StoryOriginalFonts.TryAdd(id, text.font);
         if (_loadedLegacyFont != null && text.font != _loadedLegacyFont)
-            text.font = _loadedLegacyFont;
+        {
+            var prevApplying = _applying;
+            _applying = true;
+            try
+            {
+                text.font = _loadedLegacyFont;
+            }
+            finally
+            {
+                _applying = prevApplying;
+            }
+        }
     }
 
     private static TextAlignmentOptions ToTmpAlignment(TextAnchor alignment) => alignment switch

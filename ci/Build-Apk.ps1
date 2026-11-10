@@ -43,7 +43,9 @@ try {
     } finally { $stream.Dispose() }
 } finally { $zip.Dispose() }
 & "$root/Android/Prepare.ps1" -LemonRoot $lemon -Workspace $Workspace -Apk $Apk
-& "$root/Android/Build.ps1" -Workspace $Workspace -Translations "$TranslationsRoot/translations" -FontBundle "$Toolchain/Font/alimama-android"
+$repoFontBundle = Join-Path $TranslationsRoot 'assets/android/alimama-android'
+$effectiveFontBundle = if (Test-Path -LiteralPath $repoFontBundle) { $repoFontBundle } else { "$Toolchain/Font/alimama-android" }
+& "$root/Android/Build.ps1" -Workspace $Workspace -Translations "$TranslationsRoot/translations" -FontBundle $effectiveFontBundle
 & dotnet run --project "$root/Android/Tests/Android.Tests.csproj" -c Release "-p:AndroidWorkspace=$Workspace" -- $Workspace
 Check-Exit 'Android regression tests failed.'
 $deployments = @(Get-ChildItem $Workspace -Directory -Filter 'Deployment-*')

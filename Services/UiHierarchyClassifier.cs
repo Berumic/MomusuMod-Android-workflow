@@ -783,7 +783,7 @@ public static class UiHierarchyClassifier
         if (text == null || text.transform == null)
             return false;
 
-        if (IsCurrentStoryDialogueText(text))
+        if (IsCurrentStoryDialogueText(text) || IsStorySpeakerNameText(text))
             return true;
 
         var fullPath = GetHierarchyPath(text.transform);
@@ -845,9 +845,19 @@ public static class UiHierarchyClassifier
 
         var path = GetHierarchyPath(graphic.transform);
         return path.Contains(
-            "AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/",
-            StringComparison.Ordinal);
+                   "AdvEngine/UI/MessageWindowManager/MessageWindow/RootChildren/",
+                   StringComparison.Ordinal) &&
+               !IsDialogueCheckmark(path);
     }
+
+    public static bool IsDialogueCheckmark(string path) =>
+        !string.IsNullOrEmpty(path) &&
+        path.EndsWith("/Checkmark", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsDialogueCheckmark(Graphic graphic) =>
+        graphic != null &&
+        graphic.transform != null &&
+        IsDialogueCheckmark(GetHierarchyPath(graphic.transform));
 
     public static bool IsDialogueControlLabel(Text text)
     {
@@ -869,12 +879,23 @@ public static class UiHierarchyClassifier
          path.Contains("/BackLogButton/", StringComparison.OrdinalIgnoreCase) ||
          path.Contains("/LogButton/", StringComparison.OrdinalIgnoreCase) ||
          path.Contains("/BackLog/", StringComparison.OrdinalIgnoreCase) ||
-         path.Contains("/Backlog/", StringComparison.OrdinalIgnoreCase));
+         path.Contains("/Backlog/", StringComparison.OrdinalIgnoreCase) ||
+         path.Contains("/CloseButton/", StringComparison.OrdinalIgnoreCase));
 
-    public static bool IsBackLogButtonBackground(Graphic graphic) =>
+    public static bool IsBackLogButtonBackground(Graphic graphic)
+    {
+        if (graphic == null || graphic.transform == null)
+            return false;
+
+        var path = GetHierarchyPath(graphic.transform);
+        return path.EndsWith("/BackLogButton", StringComparison.OrdinalIgnoreCase) ||
+               path.EndsWith("/CloseButton", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsCloseButtonBackground(Graphic graphic) =>
         graphic != null &&
         graphic.transform != null &&
-        GetHierarchyPath(graphic.transform).EndsWith("/BackLogButton", StringComparison.OrdinalIgnoreCase);
+        GetHierarchyPath(graphic.transform).EndsWith("/CloseButton", StringComparison.OrdinalIgnoreCase);
 
     public static bool TryGetStoryOutlineColor(Text text, Color darkOutlineColor, out Color outlineColor)
     {

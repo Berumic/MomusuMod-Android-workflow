@@ -82,7 +82,7 @@ public sealed class StoryLegacyFontReplacer : MonoBehaviour
                 continue;
             }
 
-            if (text.enabled)
+            if (text.enabled || TmpFontInstaller.HasStoryTmpOverlay(text))
                 PatchManager.ProcessDiscoveredLegacyText(text);
         }
     }

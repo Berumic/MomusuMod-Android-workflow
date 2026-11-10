@@ -153,22 +153,26 @@ public sealed class TranslationManager
 
         foreach (var pair in ReadTable(Path.Combine(_root, "names", $"{language}.json")))
         {
+            if (string.IsNullOrEmpty(pair.Value) || IsUntranslatedSelfCopy(pair.Key, pair.Value))
+                continue;
+
             if (TryParseSceneMarker(pair.Key, out var scenePath, out var sceneSource))
             {
-                if (!string.IsNullOrEmpty(pair.Value))
-                {
-                    _nameSceneTemplates.Add(new SceneTemplate(scenePath, sceneSource, pair.Value));
-                    AddKnownTranslationValue(pair.Value);
-                    _knownNameTranslationValues.Add(pair.Value);
-                }
+                _nameSceneTemplates.Add(new SceneTemplate(scenePath, sceneSource, pair.Value));
+                if (!string.IsNullOrEmpty(sceneSource) && !_names.ContainsKey(sceneSource))
+                    _names[sceneSource] = pair.Value;
+                AddKnownTranslationValue(pair.Value);
+                _knownNameTranslationValues.Add(pair.Value);
                 continue;
             }
 
             _names[pair.Key] = pair.Value;
+            var strippedNameKey = StripUiLayoutTags(NormalizeSubSkillKey(pair.Key));
+            if (!string.IsNullOrEmpty(strippedNameKey) && !_names.ContainsKey(strippedNameKey))
+                _names[strippedNameKey] = pair.Value;
             AddExTemplate(_nameExTemplates, pair.Key, pair.Value);
             AddKnownTranslationValue(pair.Value);
-            if (!string.IsNullOrEmpty(pair.Value))
-                _knownNameTranslationValues.Add(pair.Value);
+            _knownNameTranslationValues.Add(pair.Value);
         }
         _nameSceneTemplates.Sort((left, right) => right.SourceLength.CompareTo(left.SourceLength));
         SortExTemplates(_nameExTemplates);
@@ -497,11 +501,73 @@ public sealed class TranslationManager
 
     private bool TryTranslateNameCore(string source, string scenePath, out string translated)
     {
+        if (TryTranslateNameSingle(source, scenePath, out translated))
+            return true;
+
+        var normalized = NormalizeSubSkillKey(source);
+        var trimmed = normalized.Trim(' ', '\t', '\u3000', '\n');
+        if (trimmed.Length > 0 && !string.Equals(trimmed, source, StringComparison.Ordinal))
+        {
+            if (TryTranslateNameSingle(trimmed, scenePath, out var trimmedTranslated))
+            {
+                var startIdx = normalized.IndexOf(trimmed, StringComparison.Ordinal);
+                translated = startIdx >= 0
+                    ? string.Concat(
+                        normalized.AsSpan(0, startIdx),
+                        trimmedTranslated,
+                        normalized.AsSpan(startIdx + trimmed.Length))
+                    : trimmedTranslated;
+                return true;
+            }
+        }
+
+        var target = trimmed.Length > 0 ? trimmed : source;
+        if (target.Length > 2 &&
+            ((target[0] == '「' && target[^1] == '」') ||
+             (target[0] == '『' && target[^1] == '』') ||
+             (target[0] == '（' && target[^1] == '）') ||
+             (target[0] == '【' && target[^1] == '】') ||
+             (target[0] == '(' && target[^1] == ')')))
+        {
+            var inner = target[1..^1];
+            if (TryTranslateNameSingle(inner, scenePath, out var innerTranslated))
+            {
+                translated = string.Concat(target.AsSpan(0, 1), innerTranslated, target.AsSpan(target.Length - 1, 1));
+                return true;
+            }
+        }
+
+        translated = source;
+        return false;
+    }
+
+    private bool TryTranslateNameSingle(string source, string scenePath, out string translated)
+    {
         translated = source;
         if (TryTranslateSceneTemplate(source, scenePath, _nameSceneTemplates, out translated))
             return true;
 
         if (_names.TryGetValue(source, out translated) && !string.IsNullOrEmpty(translated))
+            return true;
+
+        var stripped = StripUiLayoutTags(source);
+        if (!string.IsNullOrEmpty(stripped) &&
+            !string.Equals(stripped, source, StringComparison.Ordinal) &&
+            _names.TryGetValue(stripped, out translated) &&
+            !string.IsNullOrEmpty(translated))
+            return true;
+
+        var displayKey = NormalizeStoryDisplayValue(NormalizeSubSkillKey(source));
+        if (!string.IsNullOrEmpty(displayKey) &&
+            !string.Equals(displayKey, source, StringComparison.Ordinal) &&
+            _names.TryGetValue(displayKey, out translated) &&
+            !string.IsNullOrEmpty(translated))
+            return true;
+
+        if ((_uiTexts.TryGetValue(source, out translated) ||
+             (!string.IsNullOrEmpty(stripped) && _uiTextsStripped.TryGetValue(stripped, out translated)) ||
+             (!string.IsNullOrEmpty(displayKey) && _uiTexts.TryGetValue(displayKey, out translated))) &&
+            !string.IsNullOrEmpty(translated))
             return true;
 
         if (TryTranslateJoinedNames(source, out translated))
@@ -519,10 +585,22 @@ public sealed class TranslationManager
         return TryTranslateExTemplate(source, _nameExTemplates, TryTranslateCapturedName, out translated);
     }
 
+    private static bool IsNameSeparator(char c) =>
+        c == '&' || c == '＆' || c == '・' || c == '、' || c == '／';
+
     private bool TryTranslateJoinedNames(string source, out string translated)
     {
         translated = source;
-        if (source.IndexOf('&') < 0 && source.IndexOf('＆') < 0)
+        var hasSeparator = false;
+        for (var i = 0; i < source.Length; i++)
+        {
+            if (IsNameSeparator(source[i]))
+            {
+                hasSeparator = true;
+                break;
+            }
+        }
+        if (!hasSeparator)
             return false;
 
         var result = new StringBuilder(source.Length);
@@ -531,10 +609,10 @@ public sealed class TranslationManager
         for (var index = 0; index <= source.Length; index++)
         {
             var atEnd = index == source.Length;
-            if (!atEnd && source[index] != '&' && source[index] != '＆')
+            if (!atEnd && !IsNameSeparator(source[index]))
                 continue;
 
-            var segment = source.Substring(segmentStart, index - segmentStart);
+            var segment = source.Substring(segmentStart, index - segmentStart).Trim(' ', '\u3000');
             if (segment.Length == 0 ||
                 !_names.TryGetValue(segment, out var segmentTranslation) ||
                 string.IsNullOrEmpty(segmentTranslation))
@@ -652,6 +730,9 @@ public sealed class TranslationManager
             return true;
 
         if (includeSubSkills && _subSkills.TryGetValue(source, out translated) && !string.IsNullOrEmpty(translated))
+            return true;
+
+        if (_config.TranslateNames.Value && _names.TryGetValue(source, out translated) && !string.IsNullOrEmpty(translated))
             return true;
 
         if (_knownUiTextTranslationValues.Contains(source) ||
@@ -1183,6 +1264,7 @@ public sealed class TranslationManager
         {
             if (!string.IsNullOrEmpty(uniqueScene))
                 StorySceneContext.NotifyUniqueSceneMatched(uniqueScene);
+            AddKnownTranslationValue(translated);
             return true;
         }
         if (conflict)
@@ -1327,7 +1409,10 @@ public sealed class TranslationManager
             scene = ResolveStoryScenarioIdCore(snapshot, ScenarioContext.CurrentResourceId);
 
         if (TryTranslateStoryBeforeParseSingle(snapshot, lookup, scene, allowCandidateInference, out translated, out var conflict, out uniqueScene))
+        {
+            AddKnownTranslationValue(translated);
             return true;
+        }
         if (conflict)
         {
             // Failed display-form lookups may overwrite the output with text
@@ -2936,6 +3021,9 @@ public sealed class TranslationManager
         var normalized = NormalizeSubSkillKey(value);
         if (!ReferenceEquals(normalized, value))
             _knownTranslationValues.Add(normalized);
+        var displayValue = NormalizeStoryDisplayValue(normalized);
+        if (!ReferenceEquals(displayValue, normalized))
+            _knownTranslationValues.Add(displayValue);
     }
 
     private static void AddKnownStoryTranslationValue(HashSet<string> targetSet, string value)
@@ -3285,8 +3373,11 @@ public sealed class TranslationManager
             if (property.Value.ValueKind == JsonValueKind.String)
             {
                 var val = property.Value.GetString() ?? string.Empty;
-                if (!string.IsNullOrEmpty(val) || !table.ContainsKey(property.Name))
+                if ((!string.IsNullOrEmpty(val) && !IsUntranslatedSelfCopy(property.Name, val)) ||
+                    !table.ContainsKey(property.Name))
+                {
                     table[property.Name] = val;
+                }
             }
             else if (property.Value.ValueKind == JsonValueKind.Object)
             {
